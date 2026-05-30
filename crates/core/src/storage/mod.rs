@@ -20,13 +20,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_recursion::async_recursion;
 use bytes::Bytes;
+use once_cell::sync::Lazy;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::path::Path as ObjPath;
@@ -265,6 +266,39 @@ pub struct Storage {
     pub(crate) hudi_configs: Arc<HudiConfigs>,
 }
 
+/// ENG-42276 — process-level cache of `Arc<dyn ObjectStore>` keyed by
+/// `(scheme://host, sorted_options)`. Without this every per-file
+/// `Storage::new` calls `parse_url_opts` → `reqwest::Client::build` →
+/// `rustls_native_certs::load_native_certs`, which stats + opens + PEM-parses
+/// every cert in /etc/ssl/certs/ (~150 files on al2023). Profiling under
+/// async-profiler against TPC-DS 100GB showed this consumed ~30% of executor
+/// CPU per Spark task (`Storage::new` at 31.7%, with the cert-loading leaves
+/// dominating).
+///
+/// Caching the ObjectStore additionally lets reqwest's internal connection
+/// pool stay warm across files — TCP / TLS handshake amortised once instead
+/// of N times for N parquet files in a query. The expected wall-clock impact
+/// is significantly larger than the CPU saving because the connection setup
+/// is off-CPU IO that `event=itimer` profiling didn't measure.
+///
+/// Key choice: `scheme://host` scopes to a single S3 bucket / Azure
+/// container / GCS bucket; sorted options form the credential / region
+/// boundary. Two requests with the same host but different region (rare)
+/// correctly get separate ObjectStores.
+static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn object_store_cache_key(base_url: &Url, options: &HashMap<String, String>) -> String {
+    let host_part = format!(
+        "{}://{}",
+        base_url.scheme(),
+        base_url.host_str().unwrap_or("")
+    );
+    let mut opts: Vec<(&String, &String)> = options.iter().collect();
+    opts.sort();
+    format!("{}|{:?}", host_part, opts)
+}
+
 impl Storage {
     pub const CLOUD_STORAGE_PREFIXES: [&'static str; 3] = ["AWS_", "AZURE_", "GOOGLE_"];
 
@@ -292,15 +326,35 @@ impl Storage {
         // the FFI props map.
         let effective_options = Self::with_region_fallback(&base_url, options.clone());
 
-        match parse_url_opts(&base_url, effective_options.as_ref()) {
-            Ok((object_store, _)) => Ok(Arc::new(Storage {
-                base_url: Arc::new(base_url),
-                object_store: Arc::new(object_store),
-                options: effective_options,
-                hudi_configs,
-            })),
-            Err(e) => Err(Creation(format!("Failed to create storage: {e}"))),
-        }
+        // ENG-42276 — consult the process-level ObjectStore cache before
+        // invoking parse_url_opts. See OBJECT_STORE_CACHE docs above.
+        let key = object_store_cache_key(&base_url, effective_options.as_ref());
+        let object_store: Arc<dyn ObjectStore> = {
+            let mut cache = OBJECT_STORE_CACHE
+                .lock()
+                .expect("OBJECT_STORE_CACHE mutex poisoned");
+            if let Some(existing) = cache.get(&key) {
+                existing.clone()
+            } else {
+                match parse_url_opts(&base_url, effective_options.as_ref()) {
+                    Ok((new_store, _)) => {
+                        let arc: Arc<dyn ObjectStore> = Arc::new(new_store);
+                        cache.insert(key, arc.clone());
+                        arc
+                    }
+                    Err(e) => {
+                        return Err(Creation(format!("Failed to create storage: {e}")));
+                    }
+                }
+            }
+        };
+
+        Ok(Arc::new(Storage {
+            base_url: Arc::new(base_url),
+            object_store,
+            options: effective_options,
+            hudi_configs,
+        }))
     }
 
     fn with_region_fallback(
