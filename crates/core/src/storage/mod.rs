@@ -285,6 +285,28 @@ pub struct Storage {
 /// container / GCS bucket; sorted options form the credential / region
 /// boundary. Two requests with the same host but different region (rare)
 /// correctly get separate ObjectStores.
+///
+/// **Runtime lifetime gotcha (v3 fix).** `reqwest::ClientBuilder::build()`
+/// spawns hyper's connection-dispatch task on whatever tokio runtime is
+/// current at the time of the call. If we construct the ObjectStore inside
+/// the first Spark task's per-FFI tokio runtime, that runtime gets dropped
+/// when the task ends, the hyper dispatcher dies with it, and every
+/// subsequent task that picks up the cached ObjectStore fails with
+/// `hyper::Error(User(DispatchGone), "runtime dropped the dispatch task")`.
+/// To fix: build the ObjectStore inside a dedicated process-lifetime
+/// `OBJECT_STORE_RUNTIME` (entered via `_guard = rt.enter()`), so the hyper
+/// dispatch task is bound to a runtime that outlives any individual task.
+/// Cross-runtime IO is supported by tokio (other tasks dispatch through the
+/// long-lived runtime); this is the pattern delta-rs and polars use.
+static OBJECT_STORE_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("hudi-rs-objstore")
+        .build()
+        .expect("Failed to build OBJECT_STORE_RUNTIME")
+});
+
 static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -336,6 +358,10 @@ impl Storage {
             if let Some(existing) = cache.get(&key) {
                 existing.clone()
             } else {
+                // Bind hyper's dispatch task to the process-lifetime runtime,
+                // not the caller's per-task runtime — see OBJECT_STORE_RUNTIME
+                // docs above for the DispatchGone failure mode this prevents.
+                let _guard = OBJECT_STORE_RUNTIME.enter();
                 match parse_url_opts(&base_url, effective_options.as_ref()) {
                     Ok((new_store, _)) => {
                         let arc: Arc<dyn ObjectStore> = Arc::new(new_store);
