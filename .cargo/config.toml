@@ -26,3 +26,15 @@ rustflags = [
   "-C", "link-arg=-undefined",
   "-C", "link-arg=dynamic_lookup",
 ]
+
+# ENG-42276 perf-gap investigation (LOCAL ONLY — DO NOT COMMIT):
+# Preserve frame pointers so async-profiler can walk libhudi.so call
+# stacks back into libvelox.so when sampling lands inside the Rust
+# FFI workload. Without this, stack walking dies at the bottom Rust
+# frame and the Rust portion of HudiSplitReader::next's time shows
+# up as opaque "libhudi.so+0xN" with no attribution. ~1% runtime cost.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "force-frame-pointers=yes"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "force-frame-pointers=yes"]
