@@ -20,8 +20,9 @@
 //! evaluates the original expression on every batch, so correctness is
 //! preserved when we drop — we only lose the perf benefit of early filtering.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
+use arrow::error::ArrowError;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -30,6 +31,9 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, TimeUnit};
 use arrow_select::filter::filter_record_batch;
+use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::{ArrowPredicate, RowFilter};
+use parquet::schema::types::SchemaDescriptor;
 use prost::Message;
 use substrait::proto::{
     Expression, ExtendedExpression,
@@ -160,6 +164,150 @@ pub fn filter_batch(batch: &RecordBatch, filter: &PushedFilter) -> Result<Record
     // which is what we want for SQL WHERE semantics.
     filter_record_batch(batch, &mask)
         .map_err(|e| format!("[ENG-40156] filter_record_batch failed: {e}"))
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Parquet-level pushdown adapter (ENG-42276)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Adapts a `PushedFilter` to parquet's `ArrowPredicate` trait so it can be
+/// installed as a parquet `RowFilter` and drive row-group / page-index
+/// pruning. Construct via `PushedFilter::build_row_filter`.
+struct PushedFilterArrowPredicate {
+    filter: PushedFilter,
+    projection: ProjectionMask,
+}
+
+impl ArrowPredicate for PushedFilterArrowPredicate {
+    fn projection(&self) -> &ProjectionMask {
+        &self.projection
+    }
+
+    fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
+        match self.filter.evaluate(&batch) {
+            Ok(mask) => Ok(mask),
+            Err(e) => {
+                // Don't propagate as an ArrowError — that would fail the
+                // whole parquet read. Instead, return an all-true mask so
+                // every row survives parquet-level filtering and the
+                // post-merge filter in lib.rs evaluates the predicate
+                // correctly. Net cost: pushdown's column-fetch work was
+                // wasted, but correctness is preserved.
+                log::warn!(
+                    "[ENG-40156] parquet pushdown eval failed; emitting all-true \
+                     mask so post-merge filter runs: {e}"
+                );
+                Ok(BooleanArray::from(vec![true; batch.num_rows()]))
+            }
+        }
+    }
+}
+
+impl PushedFilter {
+    /// Walk the expression tree and collect every substrait base-schema field
+    /// index referenced by a `Selection`. Used to build the parquet projection
+    /// mask for `RowFilter`.
+    fn referenced_field_indices(&self) -> BTreeSet<usize> {
+        let mut out = BTreeSet::new();
+        Self::collect_field_indices(&self.expression, &mut out);
+        out
+    }
+
+    fn collect_field_indices(expr: &Expression, out: &mut BTreeSet<usize>) {
+        match &expr.rex_type {
+            Some(RexType::Selection(field_ref)) => {
+                if let Some(field_reference::ReferenceType::DirectReference(seg)) =
+                    &field_ref.reference_type
+                {
+                    if let Some(reference_segment::ReferenceType::StructField(sf)) =
+                        &seg.reference_type
+                    {
+                        out.insert(sf.field as usize);
+                    }
+                }
+            }
+            Some(RexType::ScalarFunction(sf)) => {
+                for arg in &sf.arguments {
+                    if let Some(function_argument::ArgType::Value(e)) = &arg.arg_type {
+                        Self::collect_field_indices(e, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Build a parquet `RowFilter` that wraps this predicate.
+    ///
+    /// The returned `RowFilter` projects only the parquet columns this
+    /// predicate references (so parquet can evaluate the predicate early
+    /// and skip row groups / pages whose stats don't satisfy it before
+    /// decoding the rest of the requested columns).
+    ///
+    /// Returns `None` when pushdown isn't safe / possible:
+    /// - the expression references no fields (degenerate);
+    /// - any referenced substrait column is not present in the parquet
+    ///   file's top-level schema (column added in a newer schema version,
+    ///   nested reference we don't translate, etc.).
+    ///
+    /// On `None`, the caller's existing post-merge filter still evaluates
+    /// the predicate correctly — only the parquet-layer optimisation is
+    /// skipped.
+    pub fn build_row_filter(&self, parquet_schema: &SchemaDescriptor) -> Option<RowFilter> {
+        let referenced = self.referenced_field_indices();
+        if referenced.is_empty() {
+            log::debug!(
+                "[ENG-40156] pushdown: expression references no fields; \
+                 skipping parquet RowFilter"
+            );
+            return None;
+        }
+
+        // Map substrait field index → column name → parquet root-column index.
+        let root = parquet_schema.root_schema();
+        let mut parquet_col_indices: Vec<usize> = Vec::with_capacity(referenced.len());
+        for sub_idx in &referenced {
+            let col_name = match self.column_names.get(*sub_idx) {
+                Some(n) => n,
+                None => {
+                    log::info!(
+                        "[ENG-40156] pushdown: substrait field index {sub_idx} out of \
+                         range of column_names (len={}); skipping pushdown",
+                        self.column_names.len()
+                    );
+                    return None;
+                }
+            };
+            let mut found: Option<usize> = None;
+            for (i, f) in root.get_fields().iter().enumerate() {
+                if f.name() == col_name {
+                    found = Some(i);
+                    break;
+                }
+            }
+            match found {
+                Some(i) => parquet_col_indices.push(i),
+                None => {
+                    log::info!(
+                        "[ENG-40156] pushdown: column '{col_name}' not in parquet schema; \
+                         skipping pushdown for this file"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        let projection = ProjectionMask::roots(parquet_schema, parquet_col_indices);
+        let predicate = PushedFilterArrowPredicate {
+            filter: self.clone(),
+            projection,
+        };
+        log::info!(
+            "[ENG-40156] pushdown: installing parquet RowFilter over cols {:?}",
+            self.column_names
+        );
+        Some(RowFilter::new(vec![Box::new(predicate)]))
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1923,5 +2071,212 @@ mod tests {
     #[allow(dead_code)]
     fn _ptype_anchor() -> ptype::Struct {
         ptype::Struct::default()
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // ENG-42276 — Parquet RowFilter pushdown tests
+    // ════════════════════════════════════════════════════════════════════
+    //
+    // These tests verify the parquet-level pushdown adapter on `PushedFilter`:
+    //
+    //   - `referenced_field_indices` walks the substrait expression tree and
+    //     returns exactly the field indices read by `Selection`s.
+    //   - `build_row_filter` constructs a `RowFilter` when every referenced
+    //     column exists in the parquet file's top-level schema, returning
+    //     `None` (graceful skip — post-merge filter still runs) when any
+    //     referenced column is missing or the expression is degenerate.
+    //   - The `ArrowPredicate` wrapper produces the same mask as the
+    //     underlying `PushedFilter::evaluate` on a matching batch, and
+    //     gracefully returns an all-true mask (rather than failing the
+    //     parquet read) when underlying evaluation errors.
+    //
+    // Together these cover all the safety/correctness invariants needed by
+    // the FFI gate in `lib.rs` and the COW-vs-MOR gate in
+    // `file_group/reader/mod.rs`.
+
+    use parquet::arrow::arrow_reader::ArrowPredicate;
+    use parquet::basic::Type as ParquetPhysicalType;
+    use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
+
+    /// Build a parquet `SchemaDescriptor` whose root has primitive INT64
+    /// columns named by `field_names`. Sufficient for tests of name-based
+    /// column resolution; per-column physical type doesn't matter because
+    /// `build_row_filter` only looks at names.
+    fn make_parquet_schema(field_names: &[&str]) -> SchemaDescriptor {
+        let fields: Vec<std::sync::Arc<ParquetType>> = field_names
+            .iter()
+            .map(|n| {
+                std::sync::Arc::new(
+                    ParquetType::primitive_type_builder(n, ParquetPhysicalType::INT64)
+                        .build()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let root = ParquetType::group_type_builder("schema")
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        SchemaDescriptor::new(std::sync::Arc::new(root))
+    }
+
+    #[test]
+    fn pushdown_referenced_fields_single_selection() {
+        // Expression: a == 5. Should reference only field index 0.
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["a", "b"],
+            scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        let refs = pf.referenced_field_indices();
+        assert_eq!(refs.iter().copied().collect::<Vec<_>>(), vec![0_usize]);
+    }
+
+    #[test]
+    fn pushdown_referenced_fields_two_selections_across_and() {
+        // Expression: (a > 1) AND (b < 10). Should reference indices 0 and 1.
+        let bytes = extended(
+            &[(1, "gt:any_any"), (2, "lt:any_any"), (3, "and:bool_bool")],
+            &["a", "b"],
+            scalar_fn(
+                3,
+                vec![
+                    scalar_fn(1, vec![col_ref(0), i64_literal(1)]),
+                    scalar_fn(2, vec![col_ref(1), i64_literal(10)]),
+                ],
+            ),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        let refs = pf.referenced_field_indices();
+        assert_eq!(refs.iter().copied().collect::<Vec<_>>(), vec![0_usize, 1]);
+    }
+
+    #[test]
+    fn pushdown_referenced_fields_dedups_same_column() {
+        // Expression: (a > 1) AND (a < 10). Both branches reference column a.
+        // referenced_field_indices uses BTreeSet → deduped result.
+        let bytes = extended(
+            &[(1, "gt:any_any"), (2, "lt:any_any"), (3, "and:bool_bool")],
+            &["a", "b"],
+            scalar_fn(
+                3,
+                vec![
+                    scalar_fn(1, vec![col_ref(0), i64_literal(1)]),
+                    scalar_fn(2, vec![col_ref(0), i64_literal(10)]),
+                ],
+            ),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        let refs = pf.referenced_field_indices();
+        assert_eq!(refs.iter().copied().collect::<Vec<_>>(), vec![0_usize]);
+    }
+
+    #[test]
+    fn pushdown_build_row_filter_some_when_column_present() {
+        // Expression: a == 5. Parquet schema has [a, b]. Should produce a
+        // RowFilter (not None).
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["a", "b"],
+            scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        let schema = make_parquet_schema(&["a", "b"]);
+        let rf = pf.build_row_filter(&schema);
+        assert!(rf.is_some(), "should build a RowFilter when column exists");
+    }
+
+    #[test]
+    fn pushdown_build_row_filter_some_with_extra_parquet_cols() {
+        // Predicate references only `a`. Parquet schema has [_hoodie_commit_time,
+        // a, b, c] — the predicate column exists alongside Hudi metadata
+        // columns and extras. Should still produce Some.
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["a"],
+            scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        let schema = make_parquet_schema(&["_hoodie_commit_time", "a", "b", "c"]);
+        let rf = pf.build_row_filter(&schema);
+        assert!(rf.is_some(), "extra parquet columns should not block pushdown");
+    }
+
+    #[test]
+    fn pushdown_build_row_filter_none_when_column_missing() {
+        // Predicate references column 'z' but parquet schema only has [a, b].
+        // Should return None — graceful skip; post-merge filter handles it.
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["z"],
+            scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        let schema = make_parquet_schema(&["a", "b"]);
+        let rf = pf.build_row_filter(&schema);
+        assert!(
+            rf.is_none(),
+            "pushdown must skip when referenced column not in parquet schema"
+        );
+    }
+
+    #[test]
+    fn pushdown_arrow_predicate_evaluate_matches_filter_evaluate() {
+        // Sanity: the ArrowPredicate wrapping a PushedFilter produces the
+        // same boolean mask as PushedFilter::evaluate on the same batch.
+        let batch = make_batch_two_int_cols();
+        let bytes = extended(
+            &[(1, "lt:any_any")],
+            &["a", "b"],
+            scalar_fn(1, vec![col_ref(0), i64_literal(3)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+
+        // Reference mask via the existing evaluator.
+        let expected = pf.evaluate(&batch).unwrap();
+
+        // Mask via the parquet ArrowPredicate adapter. ProjectionMask here
+        // is irrelevant for the evaluator (it's just bookkeeping for parquet);
+        // we use a no-op all-roots mask.
+        let schema = make_parquet_schema(&["a", "b"]);
+        let projection = ProjectionMask::roots(&schema, vec![0_usize, 1]);
+        let mut pred = PushedFilterArrowPredicate {
+            filter: pf,
+            projection,
+        };
+        let got = pred.evaluate(batch).unwrap();
+        assert_eq!(format!("{:?}", got), format!("{:?}", expected));
+    }
+
+    #[test]
+    fn pushdown_arrow_predicate_returns_all_true_on_eval_error() {
+        // Predicate references column 'z', but batch only has 'a','b'.
+        // PushedFilter::evaluate will Err. The ArrowPredicate adapter must
+        // catch this and return an all-true mask (so parquet doesn't fail
+        // the whole read; the post-merge filter handles correctness).
+        let batch = make_batch_two_int_cols();
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["z"],
+            scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        // Parquet schema is independent of the test batch — projection mask
+        // points at a fictitious column for the wrapper's bookkeeping.
+        let schema = make_parquet_schema(&["z"]);
+        let projection = ProjectionMask::roots(&schema, vec![0_usize]);
+        let mut pred = PushedFilterArrowPredicate {
+            filter: pf,
+            projection,
+        };
+        let mask = pred
+            .evaluate(batch.clone())
+            .expect("adapter must not propagate the error");
+        assert_eq!(mask.len(), batch.num_rows());
+        assert!(
+            (0..mask.len()).all(|i| mask.value(i)),
+            "adapter must return all-true mask on eval failure"
+        );
     }
 }

@@ -94,7 +94,7 @@ use crate::file_group::reader::read_stats::HoodieReadStats;
 use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::reader_parameters::ReaderParameters;
 use crate::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
-use crate::storage::Storage;
+use crate::storage::{RowFilterBuilder, Storage};
 use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_schema::SchemaRef;
 use std::sync::Arc;
@@ -115,7 +115,6 @@ use std::sync::Arc;
 ///
 /// Use [`HoodieFileGroupReader::builder()`] for the builder pattern, or construct
 /// directly with [`HoodieFileGroupReader::new()`].
-#[derive(Debug)]
 pub struct HoodieFileGroupReader {
     // ── Context (mirrors Java's HoodieReaderContext<T>) ────────────────
     /// Reader context carrying merge mode, instant range, and config maps.
@@ -169,6 +168,18 @@ pub struct HoodieFileGroupReader {
     /// Converter for engine records to [`BufferedRecord`].
     /// Mirrors Java's `BufferedRecordConverter<T> bufferedRecordConverter`.
     buffered_record_converter: Option<Box<dyn BufferedRecordConverter>>,
+
+    /// ENG-42276 — optional parquet `RowFilter` builder for base-file reads.
+    ///
+    /// When set AND the table is COPY_ON_WRITE, this builder is forwarded
+    /// to the storage layer so the parquet reader can prune row groups via
+    /// column-index stats before materialising data. For MERGE_ON_READ the
+    /// builder is silently dropped: log-file updates can flip a row's
+    /// predicate result, so any parquet-level row filter built from the
+    /// base file's stats would be unsafe. The post-merge filter in the
+    /// caller (e.g. the FFI `read_record_batch`) is unaffected and still
+    /// applies the predicate correctly in all cases.
+    row_filter_builder: Option<RowFilterBuilder>,
 }
 
 impl HoodieFileGroupReader {
@@ -294,7 +305,29 @@ impl HoodieFileGroupReader {
             read_stats: HoodieReadStats::default(),
             valid_block_instants: Vec::new(),
             buffered_record_converter: None,
+            row_filter_builder: None,
         }
+    }
+
+    /// Install a parquet `RowFilter` builder. Only applied to base-file
+    /// reads when the table is COPY_ON_WRITE — see the field's doc comment.
+    pub fn set_row_filter_builder(&mut self, b: Option<RowFilterBuilder>) {
+        self.row_filter_builder = b;
+    }
+
+    /// Returns true iff the table is COPY_ON_WRITE according to
+    /// `hoodie.table.type` in the reader context's table config.
+    /// Defaults to false (treat as MOR) if the key is missing or unparseable,
+    /// so callers err on the side of NOT pushing predicates down.
+    fn is_cow(&self) -> bool {
+        use crate::config::table::TableTypeValue;
+        use std::str::FromStr;
+        self.reader_context
+            .table_config
+            .get("hoodie.table.type")
+            .and_then(|v| TableTypeValue::from_str(v).ok())
+            .map(|t| matches!(t, TableTypeValue::CopyOnWrite))
+            .unwrap_or(false)
     }
 
     /// Create a builder for configuring the reader.
@@ -469,11 +502,31 @@ impl HoodieFileGroupReader {
                 // Mirrors Java line 159-162:
                 // readerContext.getFileRecordIterator(pathInfo, start, len,
                 //     schemaHandler.getTableSchema(), schemaHandler.getRequiredSchema(), storage)
+                // ENG-42276 — only push down parquet RowFilter on COW tables.
+                // On MOR, log-file updates can change a row's predicate result,
+                // so a parquet-stats-driven row filter built from the base
+                // file alone would be unsafe.
+                let row_filter = if self.is_cow() {
+                    self.row_filter_builder.clone()
+                } else {
+                    if self.row_filter_builder.is_some() {
+                        log::info!(
+                            "[ENG-42276] MOR table — skipping parquet RowFilter pushdown \
+                             for base file '{path}' (post-merge filter still runs)"
+                        );
+                    }
+                    None
+                };
+
                 let batch = if let Some(required_schema) =
                     &self.schema_handler.required_schema
                 {
                     self.storage
-                        .get_parquet_file_data_projected(path, required_schema)
+                        .get_parquet_file_data_projected_with_options(
+                            path,
+                            required_schema,
+                            row_filter,
+                        )
                         .await
                         .map_err(|e| {
                             CoreError::ReadFileSliceError(format!(
@@ -481,6 +534,11 @@ impl HoodieFileGroupReader {
                             ))
                         })?
                 } else {
+                    // No projection requested — read everything. We still
+                    // can't apply row_filter via the unprojected helper
+                    // (it doesn't take options); skip pushdown for this
+                    // path. In practice the projected helper is taken via
+                    // the FFI; the unprojected fallback is rare.
                     self.storage
                         .get_parquet_file_data(path)
                         .await
@@ -653,7 +711,7 @@ impl HoodieFileGroupReader {
 /// Builder for `HoodieFileGroupReader`.
 ///
 /// Mirrors Java's `HoodieFileGroupReader.Builder<T>`.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct HoodieFileGroupReaderBuilder {
     reader_context: Option<Arc<ReaderContext>>,
     storage: Option<Arc<Storage>>,
@@ -661,6 +719,7 @@ pub struct HoodieFileGroupReaderBuilder {
     reader_parameters: ReaderParameters,
     data_schema: Option<SchemaRef>,
     requested_schema: Option<SchemaRef>,
+    row_filter_builder: Option<RowFilterBuilder>,
 }
 
 impl HoodieFileGroupReaderBuilder {
@@ -698,6 +757,15 @@ impl HoodieFileGroupReaderBuilder {
         self
     }
 
+    /// ENG-42276 — install a parquet `RowFilter` builder. The reader will
+    /// only use it for base-file reads on COPY_ON_WRITE tables; on
+    /// MERGE_ON_READ it is silently ignored (see [`HoodieFileGroupReader`]
+    /// field docs).
+    pub fn with_row_filter_builder(mut self, b: RowFilterBuilder) -> Self {
+        self.row_filter_builder = Some(b);
+        self
+    }
+
     pub fn build(self) -> Result<HoodieFileGroupReader> {
         let reader_context = self
             .reader_context
@@ -709,7 +777,7 @@ impl HoodieFileGroupReaderBuilder {
             .input_split
             .ok_or_else(|| CoreError::ReadFileSliceError("input_split is required".into()))?;
 
-        let reader = HoodieFileGroupReader::new(
+        let mut reader = HoodieFileGroupReader::new(
             reader_context,
             storage,
             input_split,
@@ -717,6 +785,7 @@ impl HoodieFileGroupReaderBuilder {
             self.data_schema,
             self.requested_schema,
         );
+        reader.set_row_filter_builder(self.row_filter_builder);
 
         Ok(reader)
     }

@@ -501,11 +501,28 @@ impl HoodieFileGroupReader {
             self.reader_context.merge_mode.as_str(),
         );
 
-        let mut reader = CoreFileGroupReader::builder()
+        // ENG-42276 — wire the decoded substrait predicate (if any) into
+        // the file-group reader as a parquet RowFilter builder. The reader
+        // gates application by table type (COW only) and the post-merge
+        // filter below still runs unconditionally, so this is purely an
+        // I/O optimisation, not a correctness path.
+        let mut builder = CoreFileGroupReader::builder()
             .with_reader_context(self.reader_context.clone())
             .with_storage(self.storage.clone())
             .with_input_split(self.input_split.clone())
-            .with_reader_parameters(self.reader_parameters.clone())
+            .with_reader_parameters(self.reader_parameters.clone());
+
+        if let Some(pf) = &self.pushed_filter {
+            let pf_for_closure = pf.clone();
+            let rfb: hudi_dep::storage::RowFilterBuilder = std::sync::Arc::new(
+                move |parquet_schema, _projected_schema| {
+                    pf_for_closure.build_row_filter(parquet_schema)
+                },
+            );
+            builder = builder.with_row_filter_builder(rfb);
+        }
+
+        let mut reader = builder
             .build()
             .map_err(|e| format!("Failed to build file group reader: {e}"))?;
 
