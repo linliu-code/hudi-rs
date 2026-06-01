@@ -237,6 +237,57 @@ impl PushedFilter {
         }
     }
 
+    /// Walk the expression tree and return true iff at least one leaf scalar
+    /// function is a comparison operator that parquet column stats can use
+    /// to prune row groups (Equal/NotEqual/Lt/Lte/Gt/Gte). Returns false if
+    /// the expression is composed only of IsNull/IsNotNull/And/Or/Not nodes —
+    /// these don't admit any stat-based pruning (every row group with at
+    /// least one row of either null-status passes IsNull/IsNotNull), so
+    /// installing a parquet RowFilter would just cost the extra two-pass
+    /// I/O round-trip without any benefit.
+    ///
+    /// ENG-42276 v4.1 — gates `build_row_filter` to avoid the regression on
+    /// queries like TPC-DS q27/q29/q82/q84 where Spark pushes only
+    /// `isnotnull(join_key)` predicates to the fact-table read.
+    fn has_prunable_comparison(&self, expr: &Expression) -> bool {
+        match &expr.rex_type {
+            Some(RexType::ScalarFunction(sf)) => {
+                let known = self.function_map.get(&sf.function_reference);
+                match known {
+                    Some(KnownFunction::Equal)
+                    | Some(KnownFunction::NotEqual)
+                    | Some(KnownFunction::Lt)
+                    | Some(KnownFunction::Lte)
+                    | Some(KnownFunction::Gt)
+                    | Some(KnownFunction::Gte) => true,
+                    Some(KnownFunction::And)
+                    | Some(KnownFunction::Or)
+                    | Some(KnownFunction::Not) => {
+                        // If any child has a prunable comparison, the parent
+                        // expression may also prune some row groups.
+                        sf.arguments.iter().any(|arg| {
+                            if let Some(function_argument::ArgType::Value(child)) =
+                                &arg.arg_type
+                            {
+                                self.has_prunable_comparison(child)
+                            } else {
+                                false
+                            }
+                        })
+                    }
+                    Some(KnownFunction::IsNull) | Some(KnownFunction::IsNotNull) => false,
+                    None => {
+                        // Unknown function — `decode()` would have dropped
+                        // the whole filter already in this case, so this is
+                        // defensive only.
+                        false
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Build a parquet `RowFilter` that wraps this predicate.
     ///
     /// The returned `RowFilter` projects only the parquet columns this
@@ -248,7 +299,11 @@ impl PushedFilter {
     /// - the expression references no fields (degenerate);
     /// - any referenced substrait column is not present in the parquet
     ///   file's top-level schema (column added in a newer schema version,
-    ///   nested reference we don't translate, etc.).
+    ///   nested reference we don't translate, etc.);
+    /// - **the expression contains no comparison operators** (only
+    ///   IsNull/IsNotNull/And/Or/Not). These can never prune row groups
+    ///   via column stats, so installing a RowFilter would just incur the
+    ///   two-pass-read I/O cost without any benefit — see ENG-42276 v4.1.
     ///
     /// On `None`, the caller's existing post-merge filter still evaluates
     /// the predicate correctly — only the parquet-layer optimisation is
@@ -259,6 +314,17 @@ impl PushedFilter {
             log::debug!(
                 "[ENG-40156] pushdown: expression references no fields; \
                  skipping parquet RowFilter"
+            );
+            return None;
+        }
+
+        // ENG-42276 v4.1 — selectivity gate: skip pushdown when no leaf
+        // predicate is a comparison op that parquet stats could prune on.
+        if !self.has_prunable_comparison(&self.expression) {
+            log::info!(
+                "[ENG-42276] pushdown: predicate has no comparison ops \
+                 (only IsNull/IsNotNull/And/Or/Not) — stats can't prune; \
+                 skipping parquet RowFilter to avoid two-pass-read overhead"
             );
             return None;
         }
@@ -2247,6 +2313,83 @@ mod tests {
         };
         let got = pred.evaluate(batch).unwrap();
         assert_eq!(format!("{:?}", got), format!("{:?}", expected));
+    }
+
+    #[test]
+    fn pushdown_v4_1_skips_pure_isnotnull_predicate() {
+        // ENG-42276 v4.1 selectivity gate.
+        // Predicate: isnotnull(col 0). All-isnotnull expressions can never
+        // prune any row group via column stats (every row group with
+        // any non-null row passes). build_row_filter must skip pushdown.
+        let bytes = extended(
+            &[(1, "is_not_null:any")],
+            &["a", "b"],
+            scalar_fn(1, vec![col_ref(0)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        let schema = make_parquet_schema(&["a", "b"]);
+        let rf = pf.build_row_filter(&schema);
+        assert!(
+            rf.is_none(),
+            "pure IS NOT NULL must be skipped to avoid the two-pass-read regression"
+        );
+    }
+
+    #[test]
+    fn pushdown_v4_1_skips_isnotnull_conjunction() {
+        // Predicate: isnotnull(a) AND isnotnull(b). Same logic as above:
+        // an AND of two non-prunable predicates is itself non-prunable.
+        let bytes = extended(
+            &[
+                (1, "is_not_null:any"),
+                (2, "is_not_null:any"),
+                (3, "and:bool_bool"),
+            ],
+            &["a", "b"],
+            scalar_fn(
+                3,
+                vec![
+                    scalar_fn(1, vec![col_ref(0)]),
+                    scalar_fn(2, vec![col_ref(1)]),
+                ],
+            ),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        let schema = make_parquet_schema(&["a", "b"]);
+        let rf = pf.build_row_filter(&schema);
+        assert!(
+            rf.is_none(),
+            "AND of pure IS NOT NULL conjuncts must be skipped"
+        );
+    }
+
+    #[test]
+    fn pushdown_v4_1_keeps_mixed_predicate_with_comparison() {
+        // Predicate: isnotnull(a) AND (b > 5). The comparison branch CAN
+        // prune via stats, so the AND as a whole is prunable. Pushdown
+        // should still be installed.
+        let bytes = extended(
+            &[
+                (1, "is_not_null:any"),
+                (2, "gt:any_any"),
+                (3, "and:bool_bool"),
+            ],
+            &["a", "b"],
+            scalar_fn(
+                3,
+                vec![
+                    scalar_fn(1, vec![col_ref(0)]),
+                    scalar_fn(2, vec![col_ref(1), i64_literal(5)]),
+                ],
+            ),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        let schema = make_parquet_schema(&["a", "b"]);
+        let rf = pf.build_row_filter(&schema);
+        assert!(
+            rf.is_some(),
+            "mixed isnotnull AND comparison should still install (comparison can prune)"
+        );
     }
 
     #[test]

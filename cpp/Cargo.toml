@@ -55,7 +55,10 @@ arrow-cast = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
 hudi-test = { path = "../crates/test", version = "0.5.0-dev" }
+object_store = { workspace = true }
 parquet = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
