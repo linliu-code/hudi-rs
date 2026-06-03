@@ -216,8 +216,12 @@ pub struct HoodieFileGroupReader {
     // MOR shape because the merge has resolved log updates before we filter.
     pushed_filter: Option<PushedFilter>,
 
-    // ── Rust-only ──────────────────────────────────────────────────
-    rt: tokio::runtime::Runtime,
+    // ── ENG-42276 v4.3 ────────────────────────────────────────────
+    // No per-file-group tokio runtime any more — `reader.read()` is
+    // driven on the long-lived `OBJECT_STORE_RUNTIME` so hyper's
+    // connection dispatcher (spawned by the cached ObjectStore) shares
+    // a lifetime with the requests. See storage/mod.rs OBJECT_STORE_RUNTIME
+    // docs for the DispatchGone failure mode this prevents.
 }
 
 /// Creates a `HoodieFileGroupReader` from a full `FfiReaderContext`.
@@ -440,13 +444,7 @@ pub fn new_file_group_reader_with_context(
         hoodie_reader_config: ffi_rc.hoodie_reader_config,
     });
 
-    // ── 7. Build tokio runtime ──────────────────────────────────────
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
-
-    // ── 8. Decode ENG-40156 substrait predicate ──────────────────────
+    // ── 7. Decode ENG-40156 substrait predicate ──────────────────────
     // Decode errors are hard-fail (malformed bytes), but predicates referring
     // to functions we don't recognise are silently dropped (decode returns
     // Ok(None)) — Velox's post-scan filter still evaluates the original
@@ -460,6 +458,8 @@ pub fn new_file_group_reader_with_context(
         );
     }
 
+    // ENG-42276 v4.3 — no per-fg tokio runtime; read() drives on
+    // OBJECT_STORE_RUNTIME (see HoodieFileGroupReader doc comment).
     Ok(Box::new(HoodieFileGroupReader {
         reader_context: core_reader_context.clone(),
         storage,
@@ -468,7 +468,6 @@ pub fn new_file_group_reader_with_context(
         input_split,
         partition_path_fields,
         pushed_filter,
-        rt,
     }))
 }
 
@@ -482,10 +481,7 @@ impl HoodieFileGroupReader {
         input_split: InputSplit,
         partition_path_fields: Option<Vec<String>>,
     ) -> std::result::Result<Self, String> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
+        // ENG-42276 v4.3 — no per-fg tokio runtime (see struct doc).
         Ok(Self {
             reader_context,
             storage,
@@ -494,7 +490,6 @@ impl HoodieFileGroupReader {
             input_split,
             partition_path_fields,
             pushed_filter: None,
-            rt,
         })
     }
 
@@ -538,8 +533,13 @@ impl HoodieFileGroupReader {
             .build()
             .map_err(|e| format!("Failed to build file group reader: {e}"))?;
 
-        let record_batch = self
-            .rt
+        // ENG-42276 v4.3 — drive the entire read on OBJECT_STORE_RUNTIME so
+        // the hyper connection dispatcher (spawned the first time the cached
+        // ObjectStore opens a connection) lives in the same runtime that
+        // subsequent file-group reads will dispatch through. A per-file-group
+        // current_thread runtime would bind the dispatcher to itself, drop it
+        // on block_on return, and break the next file group with DispatchGone.
+        let record_batch = hudi_dep::storage::OBJECT_STORE_RUNTIME
             .block_on(reader.read())
             .map_err(|e| format!("Failed to read file group: {e}"))?;
 

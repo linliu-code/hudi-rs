@@ -298,9 +298,29 @@ pub struct Storage {
 /// dispatch task is bound to a runtime that outlives any individual task.
 /// Cross-runtime IO is supported by tokio (other tasks dispatch through the
 /// long-lived runtime); this is the pattern delta-rs and polars use.
-static OBJECT_STORE_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+/// ENG-42276 v4.3 — made `pub` and used by `cpp/src/lib.rs` to drive
+/// `reader.read()` instead of a per-file-group `current_thread` runtime.
+/// The v3 wrap of `parse_url_opts` was necessary but not sufficient:
+/// hyper's connection dispatcher is spawned on the runtime that drives
+/// the FIRST actual HTTP request (i.e. the runtime active when
+/// `obj_store.head().await` runs), NOT the runtime active when
+/// `parse_url_opts` ran. With a per-file-group `current_thread` runtime
+/// driving `block_on`, the dispatcher binds to that runtime, dies when
+/// the runtime is dropped after `block_on` returns, and every later
+/// file-group read against the cached ObjectStore fails with
+/// `DispatchGone`. Fix: drive the entire `reader.read()` on this same
+/// long-lived runtime so the dispatcher and all subsequent requests
+/// share its lifetime.
+///
+/// Worker count bumped from 2 → 8 to handle Velox executors with up to
+/// ~16 task slots concurrently driving file-group reads through this
+/// runtime. CPU-bound parquet decode now also runs here; if that turns
+/// out to be a bottleneck, the right move is per-bucket subruntimes or
+/// to spawn parquet decode onto a CPU pool, not to revert to per-task
+/// runtimes (that just brings the DispatchGone bug back).
+pub static OBJECT_STORE_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(8)
         .enable_all()
         .thread_name("hudi-rs-objstore")
         .build()
