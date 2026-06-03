@@ -236,16 +236,25 @@ pub fn new_file_group_reader_with_context(
     // ENG-40156 — snapshot substrait filter bytes before `ctx.into()` consumes ctx.
     let substrait_filter_bytes = ctx.substrait_filter_bytes.clone();
 
+    // ENG-40156 v4.5 diagnostic — capture before ctx.into() consumes ctx.
+    let use_record_position = ctx.should_use_record_position;
+
     // Beacon: confirms hudi-rs reader was actually entered for this file group.
     // Grep executor stderr for `[hudi-rs-reader]` to verify dispatch routed here.
-    // Fields chosen to also distinguish CoW (log_files_count=0) vs MOR (>0) and
-    // whether v4/v4.1 predicate pushdown was attempted (substrait_filter_bytes>0).
+    // Fields chosen to also distinguish CoW (log_files_count=0) vs MOR (>0),
+    // whether v4/v4.1 predicate pushdown was attempted (substrait_filter_bytes>0),
+    // and whether position-based merge was requested (use_record_position) —
+    // the latter is the flag that decides between the unimplemented
+    // PositionBasedFileGroupRecordBuffer and the working
+    // KeyBasedFileGroupRecordBuffer in DefaultFileGroupRecordBufferLoader.
     log::info!(
         "[hudi-rs-reader] new_file_group_reader_with_context entered: \
-         base_file_name={} log_files_count={} substrait_filter_bytes={}",
+         base_file_name={} log_files_count={} substrait_filter_bytes={} \
+         use_record_position={}",
         base_file_name,
         log_file_names.len(),
         substrait_filter_bytes.len(),
+        use_record_position,
     );
 
     // Convert flat FFI struct → nested Rust types (intermediate, not stored).
