@@ -145,6 +145,56 @@ impl PushedFilter {
         &self.column_names
     }
 
+    /// Returns true iff every column this filter references is either in
+    /// `pk_field_names` or is the `_hoodie_record_key` meta column.
+    ///
+    /// Mirrors Java's
+    /// `SparkFileFormatInternalRowReaderContext.filterIsSafeForPrimaryKey`
+    /// (`hudi-client/hudi-spark-client/.../SparkFileFormatInternalRowReaderContext.scala:285-289`):
+    ///
+    /// ```scala
+    /// def filterIsSafeForPrimaryKey(filter: Filter, recordKeyFields: Set[String]): Boolean = {
+    ///   filter.references.forall(c =>
+    ///     recordKeyFields.contains(c.toLowerCase) ||
+    ///     c.equalsIgnoreCase(HoodieRecord.RECORD_KEY_METADATA_FIELD))
+    /// }
+    /// ```
+    ///
+    /// Used to decide whether predicate pushdown is safe for **MERGE_ON_READ**
+    /// readers (base file + parquet log blocks). Hudi requires primary keys to
+    /// be immutable across upserts — a log update changes columns but never
+    /// the PK — so a predicate over PK columns has the same outcome pre- and
+    /// post-merge. Predicates over non-PK columns can be flipped by log
+    /// updates and must wait for post-merge evaluation.
+    ///
+    /// Comparison is case-insensitive (matches Java's `.toLowerCase` /
+    /// `.equalsIgnoreCase` semantics). The empty-reference case (e.g. a
+    /// constant predicate) returns `true` — vacuously safe.
+    ///
+    /// Returns `false` defensively if any referenced substrait index is out
+    /// of range of `column_names` (would indicate a malformed plan; treat as
+    /// unsafe).
+    pub fn references_only_primary_keys(&self, pk_field_names: &[String]) -> bool {
+        let mut pk_set: std::collections::HashSet<String> = pk_field_names
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+        // Always allow the meta-column form. Java does this via the explicit
+        // `equalsIgnoreCase(HoodieRecord.RECORD_KEY_METADATA_FIELD)` branch.
+        pk_set.insert("_hoodie_record_key".to_string());
+
+        for idx in self.referenced_field_indices() {
+            let name = match self.column_names.get(idx) {
+                Some(n) => n.to_lowercase(),
+                None => return false,
+            };
+            if !pk_set.contains(&name) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Evaluate the expression against a RecordBatch, returning one boolean
     /// per row. Caller passes the result to `arrow_select::filter_record_batch`.
     pub fn evaluate(&self, batch: &RecordBatch) -> Result<BooleanArray, String> {
@@ -2251,6 +2301,159 @@ mod tests {
         let schema = make_parquet_schema(&["a", "b"]);
         let rf = pf.build_row_filter(&schema);
         assert!(rf.is_some(), "should build a RowFilter when column exists");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // references_only_primary_keys — ENG-42866 PK-safe MOR pushdown gate
+    // ════════════════════════════════════════════════════════════════════
+    //
+    // Mirrors Java's filterIsSafeForPrimaryKey
+    // (SparkFileFormatInternalRowReaderContext.scala:285-289). Test matrix:
+    //
+    //   PK fields       | predicate refs              | expected
+    //   ----------------+-----------------------------+----------
+    //   ["id"]          | a == 5                      | false      (non-PK col)
+    //   ["id"]          | id == 5                     | true       (PK col)
+    //   ["id"]          | id == 5 AND id < 100        | true       (PK twice)
+    //   ["id"]          | id == 5 AND a < 100         | false      (PK + non-PK)
+    //   ["id", "ts"]    | id == 5 AND ts < 100        | true       (composite key)
+    //   []              | _hoodie_record_key == 'a'   | true       (meta col always allowed)
+    //   ["ID"]          | id == 5                     | true       (case-insensitive)
+    //   ["id"]          | <constant predicate>        | true       (vacuous — no refs)
+    //   []              | a == 5                      | false      (no PKs configured, non-meta ref)
+
+    #[test]
+    fn pushdown_pk_safe_non_pk_column_returns_false() {
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["a", "b"],
+            scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        assert!(!pf.references_only_primary_keys(&["id".to_string()]));
+    }
+
+    #[test]
+    fn pushdown_pk_safe_pk_column_returns_true() {
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["id", "data"],
+            scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        assert!(pf.references_only_primary_keys(&["id".to_string()]));
+    }
+
+    #[test]
+    fn pushdown_pk_safe_same_pk_twice_returns_true() {
+        // id == 5 AND id < 100 — same PK column referenced twice.
+        let bytes = extended(
+            &[(1, "equal:any_any"), (2, "lt:any_any"), (3, "and:bool_bool")],
+            &["id"],
+            scalar_fn(
+                3,
+                vec![
+                    scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+                    scalar_fn(2, vec![col_ref(0), i64_literal(100)]),
+                ],
+            ),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        assert!(pf.references_only_primary_keys(&["id".to_string()]));
+    }
+
+    #[test]
+    fn pushdown_pk_safe_mixed_pk_and_non_pk_returns_false() {
+        // id == 5 AND a < 100 — PK + non-PK — Java's gate rejects.
+        let bytes = extended(
+            &[(1, "equal:any_any"), (2, "lt:any_any"), (3, "and:bool_bool")],
+            &["id", "a"],
+            scalar_fn(
+                3,
+                vec![
+                    scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+                    scalar_fn(2, vec![col_ref(1), i64_literal(100)]),
+                ],
+            ),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        assert!(!pf.references_only_primary_keys(&["id".to_string()]));
+    }
+
+    #[test]
+    fn pushdown_pk_safe_composite_key_returns_true() {
+        // Composite PK (id, ts). Predicate references both — safe.
+        let bytes = extended(
+            &[(1, "equal:any_any"), (2, "lt:any_any"), (3, "and:bool_bool")],
+            &["id", "ts"],
+            scalar_fn(
+                3,
+                vec![
+                    scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+                    scalar_fn(2, vec![col_ref(1), i64_literal(100)]),
+                ],
+            ),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        assert!(pf.references_only_primary_keys(&["id".to_string(), "ts".to_string()]));
+    }
+
+    #[test]
+    fn pushdown_pk_safe_hoodie_record_key_meta_column_returns_true() {
+        // No PK fields configured but predicate uses the _hoodie_record_key
+        // meta column — Java's gate always allows this branch via the
+        // explicit equalsIgnoreCase check.
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["_hoodie_record_key"],
+            scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        assert!(pf.references_only_primary_keys(&[]));
+    }
+
+    #[test]
+    fn pushdown_pk_safe_case_insensitive() {
+        // PK configured as "ID" (uppercase); predicate column is "id" (lower).
+        // Java does .toLowerCase on both sides — our impl must too.
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["id"],
+            scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        assert!(pf.references_only_primary_keys(&["ID".to_string()]));
+    }
+
+    #[test]
+    fn pushdown_pk_safe_empty_predicate_returns_true() {
+        // Predicate that references no columns (constant-only). forall is
+        // vacuously true — same as Java's Filter.references.forall on []
+        // returning true.
+        //
+        // We build this as a literal-only equal expression — the field
+        // collector sees no Selection nodes and returns an empty set.
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["id"],
+            scalar_fn(1, vec![i64_literal(1), i64_literal(1)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        assert!(pf.references_only_primary_keys(&["id".to_string()]));
+    }
+
+    #[test]
+    fn pushdown_pk_safe_no_pks_non_meta_ref_returns_false() {
+        // No PK fields configured at all, no meta column either. Predicate
+        // references "a". Must return false — there's nothing to make this
+        // safe under the morFilters rule.
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["a"],
+            scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        assert!(!pf.references_only_primary_keys(&[]));
     }
 
     #[test]

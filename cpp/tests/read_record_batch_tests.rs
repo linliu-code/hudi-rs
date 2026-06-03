@@ -93,6 +93,8 @@ fn build_reader_context(
         schema_handler: FileGroupReaderSchemaHandler::new(),
         table_config,
         hoodie_reader_config: HashMap::new(),
+        row_filter_builder: None,
+        mor_pk_safe: false,
     })
 }
 
@@ -623,6 +625,8 @@ fn test_read_record_batch_column_projection() {
         schema_handler,
         table_config,
         hoodie_reader_config: HashMap::new(),
+        row_filter_builder: None,
+        mor_pk_safe: false,
     });
 
     let reader = HoodieFileGroupReader::new(

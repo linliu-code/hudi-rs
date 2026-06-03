@@ -169,17 +169,12 @@ pub struct HoodieFileGroupReader {
     /// Mirrors Java's `BufferedRecordConverter<T> bufferedRecordConverter`.
     buffered_record_converter: Option<Box<dyn BufferedRecordConverter>>,
 
-    /// ENG-42276 — optional parquet `RowFilter` builder for base-file reads.
-    ///
-    /// When set AND the table is COPY_ON_WRITE, this builder is forwarded
-    /// to the storage layer so the parquet reader can prune row groups via
-    /// column-index stats before materialising data. For MERGE_ON_READ the
-    /// builder is silently dropped: log-file updates can flip a row's
-    /// predicate result, so any parquet-level row filter built from the
-    /// base file's stats would be unsafe. The post-merge filter in the
-    /// caller (e.g. the FFI `read_record_batch`) is unaffected and still
-    /// applies the predicate correctly in all cases.
-    row_filter_builder: Option<RowFilterBuilder>,
+    // NOTE: ENG-42866 — the optional parquet `RowFilter` builder used to live
+    // on this struct. It now lives on `reader_context` so the same builder is
+    // visible to (a) the base parquet read here, and (b) the parquet log
+    // block decoder in `file_group::log_file::content::Decoder`. The gate
+    // (CoW || mor_pk_safe) lives at the use sites; this file's gate is at
+    // `make_base_file_batches` below.
 }
 
 impl HoodieFileGroupReader {
@@ -305,29 +300,7 @@ impl HoodieFileGroupReader {
             read_stats: HoodieReadStats::default(),
             valid_block_instants: Vec::new(),
             buffered_record_converter: None,
-            row_filter_builder: None,
         }
-    }
-
-    /// Install a parquet `RowFilter` builder. Only applied to base-file
-    /// reads when the table is COPY_ON_WRITE — see the field's doc comment.
-    pub fn set_row_filter_builder(&mut self, b: Option<RowFilterBuilder>) {
-        self.row_filter_builder = b;
-    }
-
-    /// Returns true iff the table is COPY_ON_WRITE according to
-    /// `hoodie.table.type` in the reader context's table config.
-    /// Defaults to false (treat as MOR) if the key is missing or unparseable,
-    /// so callers err on the side of NOT pushing predicates down.
-    fn is_cow(&self) -> bool {
-        use crate::config::table::TableTypeValue;
-        use std::str::FromStr;
-        self.reader_context
-            .table_config
-            .get("hoodie.table.type")
-            .and_then(|v| TableTypeValue::from_str(v).ok())
-            .map(|t| matches!(t, TableTypeValue::CopyOnWrite))
-            .unwrap_or(false)
     }
 
     /// Create a builder for configuring the reader.
@@ -502,17 +475,27 @@ impl HoodieFileGroupReader {
                 // Mirrors Java line 159-162:
                 // readerContext.getFileRecordIterator(pathInfo, start, len,
                 //     schemaHandler.getTableSchema(), schemaHandler.getRequiredSchema(), storage)
-                // ENG-42276 — only push down parquet RowFilter on COW tables.
-                // On MOR, log-file updates can change a row's predicate result,
-                // so a parquet-stats-driven row filter built from the base
-                // file alone would be unsafe.
-                let row_filter = if self.is_cow() {
-                    self.row_filter_builder.clone()
+                //
+                // ENG-42276 / ENG-42866 — gate parquet RowFilter pushdown.
+                //   CoW: always safe (no merge).
+                //   MOR: safe ONLY when every column referenced by the filter
+                //        is a primary key — Hudi guarantees PKs are immutable
+                //        across upserts, so the predicate outcome doesn't
+                //        change post-merge. Computed at FFI entry as
+                //        `reader_context.mor_pk_safe`; mirrors Java's
+                //        `filterIsSafeForPrimaryKey` gate in
+                //        `SparkFileFormatInternalRowReaderContext`.
+                //   Otherwise (MOR + non-PK predicate): drop the filter and
+                //   let the post-merge filter (Velox/Spark above the FG
+                //   reader) evaluate the predicate after base+log merge.
+                let row_filter = if self.reader_context.can_push_row_filter() {
+                    self.reader_context.row_filter_builder.clone()
                 } else {
-                    if self.row_filter_builder.is_some() {
+                    if self.reader_context.row_filter_builder.is_some() {
                         log::info!(
-                            "[ENG-42276] MOR table — skipping parquet RowFilter pushdown \
-                             for base file '{path}' (post-merge filter still runs)"
+                            "[ENG-42866] MOR + non-PK predicate — skipping parquet \
+                             RowFilter pushdown for base file '{path}' \
+                             (post-merge filter still runs)"
                         );
                     }
                     None
@@ -719,7 +702,12 @@ pub struct HoodieFileGroupReaderBuilder {
     reader_parameters: ReaderParameters,
     data_schema: Option<SchemaRef>,
     requested_schema: Option<SchemaRef>,
+    /// Set by `with_row_filter_builder`; copied onto a cloned reader_context
+    /// at build time so the same builder is visible to base parquet reads
+    /// (this file) and parquet log block decodes (`log_file::content`).
     row_filter_builder: Option<RowFilterBuilder>,
+    /// Set by `with_mor_pk_safe`; copied onto the cloned reader_context.
+    mor_pk_safe: Option<bool>,
 }
 
 impl HoodieFileGroupReaderBuilder {
@@ -757,12 +745,30 @@ impl HoodieFileGroupReaderBuilder {
         self
     }
 
-    /// ENG-42276 — install a parquet `RowFilter` builder. The reader will
-    /// only use it for base-file reads on COPY_ON_WRITE tables; on
-    /// MERGE_ON_READ it is silently ignored (see [`HoodieFileGroupReader`]
-    /// field docs).
+    /// ENG-42276 / ENG-42866 — install a parquet `RowFilter` builder.
+    ///
+    /// Whether the builder is actually used at scan time is gated by
+    /// `reader_context.can_push_row_filter()`:
+    /// - CoW table → always pushed
+    /// - MOR table → pushed only if `mor_pk_safe` is true (see
+    ///   [`Self::with_mor_pk_safe`])
+    ///
+    /// The builder is also visible to the parquet log block decoder via the
+    /// same `reader_context` channel.
     pub fn with_row_filter_builder(mut self, b: RowFilterBuilder) -> Self {
         self.row_filter_builder = Some(b);
+        self
+    }
+
+    /// ENG-42866 — mark the pushed predicate as safe for MOR (i.e. it
+    /// references only primary-key columns). When true, the row filter
+    /// pushes into both base parquet files and parquet log blocks on MOR
+    /// tables. When false (default), the filter pushes only on CoW.
+    ///
+    /// Compute via [`crate::file_group::predicate::PushedFilter::references_only_primary_keys`]
+    /// (lives in the cpp crate via FFI) and pass the result here.
+    pub fn with_mor_pk_safe(mut self, mor_pk_safe: bool) -> Self {
+        self.mor_pk_safe = Some(mor_pk_safe);
         self
     }
 
@@ -777,7 +783,24 @@ impl HoodieFileGroupReaderBuilder {
             .input_split
             .ok_or_else(|| CoreError::ReadFileSliceError("input_split is required".into()))?;
 
-        let mut reader = HoodieFileGroupReader::new(
+        // If the caller set a row_filter_builder or mor_pk_safe via the
+        // builder API, copy them onto the reader_context. Clone-and-replace
+        // mirrors the same pattern HoodieFileGroupReader::new() uses to
+        // update the schema_handler on its reader_context.
+        let reader_context = if self.row_filter_builder.is_some() || self.mor_pk_safe.is_some() {
+            let mut updated = (*reader_context).clone();
+            if let Some(b) = self.row_filter_builder {
+                updated.row_filter_builder = Some(b);
+            }
+            if let Some(s) = self.mor_pk_safe {
+                updated.mor_pk_safe = s;
+            }
+            Arc::new(updated)
+        } else {
+            reader_context
+        };
+
+        let reader = HoodieFileGroupReader::new(
             reader_context,
             storage,
             input_split,
@@ -785,8 +808,111 @@ impl HoodieFileGroupReaderBuilder {
             self.data_schema,
             self.requested_schema,
         );
-        reader.set_row_filter_builder(self.row_filter_builder);
 
         Ok(reader)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! ENG-42866 — verify the builder routes `with_row_filter_builder` and
+    //! `with_mor_pk_safe` onto the shared `reader_context` so both the base
+    //! parquet read site (this file's `make_base_file_batches`) and the
+    //! parquet log block decoder (`file_group::log_file::content::Decoder`)
+    //! see the same gating decision.
+    //!
+    //! These are pure builder-state tests — they exercise the builder
+    //! plumbing without actually executing a read. The end-to-end
+    //! integration is covered by the FFI-level tests + the
+    //! lake-loader functional benchmark.
+    use super::*;
+    use crate::storage::util::parse_uri;
+
+    fn dummy_reader_context(table_type: &str) -> Arc<ReaderContext> {
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config
+            .insert("hoodie.table.type".to_string(), table_type.to_string());
+        Arc::new(ctx)
+    }
+
+    fn dummy_input_split() -> InputSplit {
+        // Bare split: no base file, no log files. Sufficient for builder
+        // plumbing assertions — we never call read().
+        InputSplit::new(None, None, vec![], "p1".to_string())
+    }
+
+    fn make_row_filter_builder() -> RowFilterBuilder {
+        // Closure that always returns None — we only care that the builder
+        // was installed, not what it produces.
+        std::sync::Arc::new(|_parquet_schema, _projected_schema| None)
+    }
+
+    #[test]
+    fn builder_routes_row_filter_builder_into_reader_context() {
+        let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
+        let reader = HoodieFileGroupReader::builder()
+            .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
+            .with_storage(storage)
+            .with_input_split(dummy_input_split())
+            .with_row_filter_builder(make_row_filter_builder())
+            .build()
+            .unwrap();
+        assert!(
+            reader.reader_context.row_filter_builder.is_some(),
+            "with_row_filter_builder should land on reader_context"
+        );
+    }
+
+    #[test]
+    fn builder_mor_pk_safe_true_unlocks_pushdown_on_mor() {
+        let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
+        let reader = HoodieFileGroupReader::builder()
+            .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
+            .with_storage(storage)
+            .with_input_split(dummy_input_split())
+            .with_row_filter_builder(make_row_filter_builder())
+            .with_mor_pk_safe(true)
+            .build()
+            .unwrap();
+        assert!(reader.reader_context.mor_pk_safe);
+        assert!(
+            reader.reader_context.can_push_row_filter(),
+            "MOR + mor_pk_safe=true must push"
+        );
+    }
+
+    #[test]
+    fn builder_mor_pk_safe_false_blocks_pushdown_on_mor() {
+        let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
+        let reader = HoodieFileGroupReader::builder()
+            .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
+            .with_storage(storage)
+            .with_input_split(dummy_input_split())
+            .with_row_filter_builder(make_row_filter_builder())
+            // mor_pk_safe defaults to false
+            .build()
+            .unwrap();
+        assert!(!reader.reader_context.mor_pk_safe);
+        assert!(
+            !reader.reader_context.can_push_row_filter(),
+            "MOR without PK-safety must NOT push (mirrors Java's morFilters gate)"
+        );
+    }
+
+    #[test]
+    fn builder_cow_always_pushes_regardless_of_mor_pk_safe() {
+        let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
+        let reader = HoodieFileGroupReader::builder()
+            .with_reader_context(dummy_reader_context("COPY_ON_WRITE"))
+            .with_storage(storage)
+            .with_input_split(dummy_input_split())
+            .with_row_filter_builder(make_row_filter_builder())
+            // mor_pk_safe stays default false — irrelevant for CoW.
+            .build()
+            .unwrap();
+        assert!(
+            reader.reader_context.can_push_row_filter(),
+            "CoW path always pushes regardless of mor_pk_safe"
+        );
     }
 }

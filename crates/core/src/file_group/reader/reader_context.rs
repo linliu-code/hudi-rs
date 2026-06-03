@@ -26,6 +26,7 @@
 //! the structured configuration that the reader stack needs.
 
 use crate::config::table::HudiTableConfig;
+use crate::storage::RowFilterBuilder;
 use crate::timeline::selector::InstantRange;
 use super::record_context::RecordContext;
 use super::schema_handler::FileGroupReaderSchemaHandler;
@@ -50,7 +51,7 @@ use std::collections::HashMap;
 /// | `readerContext.getSchemaHandler()`          | `schema_handler`                        |
 /// | `metaClient.getTableConfig()` (config map)  | `table_config`                          |
 /// | `props` (hoodie reader config overrides)    | `hoodie_reader_config`                  |
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReaderContext {
     pub table_path: String,
     pub latest_commit_time: String,
@@ -81,6 +82,63 @@ pub struct ReaderContext {
     pub schema_handler: FileGroupReaderSchemaHandler,
     pub table_config: HashMap<String, String>,
     pub hoodie_reader_config: HashMap<String, String>,
+    /// Optional parquet `RowFilter` builder for predicate pushdown into base
+    /// parquet files and parquet-format log blocks. Set by the FFI bridge from
+    /// the decoded substrait predicate; `None` when no predicate was pushed.
+    ///
+    /// Whether it actually gets installed is gated by [`Self::mor_pk_safe`] +
+    /// table type (see callers in `file_group::reader::HoodieFileGroupReader`
+    /// and `file_group::log_file::content::Decoder`).
+    pub row_filter_builder: Option<RowFilterBuilder>,
+    /// True when [`Self::row_filter_builder`] references only primary-key
+    /// columns and is therefore safe to push into MERGE_ON_READ base + log
+    /// readers. Mirrors Java's `morFilters` filter set, which is computed via
+    /// `filterIsSafeForPrimaryKey` and applied to both base parquet files and
+    /// parquet log blocks via the same `readerContext.getFileRecordIterator`
+    /// entry point.
+    ///
+    /// On COPY_ON_WRITE tables this flag is irrelevant — all filters push
+    /// because no merge happens. On MERGE_ON_READ, only filters with this
+    /// flag true are pushed; filters touching non-PK columns wait for
+    /// post-merge evaluation (handled by the caller — Velox/Spark — above
+    /// the FG reader).
+    pub mor_pk_safe: bool,
+}
+
+// Manual Debug — RowFilterBuilder is a closure (Arc<dyn Fn ...>), not Debug.
+// We elide it the same way `ParquetReadOptions` does in `storage::mod`.
+impl std::fmt::Debug for ReaderContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReaderContext")
+            .field("table_path", &self.table_path)
+            .field("latest_commit_time", &self.latest_commit_time)
+            .field("base_file_format", &self.base_file_format)
+            .field("has_log_files", &self.has_log_files)
+            .field("has_bootstrap_base_file", &self.has_bootstrap_base_file)
+            .field("needs_bootstrap_merge", &self.needs_bootstrap_merge)
+            .field(
+                "should_merge_use_record_position",
+                &self.should_merge_use_record_position,
+            )
+            .field(
+                "enable_logical_timestamp_field_repair",
+                &self.enable_logical_timestamp_field_repair,
+            )
+            .field("iterator_mode", &self.iterator_mode)
+            .field("merge_mode", &self.merge_mode)
+            .field("merge_strategy_id", &self.merge_strategy_id)
+            .field("instant_range", &self.instant_range)
+            .field("record_context", &self.record_context)
+            .field("schema_handler", &self.schema_handler)
+            .field("table_config", &self.table_config)
+            .field("hoodie_reader_config", &self.hoodie_reader_config)
+            .field(
+                "row_filter_builder",
+                &self.row_filter_builder.as_ref().map(|_| "<closure>"),
+            )
+            .field("mor_pk_safe", &self.mor_pk_safe)
+            .finish()
+    }
 }
 
 impl ReaderContext {
@@ -119,8 +177,14 @@ impl ReaderContext {
     /// This differs from `record_key_field()` which returns only the first
     /// field (used for per-record key extraction in the buffer).
     pub fn record_key_fields(&self) -> Vec<String> {
-        let populate = self
-            .table_config
+        Self::record_key_fields_from(&self.table_config)
+    }
+
+    /// Static version of [`Self::record_key_fields`]. Used at FFI entry when
+    /// a `ReaderContext` doesn't yet exist (we need PK fields to decide
+    /// `mor_pk_safe` before constructing the context).
+    pub fn record_key_fields_from(table_config: &HashMap<String, String>) -> Vec<String> {
+        let populate = table_config
             .get(HudiTableConfig::PopulatesMetaFields.as_ref())
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
@@ -129,7 +193,7 @@ impl ReaderContext {
                 .as_ref()
                 .to_string()]
         } else {
-            self.table_config
+            table_config
                 .get(HudiTableConfig::RecordKeyFields.as_ref())
                 .map(|fields| {
                     fields
@@ -191,6 +255,110 @@ impl ReaderContext {
             schema_handler: FileGroupReaderSchemaHandler::new(),
             table_config: HashMap::new(),
             hoodie_reader_config: HashMap::new(),
+            row_filter_builder: None,
+            mor_pk_safe: false,
         }
+    }
+
+    /// Returns true iff the table is COPY_ON_WRITE per `hoodie.table.type`.
+    /// Defaults to `false` (treat as MOR) on missing/unparseable values so
+    /// callers err on the side of NOT pushing predicates down.
+    pub fn is_cow(&self) -> bool {
+        use crate::config::table::TableTypeValue;
+        use std::str::FromStr;
+        self.table_config
+            .get("hoodie.table.type")
+            .and_then(|v| TableTypeValue::from_str(v).ok())
+            .map(|t| matches!(t, TableTypeValue::CopyOnWrite))
+            .unwrap_or(false)
+    }
+
+    /// Returns true iff this context allows installing the parquet `RowFilter`
+    /// for the current scan. Either the table is CoW (the merge can't flip
+    /// predicate outcomes) or the filter is PK-safe (PKs are immutable across
+    /// upserts, so the predicate's outcome is stable across the base+log
+    /// merge). Mirrors the gate Java applies via the `morFilters`/`allFilters`
+    /// selection in `SparkFileFormatInternalRowReaderContext`.
+    pub fn can_push_row_filter(&self) -> bool {
+        self.is_cow() || self.mor_pk_safe
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx_with_table_type(t: &str) -> ReaderContext {
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config
+            .insert("hoodie.table.type".to_string(), t.to_string());
+        ctx
+    }
+
+    #[test]
+    fn is_cow_true_for_copy_on_write() {
+        assert!(ctx_with_table_type("COPY_ON_WRITE").is_cow());
+    }
+
+    #[test]
+    fn is_cow_false_for_merge_on_read() {
+        assert!(!ctx_with_table_type("MERGE_ON_READ").is_cow());
+    }
+
+    #[test]
+    fn is_cow_false_when_table_type_missing() {
+        // Defaults to MOR (conservative) so non-PK predicates don't sneak in.
+        assert!(!ReaderContext::empty().is_cow());
+    }
+
+    #[test]
+    fn can_push_row_filter_cow_unconditionally() {
+        // CoW: pushdown is always safe regardless of mor_pk_safe.
+        let mut ctx = ctx_with_table_type("COPY_ON_WRITE");
+        ctx.mor_pk_safe = false;
+        assert!(ctx.can_push_row_filter());
+        ctx.mor_pk_safe = true;
+        assert!(ctx.can_push_row_filter());
+    }
+
+    #[test]
+    fn can_push_row_filter_mor_only_when_pk_safe() {
+        let mut ctx = ctx_with_table_type("MERGE_ON_READ");
+        ctx.mor_pk_safe = false;
+        assert!(!ctx.can_push_row_filter());
+        ctx.mor_pk_safe = true;
+        assert!(ctx.can_push_row_filter());
+    }
+
+    #[test]
+    fn record_key_fields_from_default_meta_field_mode() {
+        // Default (populate.meta.fields absent → true): record_key_fields()
+        // returns the meta-field name regardless of recordkey.fields setting.
+        let mut tc = HashMap::new();
+        tc.insert("hoodie.table.recordkey.fields".to_string(), "id".to_string());
+        let fields = ReaderContext::record_key_fields_from(&tc);
+        assert_eq!(fields, vec!["_hoodie_record_key".to_string()]);
+    }
+
+    #[test]
+    fn record_key_fields_from_virtual_key_mode_single() {
+        let mut tc = HashMap::new();
+        tc.insert("hoodie.populate.meta.fields".to_string(), "false".to_string());
+        tc.insert("hoodie.table.recordkey.fields".to_string(), "id".to_string());
+        let fields = ReaderContext::record_key_fields_from(&tc);
+        assert_eq!(fields, vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn record_key_fields_from_virtual_key_mode_composite() {
+        // Composite PK — comma-separated, with optional whitespace.
+        let mut tc = HashMap::new();
+        tc.insert("hoodie.populate.meta.fields".to_string(), "false".to_string());
+        tc.insert(
+            "hoodie.table.recordkey.fields".to_string(),
+            "id, ts".to_string(),
+        );
+        let fields = ReaderContext::record_key_fields_from(&tc);
+        assert_eq!(fields, vec!["id".to_string(), "ts".to_string()]);
     }
 }

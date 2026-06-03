@@ -434,6 +434,63 @@ pub fn new_file_group_reader_with_context(
         handler
     };
 
+    // ── 7. Decode ENG-40156 substrait predicate ──────────────────────
+    // Decode errors are hard-fail (malformed bytes), but predicates referring
+    // to functions we don't recognise are silently dropped (decode returns
+    // Ok(None)) — Velox's post-scan filter still evaluates the original
+    // expression so there is no correctness regression.
+    let pushed_filter = PushedFilter::decode(&substrait_filter_bytes)
+        .map_err(|e| format!("[ENG-40156] failed to decode pushed filter: {e}"))?;
+    if let Some(ref pf) = pushed_filter {
+        log::info!(
+            "[ENG-40156] decoded substrait predicate over columns {:?}",
+            pf.columns()
+        );
+    }
+
+    // ── 7a. ENG-42866 — compute MOR pushdown safety ──────────────────
+    // Java's `SparkFileFormatInternalRowReaderContext.filterIsSafeForPrimaryKey`
+    // pushes a filter into MOR base + log readers iff every column it
+    // references is in the primary-key field set (or is the
+    // _hoodie_record_key meta column). Primary keys are immutable across
+    // upserts, so a PK-only predicate has the same outcome pre- and post-
+    // merge.
+    //
+    // We compute the flag here (where we have both the decoded filter and
+    // the table config) and stash it on the reader_context so the FG
+    // reader gate at `make_base_file_batches` and the parquet log block
+    // decoder in `Decoder::decode_parquet_record_content` see the same
+    // decision.
+    let record_key_fields =
+        ReaderContext::record_key_fields_from(&ffi_rc.table_config);
+    let mor_pk_safe = pushed_filter
+        .as_ref()
+        .map(|pf| pf.references_only_primary_keys(&record_key_fields))
+        .unwrap_or(false);
+    if let Some(ref pf) = pushed_filter {
+        log::info!(
+            "[ENG-42866] mor_pk_safe={mor_pk_safe} (predicate columns={:?}, \
+             primary keys={:?})",
+            pf.columns(),
+            record_key_fields,
+        );
+    }
+
+    // Build the RowFilterBuilder closure once. It's installed onto the
+    // reader_context only if there is a pushed filter; the actual
+    // installation at scan time is then gated by
+    // `reader_context.can_push_row_filter()` (CoW || mor_pk_safe).
+    let row_filter_builder: Option<hudi_dep::storage::RowFilterBuilder> =
+        pushed_filter.as_ref().map(|pf| {
+            let pf_for_closure = pf.clone();
+            let rfb: hudi_dep::storage::RowFilterBuilder = std::sync::Arc::new(
+                move |parquet_schema, _projected_schema| {
+                    pf_for_closure.build_row_filter(parquet_schema)
+                },
+            );
+            rfb
+        });
+
     let core_reader_context = Arc::new(ReaderContext {
         table_path: ffi_rc.table_path,
         latest_commit_time: ffi_rc.latest_commit_time,
@@ -451,21 +508,9 @@ pub fn new_file_group_reader_with_context(
         schema_handler,
         table_config: ffi_rc.table_config,
         hoodie_reader_config: ffi_rc.hoodie_reader_config,
+        row_filter_builder,
+        mor_pk_safe,
     });
-
-    // ── 7. Decode ENG-40156 substrait predicate ──────────────────────
-    // Decode errors are hard-fail (malformed bytes), but predicates referring
-    // to functions we don't recognise are silently dropped (decode returns
-    // Ok(None)) — Velox's post-scan filter still evaluates the original
-    // expression so there is no correctness regression.
-    let pushed_filter = PushedFilter::decode(&substrait_filter_bytes)
-        .map_err(|e| format!("[ENG-40156] failed to decode pushed filter: {e}"))?;
-    if let Some(ref pf) = pushed_filter {
-        log::info!(
-            "[ENG-40156] decoded substrait predicate over columns {:?}",
-            pf.columns()
-        );
-    }
 
     // ENG-42276 v4.3 — no per-fg tokio runtime; read() drives on
     // OBJECT_STORE_RUNTIME (see HoodieFileGroupReader doc comment).
@@ -517,28 +562,18 @@ impl HoodieFileGroupReader {
             self.reader_context.merge_mode.as_str(),
         );
 
-        // ENG-42276 — wire the decoded substrait predicate (if any) into
-        // the file-group reader as a parquet RowFilter builder. The reader
-        // gates application by table type (COW only) and the post-merge
-        // filter below still runs unconditionally, so this is purely an
-        // I/O optimisation, not a correctness path.
-        let mut builder = CoreFileGroupReader::builder()
+        // ENG-42276 / ENG-42866 — the row_filter_builder + mor_pk_safe live
+        // on reader_context (set at FFI entry, see new_file_group_reader_with_context).
+        // The FG reader gate at make_base_file_batches and the parquet log
+        // block decoder in `Decoder::decode_parquet_record_content` both
+        // consult reader_context.can_push_row_filter() to decide whether to
+        // install the filter. The post-merge filter below still runs
+        // unconditionally for non-pushed-down predicates.
+        let mut reader = CoreFileGroupReader::builder()
             .with_reader_context(self.reader_context.clone())
             .with_storage(self.storage.clone())
             .with_input_split(self.input_split.clone())
-            .with_reader_parameters(self.reader_parameters.clone());
-
-        if let Some(pf) = &self.pushed_filter {
-            let pf_for_closure = pf.clone();
-            let rfb: hudi_dep::storage::RowFilterBuilder = std::sync::Arc::new(
-                move |parquet_schema, _projected_schema| {
-                    pf_for_closure.build_row_filter(parquet_schema)
-                },
-            );
-            builder = builder.with_row_filter_builder(rfb);
-        }
-
-        let mut reader = builder
+            .with_reader_parameters(self.reader_parameters.clone())
             .build()
             .map_err(|e| format!("Failed to build file group reader: {e}"))?;
 

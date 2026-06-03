@@ -29,7 +29,7 @@ use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
 use apache_avro::{Schema as AvroSchema, from_avro_datum};
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -130,13 +130,73 @@ impl Decoder {
         let mut content_bytes = Vec::new();
         reader.read_to_end(&mut content_bytes)?;
         let content_bytes = Bytes::from(content_bytes);
-        let parquet_reader = ParquetRecordBatchReader::try_new(content_bytes, self.batch_size)?;
-        let mut batches = RecordBatches::new();
-        for item in parquet_reader {
-            let batch = item.map_err(CoreError::ArrowError)?;
-            batches.push_data_batch(batch);
+
+        // ENG-42866 — install the parquet RowFilter on parquet log blocks
+        // when the pushed predicate is safe for MOR. The gate
+        // `can_push_row_filter` is true when:
+        //   - the table is CoW (irrelevant for log blocks, which only exist
+        //     on MOR — kept for symmetry with the base file path), OR
+        //   - the predicate references only primary-key columns (PKs are
+        //     immutable across upserts, so the predicate outcome is stable
+        //     across the base+log merge — see Java's morFilters gate at
+        //     `SparkFileFormatInternalRowReaderContext.filterIsSafeForPrimaryKey`).
+        //
+        // Avro and HFile log blocks decode in-memory from byte buffers with
+        // no parquet API to attach a RowFilter to; they remain unfiltered
+        // here and rely on the post-merge filter. Tracked separately.
+        let push = self.reader_context.row_filter_builder.is_some()
+            && self.reader_context.can_push_row_filter();
+
+        if push {
+            let builder = ParquetRecordBatchReaderBuilder::try_new(content_bytes)?
+                .with_batch_size(self.batch_size);
+            // Safe: row_filter_builder was checked Some above; we just took
+            // it through can_push_row_filter()'s side condition.
+            let row_filter_builder = self
+                .reader_context
+                .row_filter_builder
+                .as_ref()
+                .expect("row_filter_builder presence checked");
+            let parquet_schema = builder.parquet_schema().clone();
+            // The projected_schema arg of the builder closure is the arrow
+            // schema after column projection. Parquet log blocks are
+            // decoded WITHOUT a caller-driven projection at this layer
+            // (the merge buffer handles projection later), so pass the
+            // arrow schema as the builder sees it. The closure only uses
+            // it to validate column names exist; it can be the same as the
+            // parquet schema's arrow representation.
+            let projected_schema = builder.schema().clone();
+            let maybe_row_filter = row_filter_builder(&parquet_schema, &projected_schema);
+
+            let builder = if let Some(rf) = maybe_row_filter {
+                log::info!(
+                    "[ENG-42866] installing parquet RowFilter on log block decode"
+                );
+                builder.with_row_filter(rf)
+            } else {
+                // Closure returned None — e.g. predicate columns not in this
+                // log block's schema. Read everything; merge layer + post-
+                // merge filter handle correctness.
+                builder
+            };
+
+            let parquet_reader = builder.build()?;
+            let mut batches = RecordBatches::new();
+            for item in parquet_reader {
+                let batch = item.map_err(CoreError::ArrowError)?;
+                batches.push_data_batch(batch);
+            }
+            Ok(batches)
+        } else {
+            let parquet_reader =
+                ParquetRecordBatchReader::try_new(content_bytes, self.batch_size)?;
+            let mut batches = RecordBatches::new();
+            for item in parquet_reader {
+                let batch = item.map_err(CoreError::ArrowError)?;
+                batches.push_data_batch(batch);
+            }
+            Ok(batches)
         }
-        Ok(batches)
     }
 
     fn decode_delete_record_content(
@@ -385,5 +445,187 @@ mod tests {
         assert_eq!(batches.num_data_rows(), 3);
 
         Ok(())
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // ENG-42866 — parquet log block predicate pushdown gate
+    // ════════════════════════════════════════════════════════════════════
+    //
+    // These tests verify the new code path in `decode_parquet_record_content`
+    // that installs a parquet RowFilter on log block reads when the pushed
+    // predicate is safe for MOR.
+
+    use parquet::arrow::arrow_reader::{ArrowPredicate, RowFilter};
+    use parquet::arrow::ProjectionMask;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Build a (parquet bytes, decoder, reader) triple for tests. Bytes
+    /// contain a 3-row parquet file with `id` and `name` columns.
+    fn make_test_parquet_and_reader(
+        ctx: ReaderContext,
+    ) -> (Decoder, BufReader<Cursor<Bytes>>) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ids = Int64Array::from(vec![1, 2, 3]);
+        let names = StringArray::from(vec!["a", "b", "c"]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids) as ArrayRef, Arc::new(names) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let decoder = Decoder::new(Arc::new(ctx));
+        let bytes = Bytes::from(buf);
+        let reader = BufReader::with_capacity(bytes.len(), Cursor::new(bytes));
+        (decoder, reader)
+    }
+
+    /// Custom ArrowPredicate that keeps rows where `id > 1`. Used to verify
+    /// the parquet log block decoder actually applies the filter when the
+    /// gate allows it.
+    struct GtOnePredicate {
+        projection: ProjectionMask,
+    }
+
+    impl ArrowPredicate for GtOnePredicate {
+        fn projection(&self) -> &ProjectionMask {
+            &self.projection
+        }
+        fn evaluate(
+            &mut self,
+            batch: RecordBatch,
+        ) -> std::result::Result<arrow_array::BooleanArray, arrow_schema::ArrowError> {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let mask: arrow_array::BooleanArray =
+                (0..ids.len()).map(|i| Some(ids.value(i) > 1)).collect();
+            Ok(mask)
+        }
+    }
+
+    #[test]
+    fn parquet_log_block_pushes_filter_when_mor_pk_safe() {
+        // Setup: reader_context says CoW (so can_push_row_filter=true via
+        // is_cow=true). Row filter builder returns a real predicate that
+        // drops rows where id == 1. Expect 2 rows out of 3.
+        //
+        // We use is_cow=true rather than mor_pk_safe=true here because both
+        // paths route through can_push_row_filter() and is_cow is easier to
+        // set deterministically. The mor_pk_safe path is exercised by the
+        // builder tests in file_group::reader::tests.
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_clone = invoked.clone();
+
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config
+            .insert("hoodie.table.type".to_string(), "COPY_ON_WRITE".to_string());
+        ctx.row_filter_builder = Some(Arc::new(move |parquet_schema, _projected| {
+            invoked_clone.store(true, Ordering::SeqCst);
+            let projection = ProjectionMask::roots(parquet_schema, vec![0_usize]);
+            Some(RowFilter::new(vec![Box::new(GtOnePredicate { projection })]))
+        }));
+
+        let (decoder, mut reader) = make_test_parquet_and_reader(ctx);
+        let batches = decoder.decode_parquet_record_content(&mut reader).unwrap();
+
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "row_filter_builder closure must be invoked when gate is open"
+        );
+        assert_eq!(
+            batches.num_data_rows(),
+            2,
+            "RowFilter should have dropped the id=1 row"
+        );
+    }
+
+    #[test]
+    fn parquet_log_block_skips_filter_when_mor_not_pk_safe() {
+        // Setup: MOR table, mor_pk_safe=false → can_push_row_filter=false →
+        // the decoder must NOT call the row_filter_builder closure. All 3
+        // rows survive. Mirrors Java's `morFilters` rejecting non-PK-safe
+        // filters from the pre-merge readers.
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_clone = invoked.clone();
+
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config
+            .insert("hoodie.table.type".to_string(), "MERGE_ON_READ".to_string());
+        ctx.mor_pk_safe = false;
+        ctx.row_filter_builder = Some(Arc::new(move |parquet_schema, _projected| {
+            invoked_clone.store(true, Ordering::SeqCst);
+            let projection = ProjectionMask::roots(parquet_schema, vec![0_usize]);
+            Some(RowFilter::new(vec![Box::new(GtOnePredicate { projection })]))
+        }));
+
+        let (decoder, mut reader) = make_test_parquet_and_reader(ctx);
+        let batches = decoder.decode_parquet_record_content(&mut reader).unwrap();
+
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "row_filter_builder closure must NOT be invoked when gate is closed (MOR + non-PK-safe)"
+        );
+        assert_eq!(
+            batches.num_data_rows(),
+            3,
+            "All rows should survive — filter wasn't installed"
+        );
+    }
+
+    #[test]
+    fn parquet_log_block_pushes_filter_when_mor_pk_safe_flag_set() {
+        // Setup: MOR table, mor_pk_safe=true → can_push_row_filter=true →
+        // the decoder must call the closure. Mirrors the production path
+        // for a PK-only predicate on a MOR table.
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_clone = invoked.clone();
+
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config
+            .insert("hoodie.table.type".to_string(), "MERGE_ON_READ".to_string());
+        ctx.mor_pk_safe = true;
+        ctx.row_filter_builder = Some(Arc::new(move |parquet_schema, _projected| {
+            invoked_clone.store(true, Ordering::SeqCst);
+            let projection = ProjectionMask::roots(parquet_schema, vec![0_usize]);
+            Some(RowFilter::new(vec![Box::new(GtOnePredicate { projection })]))
+        }));
+
+        let (decoder, mut reader) = make_test_parquet_and_reader(ctx);
+        let batches = decoder.decode_parquet_record_content(&mut reader).unwrap();
+
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "MOR + mor_pk_safe=true must install the row filter"
+        );
+        assert_eq!(
+            batches.num_data_rows(),
+            2,
+            "RowFilter should have dropped the id=1 row"
+        );
+    }
+
+    #[test]
+    fn parquet_log_block_no_filter_when_builder_absent() {
+        // Setup: gate is open (CoW) but no row_filter_builder set. All rows
+        // come through; no panic, no extra work. Verifies the new code
+        // path doesn't break the no-pushed-predicate case.
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config
+            .insert("hoodie.table.type".to_string(), "COPY_ON_WRITE".to_string());
+        // row_filter_builder stays None.
+
+        let (decoder, mut reader) = make_test_parquet_and_reader(ctx);
+        let batches = decoder.decode_parquet_record_content(&mut reader).unwrap();
+        assert_eq!(batches.num_data_rows(), 3);
     }
 }
