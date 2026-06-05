@@ -60,6 +60,18 @@ pub struct BufferedRecord {
 
     /// Whether this record represents a deletion.
     pub is_delete: bool,
+
+    /// Interned schema id, set when the record is encoded to compact bytes.
+    ///
+    /// Mirrors Java's `BufferedRecord.schemaId: Integer`. Different log
+    /// blocks (and base files) may produce records with different writer
+    /// schemas, so each record carries an opaque id into
+    /// `RecordContext`'s schema cache. Used to look up the right
+    /// `RowCodec` at decode time.
+    ///
+    /// `None` for records that have not been interned yet (e.g. legacy
+    /// constructors that pre-date the schema cache).
+    pub schema_id: Option<u32>,
 }
 
 impl BufferedRecord {
@@ -71,6 +83,7 @@ impl BufferedRecord {
             binary_data: None,
             ordering_value,
             is_delete: false,
+            schema_id: None,
         }
     }
 
@@ -82,6 +95,7 @@ impl BufferedRecord {
             binary_data: None,
             ordering_value,
             is_delete: true,
+            schema_id: None,
         }
     }
 
@@ -97,50 +111,56 @@ impl BufferedRecord {
 
     /// Convert the record data to binary format for compact storage.
     ///
-    /// Mirrors Java's `BufferedRecord.toBinary(RecordContext<T> recordContext)`.
+    /// Mirrors Java's `BufferedRecord.toBinary(RecordContext<T> recordContext)`:
+    /// interns the record's writer schema in `record_context`'s schema cache,
+    /// stores the resulting id on `self`, and encodes the row via the cached
+    /// `RowCodec` for that schema. The codec format is ~10× more compact than
+    /// the legacy per-record Arrow IPC stream (ENG-40160).
     ///
-    /// ```java
-    /// public BufferedRecord<T> toBinary(RecordContext<T> recordContext) {
-    ///     if (record != null) {
-    ///         HoodieSchema schema = recordContext.getSchemaFromBufferRecord(this);
-    ///         if (schema != null) {
-    ///             record = recordContext.seal(recordContext.toBinaryRow(schema, record));
-    ///         }
-    ///     }
-    ///     return this;
-    /// }
-    /// ```
-    ///
-    /// For Arrow: serializes the `RecordBatch` to IPC bytes via
-    /// `RecordContext::to_binary_row()` + `RecordContext::seal()`,
-    /// stores in `binary_data`, clears `data`.
-    pub fn to_binary(&mut self, _record_context: &RecordContext) -> &mut Self {
-        if self.data.is_some() {
-            let schema = RecordContext::get_schema_from_buffer_record(self);
-            if let Some(ref schema) = schema {
-                let batch = self.data.take().unwrap();
-                let bytes = RecordContext::to_binary_row(schema, &batch);
-                self.binary_data = Some(RecordContext::seal(bytes));
+    /// Falls back to the legacy Arrow IPC stream when the schema contains
+    /// data types `RowCodec` doesn't yet support (List / Struct / Map).
+    pub fn to_binary(&mut self, record_context: &RecordContext) -> &mut Self {
+        if let Some(batch) = self.data.take() {
+            let schema = batch.schema();
+            let id = record_context.intern_schema(schema.clone());
+            self.schema_id = Some(id);
+
+            // Try the compact codec first.
+            if let Some(codec) = record_context.codec_for(id) {
+                if let Ok(bytes) = codec.encode_row(&batch, 0) {
+                    self.binary_data = Some(bytes);
+                    return self;
+                }
             }
+            // Codec unavailable or encode failed → legacy IPC fallback.
+            let bytes = RecordContext::to_binary_row(&schema, &batch);
+            self.binary_data = Some(RecordContext::seal(bytes));
         }
         self
     }
 
     /// Return the record data, deserializing from binary if needed.
     ///
-    /// Mirrors Java's `BufferedRecord.getRecord()`.
-    ///
-    /// In Java, `getRecord()` returns the record as-is (UnsafeRow IS InternalRow).
-    /// In Rust/Arrow, after `to_binary()` we must explicitly deserialize IPC bytes
-    /// back to `RecordBatch`.
-    pub fn get_record(&self) -> Option<RecordBatch> {
+    /// Mirrors Java's `BufferedRecord.getRecord()` + the engine-specific
+    /// unwrap. Uses `record_context`'s cached `RowCodec` (looked up by
+    /// `self.schema_id`) for the compact codec path; falls back to
+    /// Arrow IPC if `schema_id` is unset or codec decode failed.
+    pub fn get_record(&self, record_context: &RecordContext) -> Option<RecordBatch> {
         if let Some(ref batch) = self.data {
             return Some(batch.clone());
         }
-        if let Some(ref bytes) = self.binary_data {
-            return RecordContext::from_binary(bytes).ok();
+        let bytes = self.binary_data.as_ref()?;
+        // Compact codec path: requires schema_id set by to_binary().
+        if let Some(id) = self.schema_id {
+            if let Some(codec) = record_context.codec_for(id) {
+                if let Ok(batch) = codec.decode_row(bytes) {
+                    return Some(batch);
+                }
+            }
         }
-        None
+        // Legacy IPC fallback (records that pre-date schema_id, or codec
+        // build failed for an unsupported schema).
+        RecordContext::from_binary(bytes).ok()
     }
 }
 

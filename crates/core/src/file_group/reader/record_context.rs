@@ -32,6 +32,7 @@ use crate::config::table::HudiTableConfig;
 use crate::error::CoreError;
 use crate::file_group::reader::buffered_record::{BufferedRecord, OrderingValue};
 use crate::file_group::reader::delete_context::DeleteContext;
+use crate::file_group::reader::row_codec::RowCodec;
 use crate::metadata::meta_field::MetaField;
 use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_ipc::reader::StreamReader;
@@ -39,8 +40,31 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, SchemaRef};
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::{Arc, RwLock};
 
 use super::buffer::row_extraction::slice_row;
+
+/// Per-FG-reader schema + codec cache. Mirrors Java's `LocalAvroSchemaCache`
+/// on `RecordContext`, extended with a lazy-built `RowCodec` per schema id
+/// so we don't re-derive the field-layout table 18M times during a merge.
+#[derive(Debug, Default)]
+struct SchemaCacheInner {
+    /// id → schema (kept alive so Arc pointers stay valid for the
+    /// pointer-equality fast path)
+    id_to_schema: HashMap<u32, SchemaRef>,
+    /// Schema's Debug repr → id (semantic dedup; two different Arc<Schema>
+    /// with identical content collapse to the same id)
+    repr_to_id: HashMap<String, u32>,
+    /// `Arc::as_ptr(schema) as usize` → id (fast path; skips the repr
+    /// formatting when the same Arc is interned repeatedly)
+    ptr_to_id: HashMap<usize, u32>,
+    /// id → `RowCodec` for that schema. Lazy: built on first encode/decode
+    /// for the id. `None` if codec construction failed (e.g. unsupported
+    /// data type) — caller falls back to legacy IPC.
+    codecs: HashMap<u32, Arc<RowCodec>>,
+    /// Next id to assign. Starts at 0; never reused.
+    next_id: u32,
+}
 
 /// Record context for Arrow engine record operations.
 ///
@@ -80,6 +104,16 @@ pub struct RecordContext {
     /// Partition path for constructing delete rows.
     /// Mirrors Java's `RecordContext.partitionPath`.
     pub partition_path: String,
+
+    /// Cache of writer schemas seen during this FG read, plus the lazy-built
+    /// `RowCodec` for each. Mirrors Java's `localAvroSchemaCache` on
+    /// `RecordContext` — each `BufferedRecord.schema_id` is an opaque
+    /// integer key into this cache.
+    ///
+    /// `Clone` semantics: cloning `RecordContext` clones the `Arc`, so all
+    /// clones share the same cache. This matches Java where `RecordContext`
+    /// is passed by reference through the FG reader and its merger.
+    schema_cache: Arc<RwLock<SchemaCacheInner>>,
 }
 
 impl Default for RecordContext {
@@ -130,7 +164,78 @@ impl RecordContext {
             ordering_field_names,
             populate_meta_fields,
             partition_path,
+            schema_cache: Arc::new(RwLock::new(SchemaCacheInner::default())),
         }
+    }
+
+    // =========================================================================
+    // Schema cache — mirrors Java's LocalAvroSchemaCache on RecordContext
+    // =========================================================================
+
+    /// Intern a writer schema. Returns a small integer id; the same schema
+    /// (by `Arc` pointer fast-path or content-equality slow-path) always
+    /// returns the same id. Mirrors Java's `RecordContext.encodeAvroSchema`.
+    ///
+    /// Call this once per input batch (not once per row) before tagging
+    /// `BufferedRecord`s — interning is O(1) on the fast path but does
+    /// allocate a String on the slow path, so per-row calls would be
+    /// pointlessly wasteful.
+    pub fn intern_schema(&self, schema: SchemaRef) -> u32 {
+        let ptr = Arc::as_ptr(&schema) as usize;
+        // Fast path: same Arc instance previously interned.
+        {
+            let r = self.schema_cache.read().unwrap();
+            if let Some(&id) = r.ptr_to_id.get(&ptr) {
+                return id;
+            }
+        }
+        // Slow path: semantic dedup via Debug repr. Two different Arc<Schema>
+        // with the same content collapse to the same id.
+        let repr = format!("{:?}", schema.as_ref());
+        let mut w = self.schema_cache.write().unwrap();
+        if let Some(&id) = w.repr_to_id.get(&repr) {
+            w.ptr_to_id.insert(ptr, id);
+            return id;
+        }
+        let id = w.next_id;
+        w.next_id += 1;
+        w.id_to_schema.insert(id, schema);
+        w.repr_to_id.insert(repr, id);
+        w.ptr_to_id.insert(ptr, id);
+        id
+    }
+
+    /// Look up a previously interned schema. Mirrors Java's
+    /// `RecordContext.decodeAvroSchema`.
+    pub fn schema_by_id(&self, id: u32) -> Option<SchemaRef> {
+        self.schema_cache
+            .read()
+            .unwrap()
+            .id_to_schema
+            .get(&id)
+            .cloned()
+    }
+
+    /// Get the cached `RowCodec` for a schema id, building it lazily on
+    /// first use. Returns `None` if codec construction failed (e.g. the
+    /// schema contains a List/Struct/Map field — caller should fall back
+    /// to legacy IPC).
+    pub fn codec_for(&self, id: u32) -> Option<Arc<RowCodec>> {
+        {
+            let r = self.schema_cache.read().unwrap();
+            if let Some(c) = r.codecs.get(&id) {
+                return Some(c.clone());
+            }
+        }
+        let schema = self.schema_by_id(id)?;
+        let codec = Arc::new(RowCodec::new(schema).ok()?);
+        let mut w = self.schema_cache.write().unwrap();
+        // Re-check under write lock in case another thread won the race.
+        if let Some(c) = w.codecs.get(&id) {
+            return Some(c.clone());
+        }
+        w.codecs.insert(id, codec.clone());
+        Some(codec)
     }
 
     // =========================================================================

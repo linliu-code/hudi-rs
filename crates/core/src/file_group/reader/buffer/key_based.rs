@@ -252,7 +252,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             .delta_merge(&record, existing)?;
 
         if let Some(mut merged_record) = merged {
-            log::debug!(
+            log::trace!(
                 "[KeyBasedBuffer] processNextDataRecord: key={key} has_existing={has_existing} → merged (is_delete={})",
                 merged_record.is_delete(),
             );
@@ -260,7 +260,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             merged_record.to_binary(&self.record_context);
             self.base.records.insert(key.to_string(), merged_record);
         } else {
-            log::debug!(
+            log::trace!(
                 "[KeyBasedBuffer] processNextDataRecord: key={key} has_existing={has_existing} → dropped by merger",
             );
         }
@@ -326,7 +326,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             .delta_merge_delete(&delete_record, existing);
 
         if let Ok(Some(surviving_delete)) = &surviving {
-            log::debug!(
+            log::trace!(
                 "[KeyBasedBuffer] processNextDeletedRecord: key={key} has_existing={has_existing} → delete wins",
             );
             self.base.records.insert(
@@ -334,7 +334,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                 BufferedRecords::from_delete_record(surviving_delete),
             );
         } else {
-            log::debug!(
+            log::trace!(
                 "[KeyBasedBuffer] processNextDeletedRecord: key={key} has_existing={has_existing} → existing survives",
             );
         }
@@ -416,7 +416,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                 .base
                 .records
                 .values()
-                .find_map(|r| r.get_record());
+                .find_map(|r| r.get_record(&self.record_context));
             match any_data_record.as_ref() {
                 Some(batch) => batch.schema(),
                 None => {
@@ -447,7 +447,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             deletes,
         );
 
-        records_to_batch(output_records, schema)
+        records_to_batch(output_records, schema, &self.record_context)
     }
 }
 

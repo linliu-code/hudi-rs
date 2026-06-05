@@ -50,7 +50,7 @@ fn init_logger() {
     LOGGER.get_or_init(|| {
         match std::env::var("RUST_LOG") {
             Ok(_) => {}
-            Err(_) => unsafe { std::env::set_var("RUST_LOG", "debug") },
+            Err(_) => unsafe { std::env::set_var("RUST_LOG", "info") },
         }
         let _ = env_logger::try_init();
     });

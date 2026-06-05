@@ -30,6 +30,7 @@
 use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::reader::buffered_record::BufferedRecord;
+use crate::file_group::reader::record_context::RecordContext;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 
@@ -47,11 +48,15 @@ pub fn slice_row(batch: &RecordBatch, row_index: usize) -> RecordBatch {
 pub fn records_to_batch(
     records: Vec<BufferedRecord>,
     schema: SchemaRef,
+    record_context: &RecordContext,
 ) -> Result<RecordBatch> {
-    // Mirrors Java: BufferedRecord.getRecord() unwraps from binary if needed
+    // Mirrors Java: BufferedRecord.getRecord() unwraps from binary if needed.
+    // RecordContext is threaded through so each record can decode via its
+    // cached RowCodec (looked up by schema_id). Records can carry different
+    // writer schemas; reconciliation to `schema` happens below.
     let batches: Vec<RecordBatch> = records
         .iter()
-        .filter_map(|r| r.get_record())
+        .filter_map(|r| r.get_record(record_context))
         .collect();
 
     if batches.is_empty() {
@@ -166,7 +171,7 @@ mod tests {
         let records = ctx.batch_to_buffered_records(&batch, None).unwrap();
         let buffered: Vec<BufferedRecord> = records.into_iter().map(|(_, r)| r).collect();
 
-        let result = records_to_batch(buffered, schema.clone()).unwrap();
+        let result = records_to_batch(buffered, schema.clone(), &ctx).unwrap();
         assert_eq!(result.num_rows(), 3);
         assert_eq!(result.schema(), schema);
     }
@@ -174,7 +179,8 @@ mod tests {
     #[test]
     fn test_records_to_batch_empty() {
         let schema = make_test_batch(0).schema();
-        let result = records_to_batch(vec![], schema.clone()).unwrap();
+        let ctx = RecordContext::default();
+        let result = records_to_batch(vec![], schema.clone(), &ctx).unwrap();
         assert_eq!(result.num_rows(), 0);
     }
 }

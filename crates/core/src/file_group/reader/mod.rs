@@ -77,6 +77,7 @@ pub mod reader_context;
 pub mod reader_parameters;
 pub mod record_context;
 pub mod record_merger;
+pub mod row_codec;
 pub mod schema_handler;
 pub mod update_processor;
 

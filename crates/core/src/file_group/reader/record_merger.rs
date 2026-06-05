@@ -213,6 +213,7 @@ mod tests {
             binary_data: None,
             ordering_value: ordering.map(OrderingValue::Long),
             is_delete: false,
+            schema_id: None,
         }
     }
 
