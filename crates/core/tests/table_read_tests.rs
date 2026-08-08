@@ -1617,17 +1617,16 @@ mod v9_tables {
                 "Expected at least one MOR file slice with log files"
             );
 
+            // This table's log records carry a decimal and a timestamp. Both used
+            // to stop the read — the decimal had no Avro-to-Arrow conversion, and
+            // the timestamp came back without the UTC zone its parquet base file
+            // has, so the two could not be concatenated. This asserted that
+            // failure; it now asserts the read.
             let options = ReadOptions::new();
             let stream = hudi_table.read_stream(&options).await?;
-            let err = match collect_stream_batches(stream).await {
-                Ok(_) => panic!("Expected MOR streaming read with decimal log records to fail"),
-                Err(err) => err,
-            };
-            let err_message = err.to_string();
-            assert!(
-                err_message.contains("Decimal128(15, 2) not supported"),
-                "Unexpected error for MOR log-file streaming path: {err_message}"
-            );
+            let batches = collect_stream_batches(stream).await?;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert!(rows > 0, "MOR log-file streaming read returned no rows");
             Ok(())
         }
 
@@ -2679,7 +2678,7 @@ mod lance_tables {
         assert!(
             file_slices.iter().any(|slice| slice
                 .base_file_relative_path()
-                .is_ok_and(|path| path.ends_with(".lance"))),
+                .is_ok_and(|path| path.is_some_and(|p| p.ends_with(".lance")))),
             "table listing should discover .lance base files without an explicit format config"
         );
 
@@ -2807,5 +2806,349 @@ mod mdt_enabled_tables {
 
             Ok(())
         }
+    }
+}
+
+/// A base file written by compaction carries records from every commit it
+/// merged, so an incremental read that admits the file must still drop the
+/// records outside its window.
+///
+/// The fixture's compacted base file holds `a@…526409`, `b@…528666` and
+/// `c`/`d@…522627`. Reading `(…522627, …530452]` admits that file, but `d` has
+/// never been touched inside the window and must not come back. A reader that
+/// decides per file rather than per row returns it, which is the regression
+/// this pins.
+mod incremental_over_a_compacted_base_file {
+    use super::*;
+
+    const C1_INSERT_ALL: &str = "20260807223522627";
+    /// Between `c`'s update completing (…530767) and `d`'s starting (…531562).
+    /// Slice selection compares completion times while the row mask compares
+    /// requested times, so a boundary landing between the two would make the
+    /// test about that difference rather than about the compacted base file.
+    const AFTER_C_BEFORE_D: &str = "20260807223531000";
+
+    async fn read_window(merge_engine: &str) -> Result<Vec<(String, String, f64)>> {
+        let base_url = QuickstartTripsTable::V9MorCompactedIncremental.url_to_mor_avro();
+        let table = Table::new(base_url.path()).await?;
+
+        // The engine has to travel with the read: `Table::build` strips every
+        // `hoodie.read.*` key from the table's own configs.
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(C1_INSERT_ALL)
+                    .with_end_timestamp(AFTER_C_BEFORE_D)
+                    .with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), merge_engine),
+            )
+            .await?;
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = &records[0].schema();
+        let merged = concat_batches(schema, &records)?;
+        let mut rows = QuickstartTripsTable::uuid_rider_and_fare(&merged);
+        rows.sort_by(|l, r| l.0.cmp(&r.0));
+        Ok(rows)
+    }
+
+    /// `d` sits in the compacted base file at a commit before the window opens.
+    #[tokio::test]
+    async fn the_engine_drops_a_base_record_from_outside_the_window() -> Result<()> {
+        let rows = read_window("v2").await?;
+
+        let ids: Vec<&str> = rows.iter().map(|(uuid, _, _)| uuid.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a", "b", "c"],
+            "the compacted base file is inside the window, but d's only commit is not"
+        );
+        Ok(())
+    }
+
+    /// The reader in use today reaches the same answer, so the fixture pins
+    /// behaviour rather than one engine's interpretation of it.
+    #[tokio::test]
+    async fn both_engines_agree_on_the_window() -> Result<()> {
+        assert_eq!(read_window("v2").await?, read_window("legacy").await?);
+        Ok(())
+    }
+}
+
+/// Incremental reads over a merge-on-read table whose delta commits only append.
+///
+/// Every update to a merge-on-read table writes a log file and nothing else, and
+/// such a write stat records an empty `baseFile`. Reading one used to fail
+/// outright with `Failed to parse file name '' for base file.`, so no
+/// merge-on-read table could be read incrementally at all — unnoticed because
+/// every other incremental test here reads a copy-on-write table.
+mod incremental_over_append_only_delta_commits {
+    use super::*;
+
+    /// Commit 1 inserts ids 0-6, commit 2 deletes 0,1,2, commit 3 updates 4,5,6.
+    const C1_INSERT: &str = "20260409002001492";
+    const C3_UPDATE: &str = "20260409002003963";
+
+    #[tokio::test]
+    async fn a_log_only_delta_commit_no_longer_breaks_the_read() -> Result<()> {
+        let base_url = QuickstartTripsTable::V9MorNonpart3Commits.url_to_mor_avro();
+        let table = Table::new(base_url.path()).await?;
+
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(C1_INSERT)
+                    .with_end_timestamp(C3_UPDATE),
+            )
+            .await?;
+
+        let rows: usize = records.iter().map(|batch| batch.num_rows()).sum();
+        assert!(
+            rows > 0,
+            "the window covers a delete and an update commit, so it cannot be empty"
+        );
+        Ok(())
+    }
+}
+
+/// Incremental windows checked against what Hudi's own reader returns.
+///
+/// The gold files under the fixture's `gold_incremental/<window>` were produced
+/// by Spark 3.5.3 / Hudi 1.2.0-SNAPSHOT reading the same table with
+/// `hoodie.datasource.read.begin.instanttime` / `end.instanttime`. Comparing
+/// against them checks this crate against the reference implementation rather
+/// than against its own incumbent reader.
+mod incremental_windows_match_hudi {
+    use super::*;
+
+    /// Both engines, so the comparison covers the reader being shipped as well
+    /// as the one it replaces.
+    const ENGINES: [&str; 2] = ["legacy", "v2"];
+
+    async fn read_window(engine: &str, start: &str, end: &str) -> Result<RecordBatch> {
+        let base_url = QuickstartTripsTable::V9MorCompactedIncremental.url_to_mor_avro();
+        let table = Table::new(base_url.path()).await?;
+        // The engine has to travel with the read: `Table::build` strips every
+        // `hoodie.read.*` key from the table's own configs.
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(start)
+                    .with_end_timestamp(end)
+                    .with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine),
+            )
+            .await?;
+        if records.is_empty() {
+            return Ok(RecordBatch::new_empty(std::sync::Arc::new(
+                arrow_schema::Schema::empty(),
+            )));
+        }
+        let schema = records[0].schema();
+        Ok(concat_batches(&schema, &records)?)
+    }
+
+    fn gold_for(window: &str) -> Result<RecordBatch> {
+        let dir = format!(
+            "{}/gold_incremental/{window}",
+            QuickstartTripsTable::V9MorCompactedIncremental.path_to_mor_avro()
+        );
+        hudi_test::gold::read_gold_parquet(&dir)
+            .map_err(|e| CoreError::ReadFileSliceError(format!("gold '{window}': {e}")))
+    }
+
+    async fn assert_matches_gold(window: &str, start: &str, end: &str) -> Result<()> {
+        let gold = gold_for(window)?;
+        for engine in ENGINES {
+            let actual = read_window(engine, start, end).await?;
+            hudi_test::gold::compare_against_gold_keyed(&actual, &gold, "uuid").map_err(|e| {
+                CoreError::ReadFileSliceError(format!("window '{window}', engine '{engine}': {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Opens after the insert, closes on `c`'s update: `a`, `b`, `c` changed.
+    #[tokio::test]
+    async fn a_window_spanning_the_compaction_and_a_later_update() -> Result<()> {
+        assert_matches_gold(
+            "after_insert_through_c",
+            "20260807223524868",
+            "20260807223530767",
+        )
+        .await
+    }
+
+    /// Closes on the compaction: only `a` and `b` had changed by then.
+    #[tokio::test]
+    async fn a_window_closing_on_the_compaction() -> Result<()> {
+        assert_matches_gold(
+            "through_compaction",
+            "20260807223524868",
+            "20260807223529586",
+        )
+        .await
+    }
+
+    /// A window whose bounds fall between one commit's requested and completion
+    /// times, where this crate and Hudi disagree.
+    ///
+    /// Both readers range `(start, end]`; they differ in *which* timestamp they
+    /// compare. Hudi uses the commit's **completion** time (…529143, inside the
+    /// window, so `b` is returned); this crate uses its **requested** time
+    /// (…528666, which is the window's own exclusive start, so nothing is).
+    /// See `v8_mor_boundary_windows` for the four boundary positions that pin
+    /// this down.
+    #[tokio::test]
+    async fn a_window_between_requested_and_completion_time_disagrees() -> Result<()> {
+        for engine in ENGINES {
+            let actual = read_window(engine, "20260807223528666", "20260807223529143").await?;
+            assert_eq!(
+                actual.num_rows(),
+                0,
+                "engine '{engine}': this crate returns nothing here; when it starts \
+                 returning Hudi's one row, fold the window into the gold set"
+            );
+        }
+        let gold = gold_for("only_b")?;
+        assert_eq!(gold.num_rows(), 1, "Hudi returns b for this window");
+        Ok(())
+    }
+}
+
+/// Incremental windows whose bounds land on a commit's requested or completion
+/// time, checked against what Hudi returns for the same window.
+///
+/// Requires a table version 8 or later: only timeline layout v2 names completed
+/// instants `{requested}_{completion}`, so only there can the two disagree.
+///
+/// Measured against Hudi 1.2.0-SNAPSHOT, the two readers follow the same shape
+/// and differ in one input:
+///
+/// | | range | timestamp compared |
+/// |---|---|---|
+/// | Hudi | `(start, end]` | **completion** |
+/// | this crate | `(start, end]` | **requested** |
+///
+/// So they agree whenever a window's bounds fall in the gaps between commits,
+/// and disagree exactly when a bound lands between one commit's requested and
+/// completion times. Hudi's config docs describe the start as inclusive
+/// (`completion_time >= START_COMMIT`); the observed behaviour is exclusive,
+/// which `starting_on_a_completion_time` pins.
+mod incremental_window_boundaries {
+    use super::*;
+
+    /// c3 (`UPDATE b`) is the pivot: requested …723246, completed …723734.
+    const C3_REQUESTED: &str = "20260808010723246";
+    const C3_COMPLETED: &str = "20260808010723734";
+
+    /// Both engines, so the comparison covers the reader being shipped as well
+    /// as the one it replaces.
+    const ENGINES: [&str; 2] = ["legacy", "v2"];
+
+    async fn uuids_in_window(engine: &str, start: &str, end: &str) -> Result<Vec<String>> {
+        let base_url = QuickstartTripsTable::V8MorBoundaryWindows.url_to_mor_avro();
+        let table = Table::new(base_url.path()).await?;
+        // The engine has to travel with the read: `Table::build` strips every
+        // `hoodie.read.*` key from the table's own configs.
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(start)
+                    .with_end_timestamp(end)
+                    .with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine),
+            )
+            .await?;
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = records[0].schema();
+        let merged = concat_batches(&schema, &records)?;
+        let mut rows = QuickstartTripsTable::uuid_rider_and_fare(&merged);
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows.into_iter().map(|(uuid, _, _)| uuid).collect())
+    }
+
+    /// What Hudi returned for the same window, read from the fixture's gold.
+    fn hudi_uuids(window: &str) -> Result<Vec<String>> {
+        let dir = format!(
+            "{}/gold_incremental/{window}",
+            QuickstartTripsTable::V8MorBoundaryWindows.path_to_mor_avro()
+        );
+        let gold = hudi_test::gold::read_gold_parquet(&dir)
+            .map_err(|e| CoreError::ReadFileSliceError(format!("gold '{window}': {e}")))?;
+        let mut rows = QuickstartTripsTable::uuid_rider_and_fare(&gold);
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows.into_iter().map(|(uuid, _, _)| uuid).collect())
+    }
+
+    /// Neither bound touches a commit's timestamps, so requested and completion
+    /// time pick the same commits and the readers agree.
+    #[tokio::test]
+    async fn a_window_between_commits_agrees_with_hudi() -> Result<()> {
+        let hudi = hudi_uuids("between_commits")?;
+        for engine in ENGINES {
+            assert_eq!(
+                uuids_in_window(engine, "20260808010722500", "20260808010724000").await?,
+                hudi,
+                "engine '{engine}'"
+            );
+        }
+        Ok(())
+    }
+
+    /// Starting on c3's *completion* time excludes c3 from both readers — Hudi
+    /// because its start is exclusive on completion time, this crate because
+    /// c3's requested time is earlier still. Agreement by different routes.
+    #[tokio::test]
+    async fn starting_on_a_completion_time_agrees_with_hudi() -> Result<()> {
+        let hudi = hudi_uuids("start_on_completion")?;
+        for engine in ENGINES {
+            assert_eq!(
+                uuids_in_window(engine, C3_COMPLETED, "20260808010725000").await?,
+                hudi,
+                "engine '{engine}'"
+            );
+        }
+        Ok(())
+    }
+
+    /// Starting on c3's *requested* time: Hudi keeps c3, since it completed
+    /// after the window opened. This crate drops it, since the window's start is
+    /// exclusive and c3's requested time is exactly that start.
+    #[tokio::test]
+    async fn starting_on_a_requested_time_differs_from_hudi() -> Result<()> {
+        assert_eq!(hudi_uuids("start_on_requested")?, vec!["b".to_string()]);
+        for engine in ENGINES {
+            assert_eq!(
+                uuids_in_window(engine, C3_REQUESTED, "20260808010724000").await?,
+                Vec::<String>::new(),
+                "engine '{engine}': when this returns b, fold the window into \
+                 the agreeing set above"
+            );
+        }
+        Ok(())
+    }
+
+    /// A window that opens at c3's requested time and closes at its completion
+    /// time contains exactly that one commit for Hudi, and nothing here.
+    #[tokio::test]
+    async fn a_window_spanning_one_commit_differs_from_hudi() -> Result<()> {
+        assert_eq!(
+            hudi_uuids("requested_to_completion")?,
+            vec!["b".to_string()]
+        );
+        for engine in ENGINES {
+            assert_eq!(
+                uuids_in_window(engine, C3_REQUESTED, C3_COMPLETED).await?,
+                Vec::<String>::new(),
+                "engine '{engine}': when this returns b, fold the window into \
+                 the agreeing set above"
+            );
+        }
+        Ok(())
     }
 }

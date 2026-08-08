@@ -120,7 +120,7 @@ use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use url::Url;
@@ -376,6 +376,19 @@ impl Table {
         self.get_schema_inner(true).await
     }
 
+    /// The schema a file slice's records actually carry.
+    ///
+    /// Meta fields are only in the data when the table populates them; handing
+    /// a reader a schema that names columns the files do not have fails the
+    /// evolution step rather than helping it.
+    async fn data_schema_for_read(&self) -> Result<Schema> {
+        let populates_meta_fields: bool = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::PopulatesMetaFields)
+            .into();
+        self.get_schema_inner(populates_meta_fields).await
+    }
+
     async fn get_schema_inner(&self, includes_meta_fields: bool) -> Result<Schema> {
         if includes_meta_fields {
             resolve_schema(self).await
@@ -546,33 +559,31 @@ impl Table {
             .get_file_groups_between(Some(start_timestamp), Some(end_timestamp), estimator)
             .await?;
 
-        // Skip schema fetch and pruner construction when there are no filters.
-        let partition_pruner = if filters.is_empty() {
-            None
-        } else {
-            let partition_schema = self.get_partition_schema().await?;
-            // See `get_file_slices_inner` for why validation uses the
-            // meta-inclusive schema.
-            let table_schema = self.get_schema_with_meta_fields().await?;
-            validate_fields_against_schemas(filters, [&table_schema, &partition_schema])?;
-            Some(PartitionPruner::new(
-                filters,
-                &partition_schema,
-                self.hudi_configs.as_ref(),
-            )?)
-        };
+        // The commits in range say *which* file groups changed; they are not a
+        // reliable source for the slices themselves. A delta commit that only
+        // appends names no base file, and a commit that writes one does not know
+        // about log files appended after it — so a slice assembled from range
+        // metadata alone is missing either its base file or its newest logs.
+        //
+        // Read the slice that is live at the end of the range instead, exactly
+        // as a snapshot read at `end_timestamp` would. The commit-time mask then
+        // narrows its rows back to the window.
+        let touched: HashSet<(&str, &str)> = file_groups
+            .iter()
+            .map(|file_group| {
+                (
+                    file_group.partition_path.as_str(),
+                    file_group.file_id.as_str(),
+                )
+            })
+            .collect();
 
-        let mut file_slices: Vec<FileSlice> = Vec::new();
-        for file_group in file_groups {
-            if let Some(ref pruner) = partition_pruner
-                && !pruner.should_include(&file_group.partition_path)
-            {
-                continue;
-            }
-            if let Some(file_slice) = file_group.get_file_slice_as_of(end_timestamp) {
-                file_slices.push(file_slice.clone());
-            }
-        }
+        let mut file_slices: Vec<FileSlice> = self
+            .get_file_slices_inner(end_timestamp, filters, base_file_only)
+            .await?
+            .into_iter()
+            .filter(|slice| touched.contains(&(slice.partition_path.as_str(), slice.file_id())))
+            .collect();
 
         if base_file_only {
             for fs in &mut file_slices {
@@ -684,10 +695,14 @@ impl Table {
         let file_slices = self
             .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
-        let fg_reader = self.build_file_group_reader(
+        let mut fg_reader = self.build_file_group_reader(
             prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
         )?;
+        // The table's current schema, not the base file's: a base file written
+        // before a column was widened or added would otherwise force the newer
+        // records back into its own narrower shape.
+        fg_reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
         let fg_options = self.options_for_file_group(prepared);
         let batches = futures::future::try_join_all(
             file_slices
@@ -707,10 +722,14 @@ impl Table {
         let file_slices = self
             .get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
             .await?;
-        let fg_reader = self.build_file_group_reader(
+        let mut fg_reader = self.build_file_group_reader(
             prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
         )?;
+        // The table's current schema, not the base file's: a base file written
+        // before a column was widened or added would otherwise force the newer
+        // records back into its own narrower shape.
+        fg_reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
         let fg_options = self.options_for_file_group(prepared);
 
         let batches = futures::future::try_join_all(
@@ -843,10 +862,14 @@ impl Table {
             return Ok(Box::pin(stream::empty()));
         }
 
-        let fg_reader = self.build_file_group_reader(
+        let mut fg_reader = self.build_file_group_reader(
             prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
         )?;
+        // The table's current schema, not the base file's: a base file written
+        // before a column was widened or added would otherwise force the newer
+        // records back into its own narrower shape.
+        fg_reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
 
         // Extract per-batch options. Keep `filters` so they apply at row-level too —
         // the upstream pruning already used them at file/partition level; applying at
@@ -1020,7 +1043,9 @@ mod tests {
         let base_url = table.base_url();
         let options = ReadOptions::new().with_filters(filters.iter().copied())?;
         for f in table.get_file_slices(&options).await? {
-            let relative_path = f.base_file_relative_path()?;
+            let Some(relative_path) = f.base_file_relative_path()? else {
+                continue;
+            };
             let file_url = join_url_segments(&base_url, &[relative_path.as_str()])?;
             file_paths.push(file_url.to_string());
         }
@@ -1634,7 +1659,7 @@ mod tests {
         assert_eq!(p10.len(), 1, "Partition 10 should have 1 file slice");
         let file_slice = p10[0];
         assert_eq!(
-            file_slice.base_file.file_name(),
+            file_slice.base_file.as_ref().unwrap().file_name(),
             "92e64357-e4d1-4639-a9d3-c3535829d0aa-0_1-53-79_20250121000647668.parquet"
         );
         assert_eq!(file_slice.log_files.len(), 1);
@@ -1664,7 +1689,7 @@ mod tests {
         assert_eq!(
             file_slices
                 .iter()
-                .map(|f| f.base_file_relative_path().unwrap())
+                .map(|f| f.base_file_relative_path().unwrap().unwrap())
                 .collect::<Vec<_>>(),
             vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",]
         );
@@ -1678,7 +1703,7 @@ mod tests {
         assert_eq!(
             file_slices
                 .iter()
-                .map(|f| f.base_file_relative_path().unwrap())
+                .map(|f| f.base_file_relative_path().unwrap().unwrap())
                 .collect::<Vec<_>>(),
             vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",]
         );
@@ -1694,7 +1719,7 @@ mod tests {
         assert_eq!(
             file_slices
                 .iter()
-                .map(|f| f.base_file_relative_path().unwrap())
+                .map(|f| f.base_file_relative_path().unwrap().unwrap())
                 .collect::<Vec<_>>(),
             vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-182-253_20240418173550988.parquet",]
         );
@@ -1710,7 +1735,7 @@ mod tests {
         assert_eq!(
             file_slices
                 .iter()
-                .map(|f| f.base_file_relative_path().unwrap())
+                .map(|f| f.base_file_relative_path().unwrap().unwrap())
                 .collect::<Vec<_>>(),
             Vec::<String>::new()
         );
@@ -1775,17 +1800,35 @@ mod tests {
         // size comes from HoodieWriteStat.fileSizeInBytes; byte_size and num_records
         // are estimated from the cached FileStatsEstimator (seeded from a sample
         // base file in commit metadata at or before end_timestamp).
-        let m0 = file_slice_0.base_file.file_metadata.as_ref().unwrap();
+        let m0 = file_slice_0
+            .base_file
+            .as_ref()
+            .unwrap()
+            .file_metadata
+            .as_ref()
+            .unwrap();
         assert_eq!(m0.size, 440878);
         assert_eq!(m0.byte_size, 326703);
         assert_eq!(m0.num_records, 458);
 
-        let m1 = file_slice_1.base_file.file_metadata.as_ref().unwrap();
+        let m1 = file_slice_1
+            .base_file
+            .as_ref()
+            .unwrap()
+            .file_metadata
+            .as_ref()
+            .unwrap();
         assert_eq!(m1.size, 440616);
         assert_eq!(m1.byte_size, 326509);
         assert_eq!(m1.num_records, 458);
 
-        let m2 = file_slice_2.base_file.file_metadata.as_ref().unwrap();
+        let m2 = file_slice_2
+            .base_file
+            .as_ref()
+            .unwrap()
+            .file_metadata
+            .as_ref()
+            .unwrap();
         assert_eq!(m2.size, 440638);
         assert_eq!(m2.byte_size, 326525);
         assert_eq!(m2.num_records, 458);
@@ -2038,7 +2081,13 @@ mod tests {
 
         // Verify file metadata is populated from MDT with estimated stats
         for fsl in &file_slices {
-            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            let metadata = fsl
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert!(metadata.size > 0);
         }
     }
