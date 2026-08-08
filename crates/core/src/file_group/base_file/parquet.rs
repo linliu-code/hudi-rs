@@ -23,11 +23,13 @@ use std::sync::Arc;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use object_store::path::Path as ObjPath;
-use parquet::arrow::async_reader::ParquetObjectReader;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, parquet_to_arrow_schema};
 use parquet::file::metadata::ParquetMetaData;
 
 use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
+use crate::schema::parquet_list_norm::normalize_parquet_metadata;
 use crate::statistics::StatisticsContainer;
 use crate::storage::Storage;
 use crate::storage::error::{Result, StorageError};
@@ -58,9 +60,22 @@ impl ParquetBaseFileReader {
         obj_path: ObjPath,
         file_size: u64,
     ) -> Result<ParquetRecordBatchStreamBuilder<ParquetObjectReader>> {
-        let reader = ParquetObjectReader::new(self.storage.object_store.clone(), obj_path)
+        let mut reader = ParquetObjectReader::new(self.storage.object_store.clone(), obj_path)
             .with_file_size(file_size);
-        Ok(ParquetRecordBatchStreamBuilder::new(reader).await?)
+
+        // A parquet-avro writer with `write-old-list-structure=true` encodes an
+        // `array<map>` as a legacy 2-level list whose element is a REPEATED map
+        // group, which parquet-rs rejects outright when it builds the Arrow
+        // schema — "Map cannot be repeated". The footer parse itself does not,
+        // so the schema is rewritten in between and every reader built from this
+        // metadata accepts the file. The column chunks are untouched.
+        let raw = reader.get_metadata(None).await?;
+        let normalized = normalize_parquet_metadata(raw);
+        let arrow_metadata = ArrowReaderMetadata::try_new(normalized, ArrowReaderOptions::new())?;
+        Ok(ParquetRecordBatchStreamBuilder::new_with_metadata(
+            reader,
+            arrow_metadata,
+        ))
     }
 
     async fn open_builder(
@@ -104,6 +119,19 @@ impl ParquetBaseFileReader {
                 projection.iter().copied(),
             );
             builder = builder.with_projection(projection_mask);
+        }
+
+        // Built here rather than by the caller because the predicate has to be
+        // resolved against the file's own schema, which only exists once the
+        // footer is open. A builder that returns `None` — typically because the
+        // file does not have a column the predicate names — means no filter,
+        // which reads every row rather than guessing at the predicate.
+        let row_filter = options
+            .row_filter
+            .as_ref()
+            .and_then(|build| build(builder.parquet_schema(), builder.schema().as_ref()));
+        if let Some(row_filter) = row_filter {
+            builder = builder.with_row_filter(row_filter);
         }
 
         Ok(builder)
@@ -199,6 +227,36 @@ mod tests {
         Storage::new_with_base_url(base_url).unwrap()
     }
 
+    /// A base file written by parquet-avro with `write-old-list-structure=true`
+    /// must read. Its `array<map>` column is encoded as a legacy 2-level list
+    /// whose element is a REPEATED map group, which the parquet→arrow builder
+    /// rejects with "Map cannot be repeated" unless the schema is normalized
+    /// first. Without that step this read fails outright rather than returning
+    /// wrong data, so the assertion is that it returns rows at all.
+    #[tokio::test]
+    async fn test_read_data_accepts_a_legacy_two_level_list() {
+        let reader = ParquetBaseFileReader::new(test_storage());
+        let batch = reader
+            .read_data(
+                "i3/legacy_2level_repeated_map.parquet",
+                BaseFileReadOptions::default(),
+            )
+            .await
+            .expect("a legacy 2-level list encoding must be readable");
+
+        assert!(batch.num_rows() > 0);
+        let field = batch
+            .schema()
+            .field_with_name("obj_ids")
+            .expect("the array<map> column")
+            .clone();
+        assert!(
+            matches!(field.data_type(), arrow_schema::DataType::List(_)),
+            "obj_ids should surface as a List, got {:?}",
+            field.data_type()
+        );
+    }
+
     #[tokio::test]
     async fn test_read_data_returns_all_rows() {
         let reader = ParquetBaseFileReader::new(test_storage());
@@ -226,6 +284,40 @@ mod tests {
         assert_eq!(projected.num_columns(), 1);
         assert_eq!(projected.schema().field(0).name(), &first_col);
         assert_eq!(projected.num_rows(), full.num_rows());
+    }
+
+    /// The filter reaches the reader and prunes. Asserted with an always-false
+    /// predicate so the result is unambiguous whatever the fixture holds — a
+    /// filter that was silently dropped would return every row instead.
+    #[tokio::test]
+    async fn test_read_data_applies_the_row_filter() {
+        use arrow_array::BooleanArray;
+        use parquet::arrow::ProjectionMask;
+        use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
+
+        let reader = ParquetBaseFileReader::new(test_storage());
+        let opts = BaseFileReadOptions::default().with_row_filter(Arc::new(|descr, _| {
+            let mask = ProjectionMask::roots(descr, [0]);
+            Some(RowFilter::new(vec![Box::new(ArrowPredicateFn::new(
+                mask,
+                |batch| Ok(BooleanArray::from(vec![false; batch.num_rows()])),
+            ))]))
+        }));
+
+        let batch = reader.read_data("a.parquet", opts).await.unwrap();
+        assert_eq!(batch.num_rows(), 0, "the predicate rejected every row");
+    }
+
+    /// A builder that declines — typically because the file has none of the
+    /// columns the predicate names — reads every row. Returning no rows would
+    /// silently drop data on a file the predicate cannot speak about.
+    #[tokio::test]
+    async fn test_row_filter_builder_that_declines_reads_every_row() {
+        let reader = ParquetBaseFileReader::new(test_storage());
+        let opts = BaseFileReadOptions::default().with_row_filter(Arc::new(|_, _| None));
+
+        let batch = reader.read_data("a.parquet", opts).await.unwrap();
+        assert_eq!(batch.num_rows(), 5);
     }
 
     #[tokio::test]
