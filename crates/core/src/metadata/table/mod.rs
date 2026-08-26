@@ -25,6 +25,7 @@
 pub mod records;
 
 pub(crate) mod reader;
+pub(crate) mod routing;
 
 use crate::config::HudiConfigs;
 use crate::storage::Storage;
