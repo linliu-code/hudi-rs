@@ -30,11 +30,14 @@
 //! a second runtime under `#[tokio::test]` would panic.
 
 use hudi::HoodieFileGroupReader;
+use hudi::blocking_merge_stream::BlockingMergeStream;
 use hudi::hudi_core::config::HudiConfigs;
 use hudi::hudi_core::config::table::HudiTableConfig;
 use hudi::hudi_core::ffi_support::FileGroupReaderSchemaHandler;
+use hudi::hudi_core::ffi_support::HoodieFileGroupReader as CoreFileGroupReader;
 use hudi::hudi_core::ffi_support::InputSplit;
 use hudi::hudi_core::ffi_support::MAX_INSTANT_TIME;
+use hudi::hudi_core::ffi_support::OBJECT_STORE_RUNTIME;
 use hudi::hudi_core::ffi_support::ReaderContext;
 use hudi::hudi_core::ffi_support::ReaderParameters;
 use hudi::hudi_core::ffi_support::RecordContext;
@@ -43,6 +46,7 @@ use hudi::hudi_core::table::builder::OptionResolver;
 use hudi_test::QuickstartTripsTable;
 use hudi_test::gold::{compare_against_gold, read_gold_parquet};
 
+use arrow_array::RecordBatchReader;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,21 +55,30 @@ use std::sync::Arc;
 // Helpers
 // =============================================================================
 
+/// Build Storage and merged props from table path.
+///
+/// The `async fn` is the real implementation so the `#[tokio::test]` guard test
+/// can await it directly: the sync wrapper's `block_on` would panic if called
+/// from inside a runtime.
+async fn create_storage_and_props_async(
+    table_path: &str,
+) -> (Arc<Storage>, HashMap<String, String>) {
+    let empty_opts: Vec<(&str, &str)> = vec![];
+    let mut resolver = OptionResolver::new_with_options(table_path, empty_opts);
+    resolver.resolve_options().await.expect("resolve options");
+    let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options.clone()));
+    let storage =
+        Storage::new(Arc::new(resolver.storage_options), hudi_configs).expect("create storage");
+    (storage, resolver.hudi_options)
+}
+
 /// Build Storage and merged props from table path using a temporary runtime.
 fn create_storage_and_props(table_path: &str) -> (Arc<Storage>, HashMap<String, String>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build setup runtime");
-    rt.block_on(async {
-        let empty_opts: Vec<(&str, &str)> = vec![];
-        let mut resolver = OptionResolver::new_with_options(table_path, empty_opts);
-        resolver.resolve_options().await.expect("resolve options");
-        let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options.clone()));
-        let storage =
-            Storage::new(Arc::new(resolver.storage_options), hudi_configs).expect("create storage");
-        (storage, resolver.hudi_options)
-    })
+    rt.block_on(create_storage_and_props_async(table_path))
 }
 
 /// Build the full `ReaderContext` the same way `new_file_group_reader_with_context` does.
@@ -96,6 +109,7 @@ fn build_reader_context(
         row_filter_builder: None,
         row_group_selector: None,
         mor_pk_safe: false,
+        key_predicate: None,
         completion_gate_inputs: None,
     })
 }
@@ -136,7 +150,7 @@ fn read_record_batch(
 
     let mut table_config: HashMap<String, String> = HashMap::new();
     table_config.insert(
-        HudiTableConfig::PrecombineField.as_ref().to_string(),
+        HudiTableConfig::OrderingFields.as_ref().to_string(),
         "ts".to_string(),
     );
 
@@ -155,14 +169,53 @@ fn read_record_batch(
     reader.read_record_batch().expect("read_record_batch")
 }
 
+/// Read a required `Int32` column out of a batch.
+fn i32_col<'a>(batch: &'a arrow_array::RecordBatch, name: &str) -> &'a arrow_array::Int32Array {
+    batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("batch has no `{name}` column"))
+        .as_any()
+        .downcast_ref::<arrow_array::Int32Array>()
+        .unwrap_or_else(|| panic!("`{name}` is not Int32"))
+}
+
+/// Read a required `Utf8` column out of a batch.
+fn str_col<'a>(batch: &'a arrow_array::RecordBatch, name: &str) -> &'a arrow_array::StringArray {
+    batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("batch has no `{name}` column"))
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap_or_else(|| panic!("`{name}` is not Utf8"))
+}
+
 /// Extract (id, name, age) tuples from a RecordBatch, sorted by id.
 fn extract_id_name_age(batch: &arrow_array::RecordBatch) -> Vec<(i32, String, i32)> {
-    QuickstartTripsTable::id_name_age(batch)
+    let ids = i32_col(batch, "id");
+    let names = str_col(batch, "name");
+    let ages = i32_col(batch, "age");
+    let mut rows: Vec<(i32, String, i32)> = (0..batch.num_rows())
+        .map(|i| (ids.value(i), names.value(i).to_string(), ages.value(i)))
+        .collect();
+    rows.sort_by_key(|(id, _, _)| *id);
+    rows
 }
 
 /// Extract (id, name, price) tuples from a RecordBatch, sorted by id.
 fn extract_id_name_price(batch: &arrow_array::RecordBatch) -> Vec<(i32, String, f64)> {
-    QuickstartTripsTable::id_name_price(batch)
+    let ids = i32_col(batch, "id");
+    let names = str_col(batch, "name");
+    let prices = batch
+        .column_by_name("price")
+        .expect("batch has no `price` column")
+        .as_any()
+        .downcast_ref::<arrow_array::Float64Array>()
+        .expect("`price` is not Float64");
+    let mut rows: Vec<(i32, String, f64)> = (0..batch.num_rows())
+        .map(|i| (ids.value(i), names.value(i).to_string(), prices.value(i)))
+        .collect();
+    rows.sort_by_key(|(id, _, _)| *id);
+    rows
 }
 
 /// Assert reader output matches gold data, panicking with a `[table_name]`
@@ -517,7 +570,7 @@ fn test_read_record_batch_column_projection() {
 
     let mut table_config: HashMap<String, String> = HashMap::new();
     table_config.insert(
-        HudiTableConfig::PrecombineField.as_ref().to_string(),
+        HudiTableConfig::OrderingFields.as_ref().to_string(),
         "ts".to_string(),
     );
     let record_context = RecordContext::new(&table_config, partition.to_string());
@@ -542,6 +595,7 @@ fn test_read_record_batch_column_projection() {
         row_filter_builder: None,
         row_group_selector: None,
         mor_pk_safe: false,
+        key_predicate: None,
         completion_gate_inputs: None,
     });
 
@@ -596,4 +650,114 @@ fn test_read_record_batch_column_projection() {
     assert_eq!(records.len(), 2, "sf partition should have 2 rows");
     assert_eq!(records[0], (1, "Alice-V2".to_string()));
     assert_eq!(records[1], (2, "Bob".to_string()));
+}
+
+// =============================================================================
+// BlockingMergeStream (Task 6) — the sync/async bridge
+//
+// These live here, not beside the adapter in `cpp/src/blocking_merge_stream.rs`,
+// because driving `open()` needs a *core* `HoodieFileGroupReader` built from a
+// real MOR fixture, and the reusable fixture helpers (`build_reader_context`,
+// `build_input_split`, `read_record_batch`, `extract_id_name_age`) are the
+// integration-test helpers above. The in-`src` test module only has the cpp FFI
+// wrapper to hand, which cannot expose `open()`.
+// =============================================================================
+
+/// The v9 MOR `city=sf` split — the same one `test_read_record_batch_sf_merge`
+/// reads through the eager FFI path. A real 2-base-row + 1-log-update merge.
+const SF_PARTITION: &str = "city=sf";
+const SF_BASE_FILE: &str =
+    "fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet";
+const SF_LOG_FILE: &str = ".fee86b18-67b1-4479-b517-075683aeb2d1-0_20260408053037787.log.1_0-27-73";
+
+/// Table config the sf fixture needs (the precombine field drives the merge).
+fn sf_table_config() -> HashMap<String, String> {
+    let mut table_config: HashMap<String, String> = HashMap::new();
+    table_config.insert(
+        HudiTableConfig::OrderingFields.as_ref().to_string(),
+        "ts".to_string(),
+    );
+    table_config
+}
+
+/// Build a *core* `HoodieFileGroupReader` over the sf split, so the test can
+/// call `open()` and get a `FileGroupMergeStream` to wrap.
+fn build_core_sf_reader(table_path: &str, storage: Arc<Storage>) -> CoreFileGroupReader {
+    let input_split = build_input_split(SF_PARTITION, SF_BASE_FILE, vec![SF_LOG_FILE]);
+    let reader_context = build_reader_context(table_path, SF_PARTITION, true, sf_table_config());
+    CoreFileGroupReader::builder()
+        .with_reader_context(reader_context)
+        .with_storage(storage)
+        .with_input_split(input_split)
+        .with_reader_parameters(ReaderParameters::default())
+        .build()
+        .expect("build core HoodieFileGroupReader")
+}
+
+#[test]
+fn blocking_merge_stream_yields_the_same_rows_as_the_eager_read() {
+    // The adapter must not add, drop, reorder or corrupt rows: compare actual
+    // row content against the eager `read_record_batch` path over the same
+    // split, not just row counts.
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+    let (storage, props) = create_storage_and_props(&table_path);
+
+    let (eager_batch, _schema) = read_record_batch(
+        &table_path,
+        SF_PARTITION,
+        SF_BASE_FILE,
+        vec![SF_LOG_FILE],
+        storage.clone(),
+        props,
+    );
+    let mut expected = extract_id_name_age(&eager_batch);
+    expected.sort();
+
+    let mut reader = build_core_sf_reader(&table_path, storage);
+    let stream = OBJECT_STORE_RUNTIME
+        .block_on(reader.open())
+        .expect("open merge stream");
+
+    let mut rows: Vec<(i32, String, i32)> = Vec::new();
+    for chunk in BlockingMergeStream::new(stream) {
+        let batch = chunk.expect("adapter yielded an error chunk");
+        rows.extend(extract_id_name_age(&batch));
+    }
+    rows.sort();
+
+    assert!(
+        !rows.is_empty(),
+        "fixture produced no rows; the test proves nothing"
+    );
+    assert_eq!(rows, expected);
+}
+
+#[test]
+fn blocking_merge_stream_reports_the_schema_without_consuming_a_chunk() {
+    // RecordBatchReader::schema() must be answerable before the first next():
+    // the FFI reads the schema when the stream is created.
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+    let (storage, _props) = create_storage_and_props(&table_path);
+    let mut reader = build_core_sf_reader(&table_path, storage);
+
+    let stream = OBJECT_STORE_RUNTIME
+        .block_on(reader.open())
+        .expect("open merge stream");
+    let expected = stream.schema();
+    let adapter = BlockingMergeStream::new(stream);
+    assert_eq!(adapter.schema(), expected);
+}
+
+#[test]
+fn blocking_merge_stream_exposes_the_in_memory_footprint() {
+    // hudi_reader_memory_bytes reads this straight after open().
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+    let (storage, _props) = create_storage_and_props(&table_path);
+    let mut reader = build_core_sf_reader(&table_path, storage);
+
+    let stream = OBJECT_STORE_RUNTIME
+        .block_on(reader.open())
+        .expect("open merge stream");
+    let adapter = BlockingMergeStream::new(stream);
+    let _ = adapter.current_in_memory_bytes();
 }

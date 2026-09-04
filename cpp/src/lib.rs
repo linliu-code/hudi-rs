@@ -17,6 +17,7 @@
  * under the License.
  */
 pub mod base_file_provider;
+pub mod blocking_merge_stream;
 pub mod context;
 pub mod provider_abi;
 mod util;
@@ -1540,7 +1541,7 @@ mod tests {
         reader_context.latest_commit_time = MAX_INSTANT_TIME.to_string();
         reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
         reader_context.table_config.insert(
-            HudiTableConfig::PrecombineField.as_ref().to_string(),
+            HudiTableConfig::OrderingFields.as_ref().to_string(),
             "ts".to_string(),
         );
         reader_context.rebuild_record_context("city=sf".to_string());
