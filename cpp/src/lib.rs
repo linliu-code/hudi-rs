@@ -34,6 +34,7 @@ use arrow_schema::ArrowError;
 use hudi_dep::config::HudiConfigs;
 use hudi_dep::config::table::HudiTableConfig;
 use hudi_dep::config::util::split_hudi_options_from_others;
+use hudi_dep::ffi_support::InstantRange;
 use hudi_dep::ffi_support::OBJECT_STORE_RUNTIME;
 use hudi_dep::ffi_support::{
     CompletionGateInputs, FileGroupReaderSchemaHandler,
@@ -42,7 +43,6 @@ use hudi_dep::ffi_support::{
 };
 use hudi_dep::file_group::base_file::BaseFile;
 use hudi_dep::storage::Storage;
-use hudi_dep::timeline::selector::InstantRange;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
