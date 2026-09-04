@@ -311,9 +311,21 @@ mod ffi {
         /// is not torn.
         fn hudi_reader_memory_bytes(self: &HoodieFileGroupReader) -> u64;
 
-        /// Base-file provider read counters for the last `get_closable_iterator`
-        /// call. Because the provider is now STREAMED, the counters split by when
-        /// they are final:
+        /// Base-file provider read counters. **Phase 1: every counter is zero.**
+        ///
+        /// The provider handle is still accepted at the FFI boundary and this
+        /// getter is still declared, purely for ABI stability — velox passes a
+        /// handle today and must keep compiling — but the OSS-core bridge does
+        /// NOT wire it into core. Core has no provider seam on this path, so
+        /// every base file takes core's own object-store read (the same
+        /// fallback core takes when no provider is supplied) and no provider
+        /// counter is ever incremented. `read_record_batch` and
+        /// `get_closable_iterator` emit a one-shot warning when a handle was
+        /// supplied, so a caller does not have to infer this from a wall of
+        /// zeros.
+        ///
+        /// Phase 2 contract: once the provider is injected into core, the
+        /// provider is STREAMED, and the counters split by when they are final:
         ///   - **setup counters** (files_served, storage_fallbacks, local/remote,
         ///     discover/connect/fetch wall-nanos) are populated by `open()`, before
         ///     any batch is streamed — read them any time after
@@ -322,10 +334,10 @@ mod ffi {
         ///     tallied as the consumer drains the returned stream, so they are only
         ///     final AFTER the stream is fully drained. Read this after draining to
         ///     capture them.
-        /// Reads a shared live slot, so it does not depend on the stream still being
-        /// alive (safe to call after the stream is freed). Returns all-zero when no
-        /// provider was injected (the default) or `get_closable_iterator` has not
-        /// been called on this reader.
+        /// It reads a shared live slot, so it does not depend on the stream still
+        /// being alive (safe to call after the stream is freed), and returns
+        /// all-zero when no provider was injected (the default) or
+        /// `get_closable_iterator` has not been called on this reader.
         fn base_file_provider_stats(self: &HoodieFileGroupReader) -> FfiBaseFileProviderStats;
         /// [ENG-47483] Bytes fetched from storage by this reader, summed over every
         /// range read, counted at the `AsyncFileReader` boundary.
@@ -813,6 +825,12 @@ pub fn new_file_group_reader_with_context(
     // carries hoodie.populate.meta.fields, hoodie.table.precombine.field,
     // and hoodie.table.recordkey.fields — RecordContext derives everything
     // from these.
+    // The wire key is still `hoodie.table.precombine.field` on purpose: OSS core
+    // resolves it through the deprecated alias of `hoodie.table.ordering.fields`
+    // (`record_context.rs` reads `ordering.fields` first and falls back to
+    // `precombine.field`; `config/table.rs` registers the same key as a
+    // deprecated alias), so renaming the bridge key would buy nothing and would
+    // change velox's payload.
     let partition_path = input_split.partition_path.clone();
     let record_context = RecordContext::new(&ffi_rc.table_config, partition_path);
 
@@ -1059,6 +1077,18 @@ impl HoodieFileGroupReader {
             self.reader_context.merge_mode.as_str(),
         );
 
+        // RV-13 — say so out loud when the caller hands us a provider we ignore.
+        // The handle is accepted for ABI stability (see `base_file_provider_stats`),
+        // but Phase 1 injects nothing into OSS core, so a caller that wired one up
+        // would otherwise only see it in counters that read zero.
+        if self.base_file_provider.is_some() {
+            warn_once!(
+                "[hudi-rs-reader] a base-file data provider handle was supplied but \
+                 Phase 1 of the OSS-core bridge does not wire it into core; base files \
+                 take the object-store read and provider counters read zero"
+            );
+        }
+
         // ENG-42276 / ENG-42866 — the row_filter_builder + mor_pk_safe live
         // on reader_context (set at FFI entry, see new_file_group_reader_with_context).
         // The FG reader gate at make_base_file_batches and the parquet log
@@ -1179,6 +1209,38 @@ impl HoodieFileGroupReader {
             self.reader_context.merge_mode.as_str(),
         );
 
+        // RV-13 — say so out loud when the caller hands us a provider we ignore.
+        // The handle is accepted for ABI stability (see `base_file_provider_stats`),
+        // but Phase 1 injects nothing into OSS core, so a caller that wired one up
+        // would otherwise only see it in counters that read zero.
+        if self.base_file_provider.is_some() {
+            warn_once!(
+                "[hudi-rs-reader] a base-file data provider handle was supplied but \
+                 Phase 1 of the OSS-core bridge does not wire it into core; base files \
+                 take the object-store read and provider counters read zero"
+            );
+        }
+
+        // C3 — tokio re-entry guard (preserved from read_record_batch). The
+        // async setup below uses block_on on OBJECT_STORE_RUNTIME; block_on
+        // panics if invoked from within a tokio runtime thread, and a panic
+        // unwinding across the FFI boundary is UB. This entry point is meant to
+        // be called from a non-async C++ thread; surface a loud error instead of
+        // letting block_on panic across FFI.
+        //
+        // RV-19 — checked BEFORE the reader is built: the guard is a pure
+        // property of the calling thread, so building the core reader first is
+        // work thrown away on the refusal path (and it opens no IO of its own,
+        // so nothing is lost by deferring it).
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(
+                "get_closable_iterator must not be called from within a tokio runtime: \
+                 it uses block_on on OBJECT_STORE_RUNTIME, which panics on re-entry \
+                 (call it from a plain C++/native thread instead)"
+                    .to_string(),
+            );
+        }
+
         // Same construction as read_record_batch — see ENG-42276 / ENG-42866
         // doc comments there for why row_filter_builder + mor_pk_safe live on
         // the reader_context.
@@ -1194,21 +1256,6 @@ impl HoodieFileGroupReader {
             .with_reader_parameters(self.reader_parameters.clone())
             .build()
             .map_err(|e| format!("Failed to build file group reader: {e}"))?;
-
-        // C3 — tokio re-entry guard (preserved from read_record_batch). The
-        // async setup below uses block_on on OBJECT_STORE_RUNTIME; block_on
-        // panics if invoked from within a tokio runtime thread, and a panic
-        // unwinding across the FFI boundary is UB. This entry point is meant to
-        // be called from a non-async C++ thread; surface a loud error instead of
-        // letting block_on panic across FFI.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(
-                "get_closable_iterator must not be called from within a tokio runtime: \
-                 it uses block_on on OBJECT_STORE_RUNTIME, which panics on re-entry \
-                 (call it from a plain C++/native thread instead)"
-                    .to_string(),
-            );
-        }
 
         // Capture the iteration-phase stats sink BEFORE `reader` goes out of
         // scope at the end of this function. The iterator we return keeps
@@ -1927,6 +1974,26 @@ mod tests {
             "timings must be readable and sane, got merge={merge_ms}ms build={build_ms}ms"
         );
 
+        // RV-15 — pin the unit conversion itself, which the sanity bound above
+        // cannot see: core measures microseconds, the ABI promises
+        // milliseconds, and a getter that forgot the /1000 would report a
+        // sub-millisecond read as thousands of "ms" and still pass `< 60_000`
+        // here (D-10). Reading the raw sink through `stream_stat` and dividing
+        // in the test is the only way to state the relation without asserting a
+        // wall-clock value this fixture cannot guarantee.
+        let raw_merge_us = reader.stream_stat(|s| s.final_merge_us);
+        let raw_build_us = reader.stream_stat(|s| s.output_build_us);
+        assert_eq!(
+            reader.hudi_final_merge_ms(),
+            raw_merge_us / 1000,
+            "ABI promises ms; core measures µs (D-10)"
+        );
+        assert_eq!(
+            reader.hudi_output_build_ms(),
+            raw_build_us / 1000,
+            "ABI promises ms; core measures µs (D-10)"
+        );
+
         unsafe { hudi_free_arrow_stream(ptr) };
     }
 
@@ -1983,6 +2050,64 @@ mod tests {
         assert!(
             bytes < 100 * 1024 * 1024,
             "bytes_read ({bytes}) is implausible for a 2-row fixture — likely double counted"
+        );
+
+        // RV-16 — the rest of the ENG-47483 counter block, over the same real
+        // read. Each relation below is what the implementation actually
+        // guarantees for THIS fixture, not a hoped-for shape.
+        let file_row_groups = reader.hudi_file_row_groups();
+        let row_groups_read = reader.hudi_row_groups_read();
+        let selector_calls = reader.hudi_row_group_selector_calls();
+        let decoded = reader.hudi_pushdown_decoded();
+        let installed = reader.hudi_pushdown_row_filters_installed();
+        let memory_bytes = reader.hudi_reader_memory_bytes();
+
+        // `record_file_shape` runs once per read of the data, off the footer the
+        // builder already holds, and a parquet file with rows has at least one
+        // row group.
+        assert!(
+            file_row_groups >= 1,
+            "the base file's footer reports at least one row group, got {file_row_groups}"
+        );
+        // `add_row_groups_read` is called with the selector's kept set, or with
+        // the file's full row-group count when nothing prunes — so it is bounded
+        // by the denominator and cannot be zero for a file that was read.
+        assert!(
+            (1..=file_row_groups).contains(&row_groups_read),
+            "row_groups_read ({row_groups_read}) must be in 1..={file_row_groups}"
+        );
+        // 0 BY CONSTRUCTION here: `record_selector_call` fires only inside
+        // `options.row_group_selector.as_ref().and_then(..)` in
+        // `base_file/parquet.rs`, and `build_test_reader` installs no selector
+        // (no substrait filter was pushed), so the closure never runs. This is
+        // the counter's whole point — "ran and pruned nothing" and "was never
+        // installed" both leave row_groups_read == file_row_groups, and only
+        // this counter separates them.
+        assert_eq!(
+            selector_calls, 0,
+            "no selector installed on this read, so the selector closure never ran"
+        );
+        assert_eq!(
+            row_groups_read, file_row_groups,
+            "nothing pruned, so every row group in the file was scanned"
+        );
+
+        // No substrait predicate was pushed, so nothing decoded and no parquet
+        // RowFilter could be installed.
+        assert_eq!(
+            decoded, 0,
+            "no predicate bytes were pushed, so none decoded"
+        );
+        assert_eq!(
+            installed, 0,
+            "no decoded predicate means no RowFilter can be installed"
+        );
+
+        // The MOR merge map is populated by open(), so the published peak is
+        // non-zero (mirrors test_reader_memory_bytes_publishes_peak_footprint).
+        assert!(
+            memory_bytes > 0,
+            "the log scan populated the merge map, so the published peak must be > 0"
         );
 
         unsafe { hudi_free_arrow_stream(ptr) };
