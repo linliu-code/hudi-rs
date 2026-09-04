@@ -429,6 +429,22 @@ impl HoodieFileGroupReader {
         Ok(create_base_file_reader(&self.storage, &format)?)
     }
 
+    /// Open the file group and return the merge stream itself.
+    ///
+    /// [`Self::open_stream`] erases this into a `BoxStream`, which drops
+    /// [`FileGroupMergeStream::current_in_memory_bytes`]. The FFI path needs
+    /// that value to publish `hudi_reader_memory_bytes`, so it takes this
+    /// entry point instead.
+    ///
+    /// Single-use, like [`Self::open_stream`]: takes the output converter and,
+    /// for MOR, moves the record buffer into the returned stream.
+    pub async fn open(&mut self) -> Result<FileGroupMergeStream> {
+        // Stage timing (perf harness): opening the base file. Only the open --
+        // the per-row-group decode is paid lazily, inside the merge.
+        let base = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
+        self.init_record_iterators(base).await
+    }
+
     /// Stream the merged output.
     ///
     /// [`Self::read`] returns the whole file group as one batch, so peak memory
@@ -446,10 +462,7 @@ impl HoodieFileGroupReader {
     pub(crate) async fn open_stream(
         &mut self,
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
-        // Stage timing (perf harness): opening the base file. Only the open —
-        // the per-row-group decode is paid lazily, inside the merge.
-        let base = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
-        Ok(self.init_record_iterators(base).await?.into_stream())
+        Ok(self.open().await?.into_stream())
     }
 
     /// Read the file group and return the merged output as a single
@@ -2534,6 +2547,114 @@ mod tests {
              {MERGE_CHUNK_ROWS}-row bound: {sizes:?}",
             sizes.len()
         );
+    }
+
+    #[tokio::test]
+    async fn open_and_open_stream_produce_the_same_rows() {
+        use futures::StreamExt;
+        // Two readers over the same file group: one drained via open() +
+        // next_chunk(), one via open_stream(). The split in open_stream must be a
+        // pure refactor, so the row sets must be identical.
+        let tmp = tempfile::tempdir().unwrap();
+        let log_name = ".6d3d1d6e-2298-4080-a0c1-494877d6f40a-0_20250618054711154.log.1_0-26-85";
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/log_files/valid_log_delete")
+            .join(log_name);
+        std::fs::copy(&fixture, tmp.path().join(log_name)).unwrap();
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "_hoodie_record_key",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
+        let base_rows: usize = 10;
+        let keys: Vec<String> = (0..base_rows).map(|i| format!("base-{i:05}")).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from(
+                keys.iter().map(String::as_str).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let base_name = "mor-base.parquet";
+        write_parquet_file_in_row_groups(tmp.path(), base_name, &batch, base_rows);
+
+        let mut a = test_file_group_reader_for_merged_slice(
+            tmp.path(),
+            base_name,
+            log_name,
+            schema.clone(),
+        )
+        .await;
+        let mut b = test_file_group_reader_for_merged_slice(
+            tmp.path(),
+            base_name,
+            log_name,
+            schema.clone(),
+        )
+        .await;
+
+        let mut via_open = Vec::new();
+        let mut stream = a.open().await.unwrap();
+        while let Some(chunk) = stream.next_chunk().await {
+            via_open.push(chunk.unwrap());
+        }
+
+        let mut via_open_stream = Vec::new();
+        let mut boxed = b.open_stream().await.unwrap();
+        while let Some(chunk) = boxed.next().await {
+            via_open_stream.push(chunk.unwrap());
+        }
+
+        let rows_open: usize = via_open.iter().map(|b| b.num_rows()).sum();
+        let rows_stream: usize = via_open_stream.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows_open, rows_stream,
+            "open() and open_stream() disagree on row count"
+        );
+        assert!(
+            rows_open > 0,
+            "fixture produced no rows; the test proves nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_exposes_the_in_memory_footprint() {
+        // The reason open() exists: BoxStream hides current_in_memory_bytes(),
+        // which the FFI publishes as hudi_reader_memory_bytes.
+        let tmp = tempfile::tempdir().unwrap();
+        let log_name = ".6d3d1d6e-2298-4080-a0c1-494877d6f40a-0_20250618054711154.log.1_0-26-85";
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/log_files/valid_log_delete")
+            .join(log_name);
+        std::fs::copy(&fixture, tmp.path().join(log_name)).unwrap();
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "_hoodie_record_key",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
+        let base_rows: usize = 10;
+        let keys: Vec<String> = (0..base_rows).map(|i| format!("base-{i:05}")).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from(
+                keys.iter().map(String::as_str).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let base_name = "mor-base.parquet";
+        write_parquet_file_in_row_groups(tmp.path(), base_name, &batch, base_rows);
+
+        let mut r = test_file_group_reader_for_merged_slice(
+            tmp.path(),
+            base_name,
+            log_name,
+            schema.clone(),
+        )
+        .await;
+        let stream = r.open().await.unwrap();
+        let _bytes: u64 = stream.current_in_memory_bytes();
     }
 
     /// Every row group of the base file reaches the output, on both entry
