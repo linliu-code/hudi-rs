@@ -1269,10 +1269,7 @@ impl HoodieFileGroupReader {
     /// 0 when no stream has been opened yet (the sink does not exist), which is
     /// indistinguishable from a genuine 0 -- acceptable because callers read
     /// these only after draining a stream they opened.
-    fn stream_stat<T>(
-        &self,
-        pick: impl Fn(&hudi_dep::ffi_support::StreamReadStats) -> T,
-    ) -> T
+    fn stream_stat<T>(&self, pick: impl Fn(&hudi_dep::ffi_support::StreamReadStats) -> T) -> T
     where
         T: Default,
     {
@@ -1509,7 +1506,7 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
     use hudi_dep::ffi_support::MAX_INSTANT_TIME;
-    use hudi_dep::storage::OBJECT_STORE_RUNTIME;
+    use hudi_dep::ffi_support::OBJECT_STORE_RUNTIME;
     use hudi_dep::table::builder::OptionResolver;
     use hudi_test::QuickstartTripsTable;
 
