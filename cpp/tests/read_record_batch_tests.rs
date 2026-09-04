@@ -44,6 +44,7 @@ use hudi::hudi_core::ffi_support::RecordContext;
 use hudi::hudi_core::storage::Storage;
 use hudi::hudi_core::table::builder::OptionResolver;
 use hudi_test::QuickstartTripsTable;
+use hudi_test::TableFormat;
 use hudi_test::gold::{compare_against_gold, read_gold_parquet};
 
 use arrow_array::RecordBatchReader;
@@ -416,7 +417,7 @@ fn test_read_record_batch_nonpart_multi_log() {
 #[test]
 fn test_read_record_batch_log_compaction() {
     let table_path = QuickstartTripsTable::MorLayoutLogCompaction.path_to_mor_avro();
-    let gold_dir = QuickstartTripsTable::MorLayoutLogCompaction.path_to_mor_avro_gold();
+    let gold_dir = QuickstartTripsTable::MorLayoutLogCompaction.gold_dir(TableFormat::MorAvro);
     let (storage, props) = create_storage_and_props(&table_path);
 
     let (batch, schema) = read_record_batch(
@@ -446,7 +447,7 @@ fn test_read_record_batch_log_compaction() {
 #[test]
 fn test_read_record_batch_log_only() {
     let table_path = QuickstartTripsTable::MorLayoutLogOnly.path_to_mor_avro();
-    let gold_dir = QuickstartTripsTable::MorLayoutLogOnly.path_to_mor_avro_gold();
+    let gold_dir = QuickstartTripsTable::MorLayoutLogOnly.gold_dir(TableFormat::MorAvro);
     let (storage, props) = create_storage_and_props(&table_path);
 
     let (batch, schema) = read_record_batch(
@@ -474,7 +475,7 @@ fn test_read_record_batch_log_only() {
 #[test]
 fn test_read_record_batch_mixed_column_types() {
     let table_path = QuickstartTripsTable::MorLayoutColumnProjection.path_to_mor_avro();
-    let gold_dir = QuickstartTripsTable::MorLayoutColumnProjection.path_to_mor_avro_gold();
+    let gold_dir = QuickstartTripsTable::MorLayoutColumnProjection.gold_dir(TableFormat::MorAvro);
     let (storage, props) = create_storage_and_props(&table_path);
 
     let (batch, schema) = read_record_batch(
@@ -501,7 +502,7 @@ fn test_read_record_batch_mixed_column_types() {
 #[test]
 fn test_read_record_batch_all_data_types() {
     let table_path = QuickstartTripsTable::MorLayoutAllDataTypes.path_to_mor_avro();
-    let gold_dir = QuickstartTripsTable::MorLayoutAllDataTypes.path_to_mor_avro_gold();
+    let gold_dir = QuickstartTripsTable::MorLayoutAllDataTypes.gold_dir(TableFormat::MorAvro);
     let (storage, props) = create_storage_and_props(&table_path);
 
     let (batch, schema) = read_record_batch(
@@ -545,6 +546,8 @@ fn test_read_record_batch_column_projection() {
     let input_split = build_input_split(partition, base_file, log_files);
 
     // Read data schema from base file parquet metadata using a temporary runtime.
+    // OSS `Storage` has no `get_parquet_file_schema`; pull the bytes and let the
+    // parquet reader hand back the Arrow schema.
     let data_schema: SchemaRef = {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -552,10 +555,13 @@ fn test_read_record_batch_column_projection() {
             .expect("build schema-read runtime");
         let base_rel = format!("{partition}/{base_file}");
         let s = storage.clone();
-        Arc::new(
-            rt.block_on(s.get_parquet_file_schema(&base_rel))
-                .expect("read parquet schema"),
-        )
+        let bytes = rt
+            .block_on(s.get_file_data(&base_rel))
+            .expect("read base file bytes");
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("read parquet schema")
+            .schema()
+            .clone()
     };
 
     // Request only id and name.
@@ -760,4 +766,40 @@ fn blocking_merge_stream_exposes_the_in_memory_footprint() {
         .expect("open merge stream");
     let adapter = BlockingMergeStream::new(stream);
     let _ = adapter.current_in_memory_bytes();
+}
+
+// =============================================================================
+// Tokio re-entry guard (Task 7)
+// =============================================================================
+
+#[tokio::test]
+async fn get_closable_iterator_refuses_to_run_inside_a_tokio_runtime() {
+    // BlockingMergeStream::next() calls block_on, which panics on runtime
+    // re-entry, and a panic unwinding across the FFI boundary is UB. The guard
+    // in get_closable_iterator must return a loud Err instead -- and this test
+    // must reach the assertion rather than abort the process.
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+    // The async helper, not the sync wrapper: block_on inside #[tokio::test]
+    // would panic before the code under test ran.
+    let (storage, props) = create_storage_and_props_async(&table_path).await;
+
+    let input_split = build_input_split(SF_PARTITION, SF_BASE_FILE, vec![SF_LOG_FILE]);
+    let reader_context = build_reader_context(&table_path, SF_PARTITION, true, sf_table_config());
+    let reader = HoodieFileGroupReader::new(
+        reader_context,
+        storage,
+        props,
+        ReaderParameters::default(),
+        input_split,
+        None,
+    )
+    .expect("build HoodieFileGroupReader");
+
+    let err = reader
+        .get_closable_iterator()
+        .expect_err("expected a refusal when called from a tokio worker thread");
+    assert!(
+        err.contains("must not be called from within a tokio runtime"),
+        "unexpected error text: {err}",
+    );
 }
