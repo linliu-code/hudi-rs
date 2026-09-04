@@ -34,6 +34,7 @@ pub use crate::file_group::reader_v2::reader_context::{CompletionGateInputs, Rea
 pub use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
 pub use crate::file_group::reader_v2::record_context::RecordContext;
 pub use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
+pub use crate::file_group::reader_v2::MAX_INSTANT_TIME;
 
 /// One long-lived multi-threaded runtime for every FFI-driven read.
 ///

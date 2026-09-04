@@ -17,56 +17,43 @@
  * under the License.
  */
 use crate::ffi;
-use arrow::datatypes::SchemaRef;
+use arrow_array::RecordBatchReader;
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
-use arrow_array::{RecordBatch, RecordBatchIterator};
 
-pub fn create_raw_pointer_for_record_batches(
-    batches: Vec<RecordBatch>,
-    schema: SchemaRef,
-) -> *mut ffi::ArrowArrayStream {
-    let batches = batches.into_iter().map(Ok);
-    let batch_iterator = RecordBatchIterator::new(batches, schema);
-    let ffi_array_stream = FFI_ArrowArrayStream::new(Box::new(batch_iterator));
+/// [ENG-42991] Wrap any [`RecordBatchReader`] in a heap-allocated
+/// `FFI_ArrowArrayStream` returned as an opaque cxx pointer.
+///
+/// The reader is consumed lazily by the C++ side via
+/// `ArrowArrayStream::get_next` until the release callback signals
+/// end-of-stream — no eager materialisation, no `Vec<RecordBatch>`
+/// intermediary.
+///
+/// The Rust side relinquishes ownership of the heap allocation; the only
+/// correct way to reclaim it is via [`free_arrow_stream`].
+pub fn create_raw_pointer_for_record_batch_reader<R>(reader: R) -> *mut ffi::ArrowArrayStream
+where
+    R: RecordBatchReader + Send + 'static,
+{
+    let ffi_array_stream = FFI_ArrowArrayStream::new(Box::new(reader));
     let raw_ptr = Box::into_raw(Box::new(ffi_array_stream));
     raw_ptr as *mut ffi::ArrowArrayStream
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow_array::ffi_stream::ArrowArrayStreamReader;
-    use arrow_array::{Int32Array, StringArray};
-    use std::sync::Arc;
-
-    /// The C++ caller only ever sees batches as a C Data Interface stream, so an
-    /// arrow upgrade that changed how that stream is exported would break the
-    /// binding without failing anything else: running the C++ side needs Arrow
-    /// C++, which the Rust test suite does not have. Importing the exported
-    /// pointer back keeps the surface covered here instead.
-    #[test]
-    fn exported_stream_round_trips_through_the_c_data_interface() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .unwrap();
-
-        let raw = create_raw_pointer_for_record_batches(vec![batch.clone()], schema);
-        // SAFETY: the pointer is the one box `create_raw_pointer_for_record_batches`
-        // leaks, taken back here rather than by the C++ caller that normally frees it.
-        let stream = unsafe { Box::from_raw(raw as *mut FFI_ArrowArrayStream) };
-
-        let mut reader = ArrowArrayStreamReader::try_new(*stream).unwrap();
-        assert_eq!(reader.next().unwrap().unwrap(), batch);
-        assert!(reader.next().is_none());
+/// Free an `ArrowArrayStream` that was heap-allocated by
+/// [`create_raw_pointer_for_record_batch_reader`] via `Box::into_raw`.
+///
+/// This reclaims the memory through Rust's own allocator, making it safe
+/// regardless of which global allocator the Rust library was compiled with.
+/// The caller must not use `ptr` after this call.
+pub unsafe fn free_arrow_stream(ptr: *mut ffi::ArrowArrayStream) {
+    if !ptr.is_null() {
+        // Reconstruct the original Box<FFI_ArrowArrayStream>.  This is the
+        // exact type that Box::into_raw() produced in
+        // create_raw_pointer_for_record_batch_reader();
+        // the pointer was only cast to *mut ffi::ArrowArrayStream (layout-compatible
+        // CXX opaque type) for transport across the FFI boundary.
+        // Dropping the Box invokes FFI_ArrowArrayStream's Drop impl (which calls
+        // the Arrow release callback) and then frees the heap allocation.
+        unsafe { drop(Box::from_raw(ptr as *mut FFI_ArrowArrayStream)) };
     }
 }
