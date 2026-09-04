@@ -647,12 +647,10 @@ impl PushedFilter {
             Some(RexType::Selection(field_ref)) => {
                 if let Some(field_reference::ReferenceType::DirectReference(seg)) =
                     &field_ref.reference_type
-                {
-                    if let Some(reference_segment::ReferenceType::StructField(sf)) =
+                    && let Some(reference_segment::ReferenceType::StructField(sf)) =
                         &seg.reference_type
-                    {
-                        out(sf.field as usize);
-                    }
+                {
+                    out(sf.field as usize);
                 }
             }
             Some(RexType::ScalarFunction(sf)) => {

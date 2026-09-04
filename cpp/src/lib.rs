@@ -26,6 +26,7 @@ mod util;
 pub use hudi_dep as hudi_core;
 
 use crate::base_file_provider::{BaseFileDataProviderRef, BaseFileProviderStats};
+use crate::blocking_merge_stream::BlockingMergeStream;
 use crate::context::FileGroupReaderContext;
 use crate::util::{create_raw_pointer_for_record_batch_reader, free_arrow_stream};
 use arrow_array::{RecordBatch, RecordBatchReader};
@@ -35,7 +36,7 @@ use hudi_dep::config::table::HudiTableConfig;
 use hudi_dep::config::util::split_hudi_options_from_others;
 use hudi_dep::ffi_support::OBJECT_STORE_RUNTIME;
 use hudi_dep::ffi_support::{
-    CompletionGateInputs, FileGroupMergeStream, FileGroupReaderSchemaHandler,
+    CompletionGateInputs, FileGroupReaderSchemaHandler,
     HoodieFileGroupReader as CoreFileGroupReader, InputSplit, ReaderContext, ReaderParameters,
     RecordContext,
 };
@@ -481,8 +482,15 @@ pub struct HoodieFileGroupReader {
     // ── base-file data provider (composition-root-injected via C ABI) ─────
     // The concrete provider, presented as hudi-core's trait object. `None`
     // when no provider handle was supplied on the FFI context (the common
-    // path). Cloned into the core reader builder at each build site;
-    // owns the provider `ctx` and releases it (via the ABI `destroy`) on drop.
+    // path). Owns the provider `ctx` and releases it (via the ABI `destroy`)
+    // on drop.
+    //
+    // Phase 1: held but never read. OSS core has no provider seam, so nothing
+    // is injected into the reader builder (see `get_closable_iterator`). The
+    // field stays because the cxx ABI still accepts and owns the handle --
+    // `hudi_base_file_data_provider_new` / `_free` remain exported so velox
+    // needs no change -- and dropping it here would leak the provider `ctx`.
+    #[allow(dead_code)]
     base_file_provider: Option<BaseFileDataProviderRef>,
 
     // ── base-file provider read counters ──────────────────────────────────────
@@ -826,21 +834,21 @@ pub fn new_file_group_reader_with_context(
     // fields) and `data_schema` (base file reading schema).
     let schema_handler = {
         let mut handler = FileGroupReaderSchemaHandler::new();
-        if let Some(hs) = fgrc.data_schema.as_ref() {
-            if let Ok(arrow_schema) = avro_json_to_arrow_schema(&hs.avro_schema_json) {
-                let schema_ref = Arc::new(arrow_schema);
-                handler = handler
-                    .with_table_schema(schema_ref.clone())
-                    .with_data_schema(schema_ref)
-                    .with_data_schema_json(hs.avro_schema_json.clone());
-            }
+        if let Some(hs) = fgrc.data_schema.as_ref()
+            && let Ok(arrow_schema) = avro_json_to_arrow_schema(&hs.avro_schema_json)
+        {
+            let schema_ref = Arc::new(arrow_schema);
+            handler = handler
+                .with_table_schema(schema_ref.clone())
+                .with_data_schema(schema_ref)
+                .with_data_schema_json(hs.avro_schema_json.clone());
         }
-        if let Some(hs) = fgrc.requested_schema.as_ref() {
-            if let Ok(arrow_schema) = avro_json_to_arrow_schema(&hs.avro_schema_json) {
-                handler = handler
-                    .with_requested_schema(Arc::new(arrow_schema))
-                    .with_requested_schema_json(hs.avro_schema_json.clone());
-            }
+        if let Some(hs) = fgrc.requested_schema.as_ref()
+            && let Ok(arrow_schema) = avro_json_to_arrow_schema(&hs.avro_schema_json)
+        {
+            handler = handler
+                .with_requested_schema(Arc::new(arrow_schema))
+                .with_requested_schema_json(hs.avro_schema_json.clone());
         }
         handler
     };
@@ -1052,15 +1060,16 @@ impl HoodieFileGroupReader {
         // consult base_read_pushdown_is_safe() to decide whether to
         // install the filter. The post-merge filter below still runs
         // unconditionally for non-pushed-down predicates.
-        let mut builder = CoreFileGroupReader::builder()
+        // Phase 1: the provider handle stays in the cxx ABI so velox needs no
+        // change, but OSS core has no provider seam, so nothing is injected.
+        // Base files take core's own object-store read -- the same fallback
+        // core takes for `None`. Provider metrics therefore read zero; see
+        // `base_file_provider_stats`.
+        let mut reader = CoreFileGroupReader::builder()
             .with_reader_context(self.reader_context.clone())
             .with_storage(self.storage.clone())
             .with_input_split(self.input_split.clone())
-            .with_reader_parameters(self.reader_parameters.clone());
-        if let Some(provider) = &self.base_file_provider {
-            builder = builder.with_base_file_provider(provider.clone());
-        }
-        let mut reader = builder
+            .with_reader_parameters(self.reader_parameters.clone())
             .build()
             .map_err(|e| format!("Failed to build file group reader: {e}"))?;
 
@@ -1167,15 +1176,16 @@ impl HoodieFileGroupReader {
         // Same construction as read_record_batch — see ENG-42276 / ENG-42866
         // doc comments there for why row_filter_builder + mor_pk_safe live on
         // the reader_context.
-        let mut builder = CoreFileGroupReader::builder()
+        // Phase 1: the provider handle stays in the cxx ABI so velox needs no
+        // change, but OSS core has no provider seam, so nothing is injected.
+        // Base files take core's own object-store read -- the same fallback
+        // core takes for `None`. Provider metrics therefore read zero; see
+        // `base_file_provider_stats`.
+        let mut reader = CoreFileGroupReader::builder()
             .with_reader_context(self.reader_context.clone())
             .with_storage(self.storage.clone())
             .with_input_split(self.input_split.clone())
-            .with_reader_parameters(self.reader_parameters.clone());
-        if let Some(provider) = &self.base_file_provider {
-            builder = builder.with_base_file_provider(provider.clone());
-        }
-        let mut reader = builder
+            .with_reader_parameters(self.reader_parameters.clone())
             .build()
             .map_err(|e| format!("Failed to build file group reader: {e}"))?;
 
@@ -1198,14 +1208,20 @@ impl HoodieFileGroupReader {
         // scope at the end of this function. The iterator we return keeps
         // writing into it; `read_stats` would be unreachable (see
         // `stream_stats_handle`).
-        let _ = self.stream_stats.set(reader.stream_stats_handle());
+        let _ = self
+            .stream_stats
+            .set(hudi_dep::ffi_support::stream_stats_handle(&reader));
 
         // ENG-42276 v4.3 — async setup runs on OBJECT_STORE_RUNTIME so the
         // hyper dispatcher survives across file groups. The merge iteration
-        // itself runs synchronously from FFI get_next calls.
-        let merge_iter = OBJECT_STORE_RUNTIME
+        // itself runs synchronously from FFI get_next calls, via
+        // `BlockingMergeStream` — see that module for why the guard above is
+        // what makes its `block_on` sound.
+        let merge_stream = OBJECT_STORE_RUNTIME
             .block_on(reader.open())
             .map_err(|e| format!("Failed to open file group: {e}"))?;
+
+        let merge_iter = BlockingMergeStream::new(merge_stream);
 
         // ENG-44436 — publish the reader's PEAK native footprint ONCE, here.
         // `open()` has fully populated the merge map during the log scan, and the
@@ -1216,27 +1232,10 @@ impl HoodieFileGroupReader {
         self.reader_memory_bytes
             .store(merge_iter.current_in_memory_bytes(), Ordering::Relaxed);
 
-        // Capture a handle to the provider counters. With the base-file provider
-        // now STREAMING (R3), the drain counters (rows/bytes/batches) are not
-        // final at `open()` time — they accumulate as the C++ consumer drains the
-        // returned stream. So we grab the core reader's *live* stats slot (shared
-        // with the streaming counting adapter) rather than snapshotting a value.
-        // The eager / not-served paths instead record into `read_stats`, so fold
-        // that into the same slot here; a reader serves exactly one base file, so
-        // the two never both contribute (no double count). `reader` is dropped
-        // when this fn returns, but the live slot is an `Arc` kept alive by both
-        // the counting adapter inside the returned stream and this handle.
-        let live = reader.base_file_provider_live_stats();
-        if let (Ok(mut slot), Some(eager)) =
-            (live.lock(), reader.read_stats().base_file_provider.clone())
-        {
-            slot.merge(&eager);
-        }
-        // Set-once: a second `get_closable_iterator` on the same reader keeps the
-        // first slot rather than orphaning a stream that may still be draining
-        // into it. hudi-core picks exactly one sink per reader (see its
-        // `record_provider_stats`), so nothing is lost by not replacing it.
-        let _ = self.base_file_provider_stats.set(live);
+        // Phase 1: no provider counters to capture. Nothing was injected into
+        // core, so there is no live stats slot to fold `read_stats` into and
+        // `base_file_provider_stats` stays unset -- its `None` arm then reports
+        // all zeros, which is the honest answer for a read core served itself.
 
         // Wrap with the per-chunk ENG-40156 post-merge filter (no-op when
         // no predicate was pushed). Schema is unchanged by filtering.
@@ -1384,7 +1383,7 @@ fn to_ffi_base_file_provider_stats(stats: &BaseFileProviderStats) -> ffi::FfiBas
 /// [ENG-40156 + ENG-42991] Per-chunk post-merge predicate evaluation
 /// adapter.
 ///
-/// Wraps a [`FileGroupMergeIterator`] and applies the pushed Substrait
+/// Wraps a [`BlockingMergeStream`] and applies the pushed Substrait
 /// predicate to each emitted `RecordBatch` before forwarding it on. When
 /// no predicate was pushed (`filter == None`), it is a transparent
 /// pass-through.
@@ -1395,12 +1394,12 @@ fn to_ffi_base_file_provider_stats(stats: &BaseFileProviderStats) -> ffi::FfiBas
 /// predicate on the returned rows. Correctness is preserved; only the
 /// hudi-rs-side perf benefit is forfeited for the offending shape.
 struct PostMergePredicateFilter {
-    inner: FileGroupMergeStream,
+    inner: BlockingMergeStream,
     filter: Option<PushedFilter>,
 }
 
 impl PostMergePredicateFilter {
-    fn new(inner: FileGroupMergeStream, filter: Option<PushedFilter>) -> Self {
+    fn new(inner: BlockingMergeStream, filter: Option<PushedFilter>) -> Self {
         Self { inner, filter }
     }
 }
