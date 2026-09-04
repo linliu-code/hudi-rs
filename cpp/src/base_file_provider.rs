@@ -174,13 +174,15 @@ pub trait BaseFileDataProvider: Send + Sync {
     ///
     /// ## Streaming / threading contract
     /// The returned reader is consumed lazily inside the merge loop, so the whole
-    /// served file never needs to be resident at once. A provider whose
-    /// `RecordBatchReader::next` blocks (e.g. driving an async fetch via
-    /// `block_on`) is fine: hudi-core only pulls the served source from the
-    /// synchronous streaming driver (`HoodieFileGroupReader::open`'s
-    /// consumer — the FFI thread), never from within a tokio runtime worker. The
-    /// reader must be `Send` so it can move from this async method into that
-    /// driver.
+    /// served file never needs to be resident at once. On OSS, that merge loop is
+    /// driven by `next_chunk().await`, itself invoked from inside
+    /// `OBJECT_STORE_RUNTIME.block_on(...)` — so a tokio `Handle` is current
+    /// wherever `RecordBatchReader::next` runs. A provider whose `next` calls
+    /// `block_on` (e.g. to drive an async fetch) will therefore panic on nested
+    /// re-entry, and a panic unwinding across the FFI boundary is undefined
+    /// behavior. A Phase-2 provider must not `block_on` inside `next()`; hand the
+    /// async work off via a channel or `spawn_blocking` instead. The reader must
+    /// be `Send` so it can move from this async method into that driver.
     async fn try_base_file(
         &self,
         req: BaseFileDataRequest<'_>,

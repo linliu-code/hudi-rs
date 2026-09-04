@@ -63,6 +63,13 @@ impl Iterator for BlockingMergeStream {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Some(Err(ArrowError::ExternalError(
+                "BlockingMergeStream::next called from inside a tokio runtime; \
+                 block_on would panic on re-entry (UB across FFI)"
+                    .into(),
+            )));
+        }
         OBJECT_STORE_RUNTIME
             .block_on(self.inner.next_chunk())
             .map(|r| r.map_err(|e| ArrowError::ExternalError(Box::new(e))))

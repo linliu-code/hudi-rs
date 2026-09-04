@@ -482,14 +482,20 @@ pub struct HoodieFileGroupReader {
     // ── base-file data provider (composition-root-injected via C ABI) ─────
     // The concrete provider, presented as hudi-core's trait object. `None`
     // when no provider handle was supplied on the FFI context (the common
-    // path). Owns the provider `ctx` and releases it (via the ABI `destroy`)
-    // on drop.
+    // path).
     //
     // Phase 1: held but never read. OSS core has no provider seam, so nothing
     // is injected into the reader builder (see `get_closable_iterator`). The
-    // field stays because the cxx ABI still accepts and owns the handle --
-    // `hudi_base_file_data_provider_new` / `_free` remain exported so velox
-    // needs no change -- and dropping it here would leak the provider `ctx`.
+    // field still exists so `take_provider_from_handle` (which reclaims the
+    // `Box` behind the FFI handle into this `Arc`) has somewhere to put its
+    // result -- this field ends up owning the last strong reference, so
+    // `destroy(ctx)` (`impl Drop for CApiBaseFileDataProvider`) runs exactly
+    // when this FFI reader drops. Removing the `take_provider_from_handle`
+    // call would leak the provider `ctx` (the boxed handle is never
+    // reclaimed into a value that can drop). Dropping this field instead of
+    // holding it for the reader's lifetime would free the provider -- and run
+    // `destroy(ctx)` -- too early, while the reader (a Phase-2 consumer of
+    // the provider) may still be in scope.
     #[allow(dead_code)]
     base_file_provider: Option<BaseFileDataProviderRef>,
 

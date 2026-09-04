@@ -25,9 +25,13 @@
 //! This validates the full construction path (ReaderContext, InputSplit,
 //! Storage, ReaderParameters) that the FFI consumer uses.
 //!
-//! All tests are synchronous (`#[test]`) because `HoodieFileGroupReader`
+//! Most tests are synchronous (`#[test]`) because `HoodieFileGroupReader`
 //! owns a `tokio::runtime::Runtime` and calls `block_on` internally — nesting
-//! a second runtime under `#[tokio::test]` would panic.
+//! a second runtime under `#[tokio::test]` would panic. The exceptions are
+//! the tokio-context guard tests, which prove a re-entrant `block_on` is
+//! refused rather than triggering the panic they exist to guard against;
+//! those run as `#[tokio::test]` and build their fixtures with
+//! `create_storage_and_props_async` instead of the sync wrapper.
 
 use hudi::HoodieFileGroupReader;
 use hudi::blocking_merge_stream::BlockingMergeStream;
@@ -800,6 +804,33 @@ async fn get_closable_iterator_refuses_to_run_inside_a_tokio_runtime() {
         .expect_err("expected a refusal when called from a tokio worker thread");
     assert!(
         err.contains("must not be called from within a tokio runtime"),
+        "unexpected error text: {err}",
+    );
+}
+
+#[tokio::test]
+async fn blocking_merge_stream_next_refuses_to_run_inside_a_tokio_runtime() {
+    // BlockingMergeStream::next() must guard against tokio re-entry itself,
+    // not rely solely on get_closable_iterator's check one function away --
+    // block_on would otherwise panic on re-entry, and a panic unwinding
+    // across the FFI boundary is UB.
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+    // The async helper, not the sync wrapper: block_on inside #[tokio::test]
+    // would panic before the code under test ran.
+    let (storage, _props) = create_storage_and_props_async(&table_path).await;
+    let mut reader = build_core_sf_reader(&table_path, storage);
+
+    // open() is async, so it can be awaited directly here.
+    let stream = reader.open().await.expect("open merge stream");
+    let mut adapter = BlockingMergeStream::new(stream);
+
+    let err = adapter
+        .next()
+        .expect("expected Some(Err), not None")
+        .expect_err("expected an Err when called from inside a tokio runtime");
+    assert!(
+        err.to_string()
+            .contains("BlockingMergeStream::next called from inside a tokio runtime"),
         "unexpected error text: {err}",
     );
 }
