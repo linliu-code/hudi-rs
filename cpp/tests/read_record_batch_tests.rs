@@ -769,7 +769,18 @@ fn blocking_merge_stream_exposes_the_in_memory_footprint() {
         .block_on(reader.open())
         .expect("open merge stream");
     let adapter = BlockingMergeStream::new(stream);
-    let _ = adapter.current_in_memory_bytes();
+
+    // RV-20 — assert the value, not just that the call compiles. `open()` has
+    // completed the log scan, so the merge map holds this slice's log records;
+    // the core sibling `open_exposes_the_in_memory_footprint`
+    // (`reader_v2/engine.rs`) pins the same relation directly on the stream
+    // over the same fixture shape (MOR slice + one log file), and this is the
+    // exact instant `hudi_reader_memory_bytes` samples.
+    assert!(
+        adapter.current_in_memory_bytes() > 0,
+        "a MOR slice with a log file must report a non-empty merge map right \
+         after open()"
+    );
 }
 
 // =============================================================================
@@ -832,5 +843,19 @@ async fn blocking_merge_stream_next_refuses_to_run_inside_a_tokio_runtime() {
         err.to_string()
             .contains("BlockingMergeStream::next called from inside a tokio runtime"),
         "unexpected error text: {err}",
+    );
+
+    // RV-17 — and the refusal must TERMINATE the stream. The thread is still a
+    // tokio worker on the next pull, so an unfused adapter would hand the FFI
+    // consumer the identical error forever; arrow-rs's own
+    // `ArrowArrayStreamReader` keeps pulling after an error, so that is an
+    // infinite stream, not a failed one.
+    assert!(
+        adapter.next().is_none(),
+        "the adapter must be fused after the tokio re-entry refusal"
+    );
+    assert!(
+        adapter.next().is_none(),
+        "and stay fused on every further pull"
     );
 }

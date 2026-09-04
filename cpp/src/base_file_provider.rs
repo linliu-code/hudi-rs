@@ -49,8 +49,10 @@ use std::sync::Arc;
 ///
 /// hudi-core neither produces nor interprets these beyond summing them across
 /// the base files of a read; a provider fills in whatever it tracks and leaves
-/// the rest zero. Surfaced to backends (e.g. the Gluten JNI metrics bridge) via
-/// [`HoodieReadStats::base_file_provider`](super::read_stats::HoodieReadStats::base_file_provider).
+/// the rest zero. In this crate they are surfaced to backends (e.g. the Gluten
+/// JNI metrics bridge) as the `base_file_provider_stats` getter on the cxx
+/// bridge's `HoodieFileGroupReader` — plain text, not a rustdoc link, because
+/// neither the `mod ffi` bridge block nor the method backing it is public.
 /// The field set is intentionally generic — no wire/protocol type of any
 /// concrete provider leaks here.
 ///

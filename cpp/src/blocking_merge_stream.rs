@@ -45,12 +45,27 @@ pub struct BlockingMergeStream {
     /// must answer before the first `next()`, since the FFI reads the schema
     /// when it creates the stream.
     schema: SchemaRef,
+    /// Fuse latch: once set, `next()` returns `None` forever.
+    ///
+    /// RV-17. Set both on natural exhaustion and — the reason it exists — on
+    /// the tokio re-entry refusal. The refusal yields `Some(Err(..))`, and
+    /// `FFI_ArrowArrayStream` consumers routinely keep pulling after an error
+    /// (arrow-rs's own `ArrowArrayStreamReader` does), so without the latch the
+    /// same refusal is re-emitted on every subsequent pull: an infinite stream
+    /// of identical errors instead of a terminated one. The condition cannot
+    /// clear itself either — the calling thread does not stop being a tokio
+    /// worker between two `get_next` calls — so re-checking it buys nothing.
+    done: bool,
 }
 
 impl BlockingMergeStream {
     pub fn new(inner: FileGroupMergeStream) -> Self {
         let schema = inner.schema();
-        Self { inner, schema }
+        Self {
+            inner,
+            schema,
+            done: false,
+        }
     }
 
     /// Current merge-map footprint, for the `hudi_reader_memory_bytes` metric.
@@ -62,17 +77,27 @@ impl BlockingMergeStream {
 impl Iterator for BlockingMergeStream {
     type Item = Result<RecordBatch, ArrowError>;
 
+    /// Fused: after the tokio re-entry refusal, and after the merge stream is
+    /// exhausted, every subsequent call returns `None` (see [`Self::done`]).
     fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
         if tokio::runtime::Handle::try_current().is_ok() {
+            self.done = true;
             return Some(Err(ArrowError::ExternalError(
                 "BlockingMergeStream::next called from inside a tokio runtime; \
                  block_on would panic on re-entry (UB across FFI)"
                     .into(),
             )));
         }
-        OBJECT_STORE_RUNTIME
+        let chunk = OBJECT_STORE_RUNTIME
             .block_on(self.inner.next_chunk())
-            .map(|r| r.map_err(|e| ArrowError::ExternalError(Box::new(e))))
+            .map(|r| r.map_err(|e| ArrowError::ExternalError(Box::new(e))));
+        if chunk.is_none() {
+            self.done = true;
+        }
+        chunk
     }
 }
 
