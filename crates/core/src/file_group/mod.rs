@@ -26,10 +26,7 @@ pub mod builder;
 pub mod file_slice;
 pub mod log_file;
 pub mod reader;
-// `pub` so the CXX bridge (cpp/) can name these types. Upstream keeps this
-// crate-private because it has no external consumer; if this is upstreamed,
-// a re-export facade is the tidier shape.
-pub mod reader_v2;
+pub(crate) mod reader_v2;
 pub mod record_batches;
 
 use crate::Result;
