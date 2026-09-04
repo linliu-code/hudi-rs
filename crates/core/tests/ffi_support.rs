@@ -12,11 +12,23 @@ fn object_store_runtime_is_multi_thread_and_reusable() {
     let b = OBJECT_STORE_RUNTIME.block_on(async { 2 + 2 });
     assert_eq!((a, b), (2, 4));
 
-    // Must be multi_thread: block_on from inside Iterator::next while the
-    // runtime also drives IO requires more than one worker.
-    let n = OBJECT_STORE_RUNTIME.block_on(async { tokio::spawn(async { 7 }).await.unwrap() });
-    assert_eq!(
-        n, 7,
-        "spawn inside block_on requires a multi-thread runtime"
-    );
+    // Must be multi_thread: the FFI adapter calls block_on from inside
+    // Iterator::next while the same runtime drives IO. Prove it with a
+    // SYNCHRONOUS block inside the block_on future: on a multi-thread runtime
+    // the spawned task runs on a worker thread and sends; on a current-thread
+    // runtime the only thread is parked here in recv_timeout, the spawned
+    // task can never be scheduled, and the recv times out. (A plain
+    // `tokio::spawn(..).await` does NOT distinguish the two -- current_thread
+    // cooperatively runs spawned tasks whenever the outer future yields.)
+    let (tx, rx) = std::sync::mpsc::channel::<u8>();
+    OBJECT_STORE_RUNTIME.block_on(async move {
+        let worker = tokio::spawn(async move {
+            tx.send(7).expect("receiver dropped");
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+            "spawned task never ran while this thread blocked: runtime is not multi_thread",
+        );
+        assert_eq!(got, 7);
+        worker.await.expect("spawned task panicked");
+    });
 }
