@@ -1323,13 +1323,18 @@ impl HFileReader {
         }
     }
 
-    /// Load a data block.
     /// Data blocks decompressed by this reader so far. See the field's note: this is
     /// how a test asserts a lookup's COST, which its RESULT cannot reveal.
-    pub fn data_block_load_count(&self) -> usize {
+    ///
+    /// `pub(crate)` and `#[cfg(test)]`: the only caller is this file's own
+    /// `tests` module, so restricting to `pub(crate)` alone leaves the method
+    /// dead code (and warning) outside test builds.
+    #[cfg(test)]
+    pub(crate) fn data_block_load_count(&self) -> usize {
         self.data_block_load_count
     }
 
+    /// Load a data block.
     fn load_data_block(&mut self, entry: &BlockIndexEntry) -> Result<()> {
         self.data_block_load_count += 1;
         let block = self.read_block_at(entry.offset as usize, entry.size as usize)?;
@@ -1723,7 +1728,8 @@ mod tests {
             loaded <= 2,
             "a point lookup for the LAST key of a {total_blocks}-block file decompressed \
              {loaded} blocks; the index probe is not locating the block (it degraded to a \
-             linear walk). Expected 1, allowing 2 for a boundary re-probe."
+             linear walk). Expected 1, allowing 2 = seek_to_first's block-1 scaffold \
+             load + the probed target block."
         );
     }
 
