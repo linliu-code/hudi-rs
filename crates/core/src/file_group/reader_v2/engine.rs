@@ -1219,6 +1219,15 @@ impl HoodieFileGroupReader {
         &self.read_stats
     }
 
+    /// Clone the shared stage-timing sink.
+    ///
+    /// FFI consumers capture this before dropping the reader: the stream
+    /// returned by [`Self::open`] keeps accumulating into it as chunks drain,
+    /// so reading `read_stats()` off a dropped reader yields zeros.
+    pub fn stream_stats_handle(&self) -> StreamStatsHandle {
+        self.stream_stats.clone()
+    }
+
     /// Returns the valid block instants from log scanning.
     /// See `read_stats`.
     #[allow(dead_code)]
