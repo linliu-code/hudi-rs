@@ -50,6 +50,7 @@ mod avro_to_arrow;
 pub mod config;
 pub mod error;
 pub mod expr;
+pub mod ffi_support;
 pub mod file_group;
 pub mod hfile;
 pub mod keygen;
