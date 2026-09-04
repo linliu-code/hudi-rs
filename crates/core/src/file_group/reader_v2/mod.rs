@@ -39,26 +39,26 @@
 #[allow(dead_code)]
 pub(crate) const MAX_INSTANT_TIME: &str = "99991231235959999";
 
-pub(crate) mod adapter;
-pub(crate) mod buffer;
-pub(crate) mod buffered_record;
-pub(crate) mod buffered_record_converter;
-pub(crate) mod delete_context;
-pub(crate) mod engine;
-pub(crate) mod gaps;
+pub mod adapter;
+pub mod buffer;
+pub mod buffered_record;
+pub mod buffered_record_converter;
+pub mod delete_context;
+pub mod engine;
+pub mod gaps;
 #[cfg(test)]
 mod harness;
 #[cfg(test)]
 mod harness_tests;
-pub(crate) mod input_split;
-pub(crate) mod iterator_mode;
-pub(crate) mod log_record_reader;
+pub mod input_split;
+pub mod iterator_mode;
+pub mod log_record_reader;
 #[cfg(test)]
 mod memory_limit_tests;
 #[cfg(test)]
 mod merge_cpu_bench;
-pub(crate) mod merge_iterator;
-pub(crate) mod merged_log_record_reader;
+pub mod merge_iterator;
+pub mod merged_log_record_reader;
 // The one module here that names something outside this reader: it holds Hudi's
 // metadata payload merge, so `filesystemMetadata` and the payload's class name appear
 // below a reader that otherwise knows nothing about the metadata table.
@@ -74,20 +74,20 @@ pub(crate) mod merged_log_record_reader;
 //
 // The cost of leaving it: a second payload cannot be added without editing this
 // directory.
-pub(crate) mod metadata_merger;
-pub(crate) mod output_converter;
-pub(crate) mod profiling;
-pub(crate) mod read_stats;
-pub(crate) mod reader_context;
-pub(crate) mod reader_parameters;
-pub(crate) mod record_context;
-pub(crate) mod record_merger;
-pub(crate) mod resolver;
+pub mod metadata_merger;
+pub mod output_converter;
+pub mod profiling;
+pub mod read_stats;
+pub mod reader_context;
+pub mod reader_parameters;
+pub mod record_context;
+pub mod record_merger;
+pub mod resolver;
 /// Arrow IPC serialization for the spill tier.
 ///
 /// Only the RocksDB-backed merge map serializes anything, so without
 /// `spill-rocksdb` there is no caller and the module is not built.
 #[cfg(feature = "spill-rocksdb")]
-pub(crate) mod row_serde;
-pub(crate) mod schema_handler;
-pub(crate) mod update_processor;
+pub mod row_serde;
+pub mod schema_handler;
+pub mod update_processor;
