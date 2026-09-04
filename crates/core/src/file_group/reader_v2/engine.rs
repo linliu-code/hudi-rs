@@ -2663,7 +2663,10 @@ mod tests {
         )
         .await;
         let stream = r.open().await.unwrap();
-        let _bytes: u64 = stream.current_in_memory_bytes();
+        assert!(
+            stream.current_in_memory_bytes() > 0,
+            "MOR slice with a log file must have a non-empty merge map after open()"
+        );
     }
 
     /// Every row group of the base file reaches the output, on both entry
