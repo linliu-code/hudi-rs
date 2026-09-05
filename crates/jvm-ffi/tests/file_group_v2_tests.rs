@@ -646,7 +646,7 @@ fn a_prefixes_predicate_returns_only_keys_with_the_prefix() {
     let other_rows = a_key_in_another_hfile(&base).map(|other_key| {
         let other_prefix: String = other_key
             .chars()
-            .take(std::cmp::max(1, other_key.len() / 2))
+            .take(std::cmp::max(1, other_key.chars().count() / 2))
             .collect();
         assert!(
             !first.starts_with(&other_prefix),

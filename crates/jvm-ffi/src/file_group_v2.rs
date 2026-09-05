@@ -76,11 +76,13 @@ pub struct FileGroupRequest<'a> {
     pub lookup_keys_are_prefixes: bool,
     /// Explicit valid-instant set — Java's `InstantRange.EXACT_MATCH(validInstantTimestamps)`:
     /// a log block whose instant is not in the set is skipped. Empty means no range.
-    /// Only meaningful for a metadata-table read (a `table_path` ending in
-    /// `.hoodie/metadata`): for any other path reader_v2's `base_file_in_range`
-    /// (`crates/core/src/file_group/reader_v2/engine.rs`) drops the whole base
-    /// file whenever a range is set, so a data-table caller passing instants
-    /// would silently get zero base rows.
+    /// Designed for a metadata-table read (a `table_path` ending in
+    /// `.hoodie/metadata`), where reader_v2's `base_file_in_range`
+    /// (`crates/core/src/file_group/reader_v2/engine.rs`) always keeps the base
+    /// file. For any other path the base file is subject to the range too: it is
+    /// kept only if its own commit instant is in the set (all-or-nothing per
+    /// file, unlike the per-block log filtering; unresolvable instant = keep),
+    /// so a data-table caller must include the base file's instant.
     pub valid_instants: &'a [&'a str],
 }
 
