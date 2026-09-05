@@ -68,18 +68,21 @@ fn jstring_array_to_vec(
         .map_err(|e| format!("{what}: cannot read array length: {e}"))?;
     let mut out = Vec::with_capacity(len as usize);
     for i in 0..len {
-        let element = env
-            .get_object_array_element(array, i)
-            .map_err(|e| format!("{what}[{i}]: {e}"))?;
-        let element = JString::from(element);
-        let value = jstring_to_string(env, &element, &format!("{what}[{i}]"))?;
-        // Release this element's local reference immediately: a JNI call has
-        // a bounded local-reference table, and leaving one per element live
-        // for the whole call risks overflowing it on a file group with many
-        // log files.
-        if let Err(e) = env.delete_local_ref(element) {
-            log::warn!("{what}[{i}]: failed to delete local ref: {e}");
-        }
+        // `get_object_array_element` allocates a local ref for the element,
+        // and `get_string` allocates two more of its own internally
+        // (`find_class("java/lang/String")` and `get_object_class`) — none of
+        // `JObject`/`JString`/`JClass` implement `Drop` in jni-0.21.1, so
+        // without a frame every one of those refs would stay live for the
+        // rest of the call. Running the whole per-element read inside
+        // `with_local_frame` pops all of them, on both the success and the
+        // error path, keeping live refs bounded regardless of array length.
+        let value = env
+            .with_local_frame(4, |env| -> Result<String, jni::errors::Error> {
+                let element = env.get_object_array_element(array, i)?;
+                let element = JString::from(element);
+                env.get_string(&element).map(String::from)
+            })
+            .map_err(|e| format!("{what}[{i}]: not a valid Java string: {e}"))?;
         out.push(value);
     }
     Ok(out)
