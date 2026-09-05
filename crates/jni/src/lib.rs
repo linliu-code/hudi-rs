@@ -34,6 +34,16 @@ use jni::JNIEnv;
 use jni::objects::{JClass, JObjectArray, JString};
 use jni::sys::{jboolean, jlong, jstring};
 
+/// Revision of the `Java_…` export signatures in this crate. Bump it whenever the
+/// parameter list of any exported `Java_` function changes: the Java side
+/// (`NativeFileGroupReader.REQUIRED_JNI_ABI`) refuses a library that reports a lower
+/// revision, which turns a jar/`libhudi_jni.so` mismatch into a load-time error
+/// instead of a mis-read argument slot (OI-17).
+///
+/// History: 1 = the 7-argument `readFileGroupInto` (pre lookup-keys);
+/// 2 = `readFileGroupInto` gained `lookupKeys`, `lookupKeysArePrefixes`, `validInstants`.
+pub const JNI_ABI_VERSION: u32 = 2;
+
 const EXCEPTION_CLASS: &str = "org/apache/hudi/io/nativereader/NativeReaderException";
 
 static LOGGER: OnceLock<()> = OnceLock::new();
@@ -120,6 +130,8 @@ fn throw(env: &mut JNIEnv, message: String) {
 /// `lookupKeysArePrefixes` is set; a null array means the whole slice (no key
 /// filter). `validInstants` is the set of valid instant timestamps; a null
 /// array means no instant filter.
+///
+/// Changing this parameter list requires bumping [`JNI_ABI_VERSION`].
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReader_readFileGroupInto<
     'local,
@@ -179,7 +191,7 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
     }
 }
 
-/// Liveness probe for the loader: returns `"hudi-jni <version>"`.
+/// Liveness probe for the loader: returns `"hudi-jni <crate version> abi=<JNI_ABI_VERSION>"`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReader_version<
     'local,
@@ -189,9 +201,13 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
 ) -> jstring {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         init_logger();
-        env.new_string(format!("hudi-jni {}", env!("CARGO_PKG_VERSION")))
-            .map(|s| s.into_raw())
-            .map_err(|e| format!("cannot allocate the version string: {e}"))
+        env.new_string(format!(
+            "hudi-jni {} abi={}",
+            env!("CARGO_PKG_VERSION"),
+            JNI_ABI_VERSION
+        ))
+        .map(|s| s.into_raw())
+        .map_err(|e| format!("cannot allocate the version string: {e}"))
     }));
     match outcome {
         Ok(Ok(raw)) => raw,
