@@ -351,10 +351,19 @@ pub extern "C" fn hudi_ffi_last_error() -> *const c_char {
 /// an empty string means "no schema", and the engine then infers the output
 /// schema from the slice — which cannot work for a log-only slice.
 ///
+/// `lookup_keys` (with `lookup_key_count` and `lookup_keys_are_prefixes`) and
+/// `valid_instants` (with `valid_instant_count`) are both optional: a null
+/// pointer with a count of 0, or a non-null pointer with a count of 0, both
+/// mean ABSENT — the whole slice, never "match nothing". When `lookup_keys` is
+/// non-empty, `lookup_keys_are_prefixes` selects exact-key matching (`false`)
+/// or prefix matching (`true`).
+///
 /// # Safety
 /// All string pointers must be valid NUL-terminated UTF-8; `log_file_names`
-/// must point to `log_file_count` such strings; `out_stream` must be a valid
-/// pointer to writable memory sized for an `ArrowArrayStream`.
+/// must point to `log_file_count` such strings; `lookup_keys` must point to
+/// `lookup_key_count` such strings; `valid_instants` must point to
+/// `valid_instant_count` such strings; `out_stream` must be a valid pointer to
+/// writable memory sized for an `ArrowArrayStream`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hudi_ffi_read_file_group_v2_into(
     table_path: *const c_char,
@@ -364,6 +373,11 @@ pub unsafe extern "C" fn hudi_ffi_read_file_group_v2_into(
     log_file_count: usize,
     latest_instant: *const c_char,
     data_schema_json: *const c_char,
+    lookup_keys: *const *const c_char,
+    lookup_key_count: usize,
+    lookup_keys_are_prefixes: bool,
+    valid_instants: *const *const c_char,
+    valid_instant_count: usize,
     out_stream: *mut FFI_ArrowArrayStream,
 ) -> i32 {
     const WHAT: &str = "hudi_ffi_read_file_group_v2_into";
@@ -380,6 +394,9 @@ pub unsafe extern "C" fn hudi_ffi_read_file_group_v2_into(
         } else {
             unsafe { as_str(data_schema_json, "data_schema_json") }?
         };
+        let lookup_keys = unsafe { as_strs(lookup_keys, lookup_key_count, "lookup_keys") }?;
+        let valid_instants =
+            unsafe { as_strs(valid_instants, valid_instant_count, "valid_instants") }?;
         let req = file_group_v2::FileGroupRequest {
             table_path,
             partition_path,
@@ -387,6 +404,9 @@ pub unsafe extern "C" fn hudi_ffi_read_file_group_v2_into(
             log_file_names: &logs,
             latest_instant,
             data_schema_json,
+            lookup_keys: &lookup_keys,
+            lookup_keys_are_prefixes,
+            valid_instants: &valid_instants,
         };
         unsafe { file_group_v2::export_file_group_stream_v2(&req, out_stream) }
     }));
@@ -521,6 +541,11 @@ mod tests {
                 0,
                 std::ptr::null(),
                 std::ptr::null(),
+                std::ptr::null(),
+                0,
+                false,
+                std::ptr::null(),
+                0,
                 &mut stream as *mut _,
             )
         };

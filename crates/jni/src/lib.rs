@@ -152,6 +152,10 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
             log_file_names: &log_refs,
             latest_instant: &latest_instant,
             data_schema_json: &data_schema_json,
+            // Task 2 wires the real key predicate and valid-instant set through JNI.
+            lookup_keys: &[],
+            lookup_keys_are_prefixes: false,
+            valid_instants: &[],
         };
         // SAFETY: the address comes from ArrowArrayStream.allocateNew on the Java side.
         unsafe { export_file_group_stream_v2(&req, stream_address as *mut FFI_ArrowArrayStream) }

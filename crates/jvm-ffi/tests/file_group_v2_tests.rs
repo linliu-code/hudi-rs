@@ -106,6 +106,9 @@ fn base_only_slice_returns_every_entry_of_the_hfile() {
             log_file_names: &[],
             latest_instant: "",
             data_schema_json: "",
+            lookup_keys: &[],
+            lookup_keys_are_prefixes: false,
+            valid_instants: &[],
         };
         let batch = read_file_group_v2(&req).expect("base-only read");
 
@@ -172,6 +175,9 @@ fn base_plus_logs_slice_merges_without_error() {
         log_file_names: &shard_logs,
         latest_instant: "",
         data_schema_json: "",
+        lookup_keys: &[],
+        lookup_keys_are_prefixes: false,
+        valid_instants: &[],
     };
     let batch = read_file_group_v2(&req).expect("base+logs read");
     println!(
@@ -200,6 +206,9 @@ fn exported_stream_round_trips_through_the_arrow_c_stream_interface() {
         log_file_names: &[],
         latest_instant: "",
         data_schema_json: "",
+        lookup_keys: &[],
+        lookup_keys_are_prefixes: false,
+        valid_instants: &[],
     };
     let direct = read_file_group_v2(&req).expect("direct read");
 
@@ -226,6 +235,9 @@ fn a_missing_base_file_is_an_error_not_a_panic() {
         log_file_names: &[],
         latest_instant: "",
         data_schema_json: "",
+        lookup_keys: &[],
+        lookup_keys_are_prefixes: false,
+        valid_instants: &[],
     };
     let err = read_file_group_v2(&req).expect_err("must fail");
     assert!(!err.is_empty());
@@ -284,6 +296,9 @@ fn log_only_bootstrap_slice_reads_like_java_empty_result_with_table_schema() {
         log_file_names: &shard_logs,
         latest_instant: "",
         data_schema_json: &schema_json,
+        lookup_keys: &[],
+        lookup_keys_are_prefixes: false,
+        valid_instants: &[],
     };
     let batch = read_file_group_v2(&req).unwrap_or_else(|e| {
         panic!(
@@ -341,6 +356,9 @@ fn log_only_slice_without_a_schema_still_fails_with_a_clear_error() {
         log_file_names: &shard_logs,
         latest_instant: "",
         data_schema_json: "",
+        lookup_keys: &[],
+        lookup_keys_are_prefixes: false,
+        valid_instants: &[],
     };
     let err = read_file_group_v2(&req).expect_err("a log-only slice has no schema to infer");
     println!("log_only_no_schema shard={shard} err={err}");
@@ -366,6 +384,9 @@ fn base_only_slice_with_explicit_schema_returns_the_same_rows_as_without() {
         log_file_names: &[],
         latest_instant: "",
         data_schema_json: "",
+        lookup_keys: &[],
+        lookup_keys_are_prefixes: false,
+        valid_instants: &[],
     })
     .expect("base-only read without a schema");
     let with = read_file_group_v2(&FileGroupRequest {
@@ -375,6 +396,9 @@ fn base_only_slice_with_explicit_schema_returns_the_same_rows_as_without() {
         log_file_names: &[],
         latest_instant: "",
         data_schema_json: &schema_json,
+        lookup_keys: &[],
+        lookup_keys_are_prefixes: false,
+        valid_instants: &[],
     })
     .expect("base-only read with a schema");
 
@@ -439,6 +463,9 @@ fn base_plus_logs_slice_with_explicit_schema_merges_without_error() {
         log_file_names: &shard_logs,
         latest_instant: "",
         data_schema_json: &schema_json,
+        lookup_keys: &[],
+        lookup_keys_are_prefixes: false,
+        valid_instants: &[],
     };
     let batch = read_file_group_v2(&req).expect("base+logs read with a schema");
     println!(
@@ -453,5 +480,401 @@ fn base_plus_logs_slice_with_explicit_schema_merges_without_error() {
         keys.iter().collect::<HashSet<_>>().len(),
         keys.len(),
         "merge keeps one row per key"
+    );
+}
+
+/// A whole-slice request for `base` with the given logs; tests override the lookup fields.
+fn request<'a>(
+    mdt: &'a str,
+    base: &'a str,
+    logs: &'a [&'a str],
+    schema: &'a str,
+) -> FileGroupRequest<'a> {
+    FileGroupRequest {
+        table_path: mdt,
+        partition_path: "record_index",
+        base_file_name: base,
+        log_file_names: logs,
+        latest_instant: "",
+        data_schema_json: schema,
+        lookup_keys: &[],
+        lookup_keys_are_prefixes: false,
+        valid_instants: &[],
+    }
+}
+
+/// The hfile with the most rows, read as a base-only slice, i.e. with no log
+/// files handed to the reader — whether or not the shard also has logs on
+/// disk (matching `base_only_slice_returns_every_entry_of_the_hfile`, which
+/// reads every hfile the same way).
+fn richest_hfile() -> (String, Vec<String>) {
+    let (hfiles, _) = record_index_files();
+    let mdt = mdt_path();
+    let mut best: Option<(String, Vec<String>)> = None;
+    for base in &hfiles {
+        let batch = read_file_group_v2(&request(&mdt, base, &[], "")).expect("base-only read");
+        let mut keys = keys_of(&batch);
+        keys.sort();
+        if best.as_ref().is_none_or(|(_, k)| keys.len() > k.len()) {
+            best = Some((base.clone(), keys));
+        }
+    }
+    let (base, keys) = best.expect("a record_index hfile");
+    assert!(!keys.is_empty(), "shard {base} must hold at least one key");
+    (base, keys)
+}
+
+/// A key that lives in a record_index hfile OTHER than `exclude_base`, read as
+/// a base-only slice like `richest_hfile`. `None` only if no other hfile
+/// yields any row when read base-only.
+fn a_key_in_another_hfile(exclude_base: &str) -> Option<String> {
+    let (hfiles, _) = record_index_files();
+    let mdt = mdt_path();
+    for base in &hfiles {
+        if base == exclude_base {
+            continue;
+        }
+        let batch = read_file_group_v2(&request(&mdt, base, &[], "")).expect("base-only read");
+        if let Some(key) = keys_of(&batch).into_iter().next() {
+            return Some(key);
+        }
+    }
+    None
+}
+
+#[test]
+fn a_keys_predicate_returns_exactly_the_asked_for_keys_that_exist() {
+    let mdt = mdt_path();
+    let (base, all_keys) = richest_hfile();
+    let wanted = all_keys[0].clone();
+    let lookup = [wanted.as_str(), "no-such-key-zzz"];
+    let mut req = request(&mdt, &base, &[], "");
+    req.lookup_keys = &lookup;
+    let batch = read_file_group_v2(&req).expect("keys lookup");
+    let keys = keys_of(&batch);
+    println!("keys_predicate base={base} asked={lookup:?} got={keys:?}");
+    assert_eq!(keys, vec![wanted]);
+
+    // Negative: a key that exists nowhere must return nothing. On this
+    // fixture `richest_hfile` can return a 1-key shard, so an unfiltered read
+    // already equals `[wanted]` above; these two negatives are what actually
+    // proves the predicate filters rather than being ignored.
+    let missing = ["no-such-key-zzz"];
+    let mut req_missing = request(&mdt, &base, &[], "");
+    req_missing.lookup_keys = &missing;
+    let missing_batch = read_file_group_v2(&req_missing).expect("missing-key lookup");
+    assert_eq!(
+        missing_batch.num_rows(),
+        0,
+        "a key that exists nowhere must yield no rows"
+    );
+
+    // Negative: a key that exists, but in a DIFFERENT hfile, must not leak
+    // into this shard's result.
+    let other_rows = a_key_in_another_hfile(&base).map(|other_key| {
+        let lookup_other = [other_key.as_str()];
+        let mut req_other = request(&mdt, &base, &[], "");
+        req_other.lookup_keys = &lookup_other;
+        let other_batch = read_file_group_v2(&req_other).expect("other-shard-key lookup");
+        other_batch.num_rows()
+    });
+    match other_rows {
+        Some(n) => {
+            println!(
+                "keys_predicate negative_missing_rows={} negative_other_shard_rows={n}",
+                missing_batch.num_rows()
+            );
+            assert_eq!(
+                n, 0,
+                "a key from a different shard must not appear in this shard's result"
+            );
+        }
+        None => println!(
+            "keys_predicate negative_missing_rows={} negative_other_shard_rows=<no other hfile holds a key, skipped>",
+            missing_batch.num_rows()
+        ),
+    }
+}
+
+#[test]
+fn a_prefixes_predicate_returns_only_keys_with_the_prefix() {
+    let mdt = mdt_path();
+    let (base, all_keys) = richest_hfile();
+    let first = &all_keys[0];
+    let prefix: String = first
+        .chars()
+        .take(std::cmp::max(1, first.len() / 2))
+        .collect();
+    let expected: Vec<String> = all_keys
+        .iter()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+    let lookup = [prefix.as_str(), "zzz-no-such-prefix"];
+    let mut req = request(&mdt, &base, &[], "");
+    req.lookup_keys = &lookup;
+    req.lookup_keys_are_prefixes = true;
+    let batch = read_file_group_v2(&req).expect("prefix lookup");
+    let mut keys = keys_of(&batch);
+    keys.sort();
+    println!(
+        "prefix_predicate base={base} prefix={prefix:?} expected={} got={}",
+        expected.len(),
+        keys.len()
+    );
+    assert_eq!(keys, expected);
+    assert!(
+        keys.len() < all_keys.len() || all_keys.len() == 1,
+        "the prefix must actually narrow the read"
+    );
+
+    // Negative: an unmatched prefix, alone, must return nothing.
+    let missing_prefix = ["zzz-no-such-prefix"];
+    let mut req_missing = request(&mdt, &base, &[], "");
+    req_missing.lookup_keys = &missing_prefix;
+    req_missing.lookup_keys_are_prefixes = true;
+    let missing_batch = read_file_group_v2(&req_missing).expect("missing-prefix lookup");
+    assert_eq!(
+        missing_batch.num_rows(),
+        0,
+        "an unmatched prefix must yield no rows"
+    );
+
+    // Negative: the prefix of a DIFFERENT shard's key must not accidentally
+    // also prefix this shard's key (checked up front, or the negative below
+    // would be meaningless), and must not match this shard's row.
+    let other_rows = a_key_in_another_hfile(&base).map(|other_key| {
+        let other_prefix: String = other_key
+            .chars()
+            .take(std::cmp::max(1, other_key.len() / 2))
+            .collect();
+        assert!(
+            !first.starts_with(&other_prefix),
+            "the other shard's prefix {other_prefix:?} must not also prefix this shard's key              {first:?}, or this negative check proves nothing"
+        );
+        let lookup_other = [other_prefix.as_str()];
+        let mut req_other = request(&mdt, &base, &[], "");
+        req_other.lookup_keys = &lookup_other;
+        req_other.lookup_keys_are_prefixes = true;
+        let other_batch = read_file_group_v2(&req_other).expect("other-shard-prefix lookup");
+        other_batch.num_rows()
+    });
+    match other_rows {
+        Some(n) => {
+            println!(
+                "prefix_predicate negative_missing_rows={} negative_other_shard_rows={n}",
+                missing_batch.num_rows()
+            );
+            assert_eq!(
+                n, 0,
+                "a different shard's key prefix must not match this shard's key"
+            );
+        }
+        None => println!(
+            "prefix_predicate negative_missing_rows={} negative_other_shard_rows=<no other hfile holds a key, skipped>",
+            missing_batch.num_rows()
+        ),
+    }
+}
+
+#[test]
+fn empty_lookup_keys_and_empty_valid_instants_read_the_whole_slice() {
+    let mdt = mdt_path();
+    let (base, all_keys) = richest_hfile();
+    let req = request(&mdt, &base, &[], "");
+    let batch = read_file_group_v2(&req).expect("whole slice");
+    let mut keys = keys_of(&batch);
+    keys.sort();
+    assert_eq!(keys, all_keys);
+}
+
+/// A shard that has a base file AND log files: the log's records must come out
+/// merged, and a keys predicate must still find a key that lives in the log.
+fn base_plus_logs_shard() -> (String, Vec<String>) {
+    let (hfiles, logs) = record_index_files();
+    let base = hfiles
+        .iter()
+        .find(|h| logs.iter().any(|l| file_id(l) == file_id(h)))
+        .expect("fixture must carry a record_index shard with base + logs")
+        .clone();
+    let shard_logs = logs
+        .iter()
+        .filter(|l| file_id(l) == file_id(&base))
+        .cloned()
+        .collect();
+    (base, shard_logs)
+}
+
+#[test]
+fn a_keys_predicate_on_base_plus_logs_returns_the_merged_row() {
+    let mdt = mdt_path();
+    let schema = mdt_record_schema_json();
+    let (base, shard_logs) = base_plus_logs_shard();
+    let logs: Vec<&str> = shard_logs.iter().map(String::as_str).collect();
+    let merged = read_file_group_v2(&request(&mdt, &base, &logs, &schema)).expect("merged read");
+    let merged_keys = keys_of(&merged);
+    assert!(!merged_keys.is_empty(), "shard {base} must have rows");
+    let base_only = read_file_group_v2(&request(&mdt, &base, &[], "")).expect("base read");
+    let base_keys: HashSet<String> = keys_of(&base_only).into_iter().collect();
+    // Prefer a key the logs add or change; fall back to any merged key.
+    let target = merged_keys
+        .iter()
+        .find(|k| !base_keys.contains(*k))
+        .unwrap_or(&merged_keys[0])
+        .clone();
+    println!(
+        "base_plus_logs base={base} logs={} merged_rows={} target={target} in_base={}",
+        logs.len(),
+        merged.num_rows(),
+        base_keys.contains(&target)
+    );
+    let lookup = [target.as_str()];
+    let mut req = request(&mdt, &base, &logs, &schema);
+    req.lookup_keys = &lookup;
+    let batch = read_file_group_v2(&req).expect("keys lookup on base+logs");
+    assert_eq!(keys_of(&batch), vec![target]);
+
+    // Negative: on this same base+logs shard, a key that exists nowhere must
+    // return nothing, while the unfiltered merged read (asserted above to be
+    // non-empty) shows the shard genuinely has rows to filter away.
+    assert!(
+        merged.num_rows() >= 1,
+        "the unfiltered merged read must have rows for the negative check below to be meaningful"
+    );
+    let missing = ["no-such-key-zzz"];
+    let mut req_missing = request(&mdt, &base, &logs, &schema);
+    req_missing.lookup_keys = &missing;
+    let missing_batch = read_file_group_v2(&req_missing).expect("missing-key lookup on base+logs");
+    println!("base_plus_logs negative_rows={}", missing_batch.num_rows());
+    assert_eq!(
+        missing_batch.num_rows(),
+        0,
+        "a key that exists nowhere must yield no rows on a base+logs slice"
+    );
+}
+
+/// The completed instants of the fixture MDT's own timeline (`<mdt>/.hoodie/<instant>.deltacommit`,
+/// also under `.hoodie/timeline/` on the newer layout). This is the set Java's
+/// `getValidInstantTimestamps` would hand the reader for a fully committed table: log BLOCKS carry
+/// these instants in their headers (a log FILE's name carries the slice's base instant, which is
+/// not what the range filter tests).
+fn mdt_completed_instants() -> Vec<String> {
+    let mdt = mdt_path();
+    let mut out = Vec::new();
+    for dir in [format!("{mdt}/.hoodie"), format!("{mdt}/.hoodie/timeline")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let name = entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string();
+            let Some((stem, ext)) = name.rsplit_once('.') else {
+                continue;
+            };
+            if !matches!(ext, "deltacommit" | "commit" | "compaction") {
+                continue;
+            }
+            // `<instant>` or `<instant>_<completion>`; keep the leading digits.
+            let instant: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !instant.is_empty() {
+                out.push(instant);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    assert!(!out.is_empty(), "fixture MDT must have completed instants");
+    out
+}
+
+#[test]
+fn valid_instants_that_exclude_a_log_instant_drop_that_logs_rows() {
+    let mdt = mdt_path();
+    let schema = mdt_record_schema_json();
+    let (base, shard_logs) = base_plus_logs_shard();
+    let logs: Vec<&str> = shard_logs.iter().map(String::as_str).collect();
+    let instants = mdt_completed_instants();
+    println!("valid_instants base={base} completed_instants={instants:?}");
+
+    let all = read_file_group_v2(&request(&mdt, &base, &logs, &schema)).expect("no-range read");
+    let full: Vec<&str> = instants.iter().map(String::as_str).collect();
+    let mut req_full = request(&mdt, &base, &logs, &schema);
+    req_full.valid_instants = &full;
+    let with_full = read_file_group_v2(&req_full).expect("full-set read");
+    assert_eq!(
+        keys_of(&with_full),
+        keys_of(&all),
+        "the full completed-instant set must keep every row"
+    );
+
+    let none: Vec<&str> = vec!["00000000000000000"];
+    let mut req_none = request(&mdt, &base, &logs, &schema);
+    req_none.valid_instants = &none;
+    let without = read_file_group_v2(&req_none).expect("excluded read");
+    let base_only = read_file_group_v2(&request(&mdt, &base, &[], "")).expect("base read");
+    let mut got = keys_of(&without);
+    got.sort();
+    let mut expect = keys_of(&base_only);
+    expect.sort();
+    println!(
+        "valid_instants all={} full_set={} excluded={} base_only={}",
+        all.num_rows(),
+        with_full.num_rows(),
+        without.num_rows(),
+        base_only.num_rows()
+    );
+    println!("valid_instants full_differs_from_base={}", all != base_only);
+    assert_eq!(
+        got, expect,
+        "with every log block's instant excluded only the base file's rows remain"
+    );
+    assert_eq!(
+        without, base_only,
+        "excluding every log instant must reproduce the base-only batch exactly"
+    );
+    assert!(
+        all.num_rows() >= base_only.num_rows(),
+        "sanity: merged never has fewer rows than the base alone"
+    );
+}
+
+/// Minor: a key predicate on a LOG-ONLY slice (no base file — the same
+/// bootstrap shard `log_only_bootstrap_slice_reads_like_java_empty_result_with_table_schema`
+/// uses) must not break the log path. That shard's bootstrap log holds an
+/// empty delete block, so the unfiltered read is already 0 rows; this proves
+/// a predicate on a log-only slice still reads cleanly rather than erroring.
+#[test]
+fn a_keys_predicate_on_a_log_only_slice_reads_without_error() {
+    let (hfiles, logs) = record_index_files();
+    let log_only: Vec<&String> = logs
+        .iter()
+        .filter(|l| !hfiles.iter().any(|h| file_id(h) == file_id(l)))
+        .collect();
+    assert!(
+        !log_only.is_empty(),
+        "fixture must carry a log-only record_index shard"
+    );
+    let shard = file_id(log_only[0]);
+    let shard_logs: Vec<&str> = logs
+        .iter()
+        .filter(|l| file_id(l) == shard)
+        .map(String::as_str)
+        .collect();
+
+    let mdt = mdt_path();
+    let schema_json = mdt_record_schema_json();
+    let lookup = ["no-such-key-zzz"];
+    let mut req = request(&mdt, "", &shard_logs, &schema_json);
+    req.lookup_keys = &lookup;
+    let batch = read_file_group_v2(&req)
+        .unwrap_or_else(|e| panic!("log-only shard {shard} with a key predicate must read: {e}"));
+    println!("log_only_predicate shard={shard} rows={}", batch.num_rows());
+    assert_eq!(
+        batch.num_rows(),
+        0,
+        "a predicate on an already-empty log-only slice must still yield zero rows"
     );
 }
