@@ -24,6 +24,7 @@
 
 use arrow::array::{Array, RecordBatchReader, StringArray};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use hudi::ffi_support::MAX_INSTANT_TIME;
 use hudi::hfile::HFileReader;
 use hudi_jvm_ffi::file_group_v2::{
     FileGroupRequest, export_file_group_stream_v2, read_file_group_v2,
@@ -104,7 +105,7 @@ fn base_only_slice_returns_every_entry_of_the_hfile() {
             partition_path: "record_index",
             base_file_name: base,
             log_file_names: &[],
-            latest_instant: "",
+            latest_instant: MAX_INSTANT_TIME,
             data_schema_json: "",
             lookup_keys: &[],
             lookup_keys_are_prefixes: false,
@@ -173,7 +174,7 @@ fn base_plus_logs_slice_merges_without_error() {
         partition_path: "record_index",
         base_file_name: &base,
         log_file_names: &shard_logs,
-        latest_instant: "",
+        latest_instant: MAX_INSTANT_TIME,
         data_schema_json: "",
         lookup_keys: &[],
         lookup_keys_are_prefixes: false,
@@ -204,7 +205,7 @@ fn exported_stream_round_trips_through_the_arrow_c_stream_interface() {
         partition_path: "record_index",
         base_file_name: &hfiles[0],
         log_file_names: &[],
-        latest_instant: "",
+        latest_instant: MAX_INSTANT_TIME,
         data_schema_json: "",
         lookup_keys: &[],
         lookup_keys_are_prefixes: false,
@@ -233,7 +234,7 @@ fn a_missing_base_file_is_an_error_not_a_panic() {
         partition_path: "record_index",
         base_file_name: "record-index-9999-0_0-0-0_00000000000000000.hfile",
         log_file_names: &[],
-        latest_instant: "",
+        latest_instant: MAX_INSTANT_TIME,
         data_schema_json: "",
         lookup_keys: &[],
         lookup_keys_are_prefixes: false,
@@ -294,7 +295,7 @@ fn log_only_bootstrap_slice_reads_like_java_empty_result_with_table_schema() {
         partition_path: "record_index",
         base_file_name: "",
         log_file_names: &shard_logs,
-        latest_instant: "",
+        latest_instant: MAX_INSTANT_TIME,
         data_schema_json: &schema_json,
         lookup_keys: &[],
         lookup_keys_are_prefixes: false,
@@ -354,7 +355,7 @@ fn log_only_slice_without_a_schema_still_fails_with_a_clear_error() {
         partition_path: "record_index",
         base_file_name: "",
         log_file_names: &shard_logs,
-        latest_instant: "",
+        latest_instant: MAX_INSTANT_TIME,
         data_schema_json: "",
         lookup_keys: &[],
         lookup_keys_are_prefixes: false,
@@ -382,7 +383,7 @@ fn base_only_slice_with_explicit_schema_returns_the_same_rows_as_without() {
         partition_path: "record_index",
         base_file_name: base,
         log_file_names: &[],
-        latest_instant: "",
+        latest_instant: MAX_INSTANT_TIME,
         data_schema_json: "",
         lookup_keys: &[],
         lookup_keys_are_prefixes: false,
@@ -394,7 +395,7 @@ fn base_only_slice_with_explicit_schema_returns_the_same_rows_as_without() {
         partition_path: "record_index",
         base_file_name: base,
         log_file_names: &[],
-        latest_instant: "",
+        latest_instant: MAX_INSTANT_TIME,
         data_schema_json: &schema_json,
         lookup_keys: &[],
         lookup_keys_are_prefixes: false,
@@ -461,7 +462,7 @@ fn base_plus_logs_slice_with_explicit_schema_merges_without_error() {
         partition_path: "record_index",
         base_file_name: &base,
         log_file_names: &shard_logs,
-        latest_instant: "",
+        latest_instant: MAX_INSTANT_TIME,
         data_schema_json: &schema_json,
         lookup_keys: &[],
         lookup_keys_are_prefixes: false,
@@ -495,7 +496,7 @@ fn request<'a>(
         partition_path: "record_index",
         base_file_name: base,
         log_file_names: logs,
-        latest_instant: "",
+        latest_instant: MAX_INSTANT_TIME,
         data_schema_json: schema,
         lookup_keys: &[],
         lookup_keys_are_prefixes: false,
@@ -886,5 +887,22 @@ fn a_keys_predicate_on_a_log_only_slice_reads_without_error() {
         batch.num_rows(),
         0,
         "a predicate on an already-empty log-only slice must still yield zero rows"
+    );
+}
+
+/// Java never has an "empty" latest instant: `readSliceWithFilter` passes the last
+/// completed instant or SOLO_COMMIT_TIMESTAMP. The old native contract mapped "" to
+/// MAX_INSTANT_TIME (read everything) — the opposite direction from Java's fallback
+/// (read nothing). OI-16 / D-13: "" is refused before any I/O.
+#[test]
+fn an_empty_latest_instant_is_refused() {
+    let mdt = mdt_path();
+    let (base, _) = richest_hfile();
+    let mut req = request(&mdt, &base, &[], "");
+    req.latest_instant = "";
+    let err = read_file_group_v2(&req).expect_err("an empty latest_instant must be refused");
+    assert!(
+        err.contains("latest_instant is empty"),
+        "the error must name the argument, got: {err}"
     );
 }

@@ -346,6 +346,8 @@ pub extern "C" fn hudi_ffi_last_error() -> *const c_char {
 /// The error and panic handling is the same, down to clearing the previous
 /// call's message first.
 ///
+/// `latest_instant` is required and must be non-empty; the read is refused otherwise.
+///
 /// `data_schema_json` is the Avro JSON of the table's data schema, the way
 /// Java's `HoodieFileGroupReader` is always given one. It is optional: null or
 /// an empty string means "no schema", and the engine then infers the output

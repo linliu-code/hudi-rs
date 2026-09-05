@@ -123,6 +123,8 @@ fn throw(env: &mut JNIEnv, message: String) {
 /// Reads one file group through reader_v2 into the Java-allocated stream at
 /// `stream_address`. Throws `NativeReaderException` on any failure.
 ///
+/// `latestInstant` is required and must be non-empty; the read is refused otherwise.
+///
 /// `dataSchemaJson` is the Avro JSON of the table's data schema, the way Java's
 /// own `HoodieFileGroupReader` is always given one. It is optional: a null Java
 /// string is "no schema" rather than an error, and the engine then infers the

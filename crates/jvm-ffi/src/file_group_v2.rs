@@ -34,7 +34,7 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use hudi::config::HudiConfigs;
 use hudi::ffi_support::{
     FileGroupReaderSchemaHandler, HoodieFileGroupReader, InputSplit, InstantRange, KeyPredicate,
-    MAX_INSTANT_TIME, OBJECT_STORE_RUNTIME, ReaderContext, ReaderParameters, RecordContext,
+    OBJECT_STORE_RUNTIME, ReaderContext, ReaderParameters, RecordContext,
 };
 use hudi::storage::Storage;
 use hudi::table::builder::OptionResolver;
@@ -54,7 +54,9 @@ pub struct FileGroupRequest<'a> {
     pub base_file_name: &'a str,
     /// Log file NAMES in any order (the split sorts them).
     pub log_file_names: &'a [&'a str],
-    /// Latest completed instant to read as of; `""` means everything.
+    /// Latest completed instant to read as of. REQUIRED: an empty string is refused
+    /// (Java always passes a concrete instant — the last completed one or
+    /// SOLO_COMMIT_TIMESTAMP); pass MAX_INSTANT_TIME to read everything.
     pub latest_instant: &'a str,
     /// Avro JSON of the table's data schema; `""` = none (the engine then
     /// infers as today).
@@ -113,11 +115,7 @@ fn build_reader_context(
         .get(BASE_FILE_FORMAT_KEY)
         .map(|v| v.to_ascii_lowercase())
         .unwrap_or_default();
-    let latest_commit_time = if req.latest_instant.is_empty() {
-        MAX_INSTANT_TIME.to_string()
-    } else {
-        req.latest_instant.to_string()
-    };
+    let latest_commit_time = req.latest_instant.to_string();
     let record_context = RecordContext::new(&table_config, req.partition_path.to_string());
     let key_predicate = if req.lookup_keys.is_empty() {
         None
@@ -171,6 +169,14 @@ pub fn read_file_group_v2(req: &FileGroupRequest<'_>) -> Result<RecordBatch, Str
     if req.table_path.is_empty() {
         return Err("table_path is empty".to_string());
     }
+    if req.latest_instant.is_empty() {
+        return Err(
+            "latest_instant is empty: pass the latest completed instant, or MAX_INSTANT_TIME \
+             to read everything (Java passes SOLO_COMMIT_TIMESTAMP when the metadata table \
+             has no completed instant)"
+                .to_string(),
+        );
+    }
     if req.base_file_name.is_empty() && req.log_file_names.is_empty() {
         return Err("a file slice needs a base file or at least one log file".to_string());
     }
@@ -194,11 +200,7 @@ pub fn read_file_group_v2(req: &FileGroupRequest<'_>) -> Result<RecordBatch, Str
             req.base_file_name
         },
         req.log_file_names.len(),
-        if req.latest_instant.is_empty() {
-            "<max>"
-        } else {
-            req.latest_instant
-        },
+        req.latest_instant,
         !req.data_schema_json.is_empty(),
         req.lookup_keys.len(),
         req.lookup_keys_are_prefixes,
