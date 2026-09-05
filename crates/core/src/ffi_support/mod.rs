@@ -33,6 +33,7 @@ use crate::file_group::log_file::avro::{AvroBlockDecoder, RegisteredWriterSchema
 /// Matches the HFile base-file reader's `DECODE_BATCH_SIZE`.
 const SCHEMA_BATCH_SIZE: usize = 1024;
 
+pub use crate::file_group::base_file::reader::KeyPredicate;
 pub use crate::file_group::reader_v2::MAX_INSTANT_TIME;
 pub use crate::file_group::reader_v2::engine::HoodieFileGroupReader;
 pub use crate::file_group::reader_v2::input_split::InputSplit;

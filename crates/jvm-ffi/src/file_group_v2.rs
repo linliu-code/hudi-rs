@@ -33,8 +33,8 @@ use arrow::array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use hudi::config::HudiConfigs;
 use hudi::ffi_support::{
-    FileGroupReaderSchemaHandler, HoodieFileGroupReader, InputSplit, MAX_INSTANT_TIME,
-    OBJECT_STORE_RUNTIME, ReaderContext, ReaderParameters, RecordContext,
+    FileGroupReaderSchemaHandler, HoodieFileGroupReader, InputSplit, InstantRange, KeyPredicate,
+    MAX_INSTANT_TIME, OBJECT_STORE_RUNTIME, ReaderContext, ReaderParameters, RecordContext,
 };
 use hudi::storage::Storage;
 use hudi::table::builder::OptionResolver;
@@ -63,6 +63,17 @@ pub struct FileGroupRequest<'a> {
     /// read without it because a freshly bootstrapped MDT file group is one
     /// empty delete block with no schema header.
     pub data_schema_json: &'a str,
+    /// Keys (or key prefixes) to look up — Java's `Predicates.in(keys)` /
+    /// `Predicates.startsWithAny(prefixes)` on the reader context. Already
+    /// encoded, sorted and deduplicated by the caller. Empty means NO predicate
+    /// (the whole slice), never "match nothing": Java returns an empty iterator
+    /// before it builds a reader when it has no keys, so that case never gets here.
+    pub lookup_keys: &'a [&'a str],
+    /// `true`: `lookup_keys` are prefixes; `false`: exact keys.
+    pub lookup_keys_are_prefixes: bool,
+    /// Explicit valid-instant set — Java's `InstantRange.EXACT_MATCH(validInstantTimestamps)`:
+    /// a log block whose instant is not in the set is skipped. Empty means no range.
+    pub valid_instants: &'a [&'a str],
 }
 
 fn join_in_partition(partition: &str, name: &str) -> String {
@@ -98,6 +109,24 @@ fn build_reader_context(
         req.latest_instant.to_string()
     };
     let record_context = RecordContext::new(&table_config, req.partition_path.to_string());
+    let key_predicate = if req.lookup_keys.is_empty() {
+        None
+    } else {
+        let keys: Vec<String> = req.lookup_keys.iter().map(|k| k.to_string()).collect();
+        Some(if req.lookup_keys_are_prefixes {
+            KeyPredicate::Prefixes(keys)
+        } else {
+            KeyPredicate::Keys(keys)
+        })
+    };
+    let instant_range = if req.valid_instants.is_empty() {
+        None
+    } else {
+        Some(InstantRange::exact_match(
+            req.valid_instants.iter().copied(),
+            "UTC",
+        ))
+    };
     ReaderContext {
         table_path: req.table_path.to_string(),
         latest_commit_time,
@@ -110,7 +139,7 @@ fn build_reader_context(
         iterator_mode: String::new(),
         merge_mode,
         merge_strategy_id,
-        instant_range: None,
+        instant_range,
         record_context,
         schema_handler,
         table_config,
@@ -118,7 +147,7 @@ fn build_reader_context(
         row_filter_builder: None,
         row_group_selector: None,
         mor_pk_safe: false,
-        key_predicate: None,
+        key_predicate,
         completion_gate_inputs: None,
     }
 }
@@ -145,7 +174,8 @@ pub fn read_file_group_v2(req: &FileGroupRequest<'_>) -> Result<RecordBatch, Str
 
     log::info!(
         "[hudi-rs-jni] read_file_group_v2 entered: table_path={} partition={} base_file={} \
-         log_files={} latest_instant={} has_data_schema={}",
+         log_files={} latest_instant={} has_data_schema={} lookup_keys={} prefixes={} \
+         valid_instants={}",
         req.table_path,
         req.partition_path,
         if req.base_file_name.is_empty() {
@@ -160,6 +190,9 @@ pub fn read_file_group_v2(req: &FileGroupRequest<'_>) -> Result<RecordBatch, Str
             req.latest_instant
         },
         !req.data_schema_json.is_empty(),
+        req.lookup_keys.len(),
+        req.lookup_keys_are_prefixes,
+        req.valid_instants.len(),
     );
 
     // Java's caller always supplies the data schema; when we get one, hand it to
