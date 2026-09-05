@@ -603,7 +603,7 @@ fn a_prefixes_predicate_returns_only_keys_with_the_prefix() {
     let first = &all_keys[0];
     let prefix: String = first
         .chars()
-        .take(std::cmp::max(1, first.len() / 2))
+        .take(std::cmp::max(1, first.chars().count() / 2))
         .collect();
     let expected: Vec<String> = all_keys
         .iter()
@@ -686,6 +686,13 @@ fn empty_lookup_keys_and_empty_valid_instants_read_the_whole_slice() {
     let mut keys = keys_of(&batch);
     keys.sort();
     assert_eq!(keys, all_keys);
+    let bytes = std::fs::read(format!("{mdt}/record_index/{base}")).expect("read hfile");
+    let expected = HFileReader::new(bytes).expect("parse hfile").num_entries();
+    assert_eq!(
+        batch.num_rows() as u64,
+        expected,
+        "an empty predicate and an empty instant set must read every entry of the HFile"
+    );
 }
 
 /// A shard that has a base file AND log files: the log's records must come out
@@ -826,7 +833,10 @@ fn valid_instants_that_exclude_a_log_instant_drop_that_logs_rows() {
         without.num_rows(),
         base_only.num_rows()
     );
-    println!("valid_instants full_differs_from_base={}", all != base_only);
+    assert_ne!(
+        all, base_only,
+        "the shard's logs must change the base rows, or the exclusion check below proves nothing"
+    );
     assert_eq!(
         got, expect,
         "with every log block's instant excluded only the base file's rows remain"

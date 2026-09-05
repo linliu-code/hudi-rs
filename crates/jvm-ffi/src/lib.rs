@@ -363,7 +363,9 @@ pub extern "C" fn hudi_ffi_last_error() -> *const c_char {
 /// must point to `log_file_count` such strings; `lookup_keys` must point to
 /// `lookup_key_count` such strings; `valid_instants` must point to
 /// `valid_instant_count` such strings; `out_stream` must be a valid pointer to
-/// writable memory sized for an `ArrowArrayStream`.
+/// writable memory sized for an `ArrowArrayStream`. `lookup_keys_are_prefixes`
+/// is a C `bool` (`_Bool`, one byte, 0 or 1); any other value is undefined
+/// behaviour.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hudi_ffi_read_file_group_v2_into(
     table_path: *const c_char,

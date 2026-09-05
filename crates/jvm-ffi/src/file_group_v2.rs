@@ -66,13 +66,21 @@ pub struct FileGroupRequest<'a> {
     /// Keys (or key prefixes) to look up — Java's `Predicates.in(keys)` /
     /// `Predicates.startsWithAny(prefixes)` on the reader context. Already
     /// encoded, sorted and deduplicated by the caller. Empty means NO predicate
-    /// (the whole slice), never "match nothing": Java returns an empty iterator
-    /// before it builds a reader when it has no keys, so that case never gets here.
+    /// (the whole slice), never "match nothing". Java never sends an empty key
+    /// set: `HoodieBackedTableMetadata.readSliceAndFilterByKeysIntoList` returns
+    /// an empty iterator before it builds any reader, and the native seam
+    /// (`NativeRecordIndexSliceReader.toLookup`) throws on an empty list as a
+    /// second guard.
     pub lookup_keys: &'a [&'a str],
     /// `true`: `lookup_keys` are prefixes; `false`: exact keys.
     pub lookup_keys_are_prefixes: bool,
     /// Explicit valid-instant set — Java's `InstantRange.EXACT_MATCH(validInstantTimestamps)`:
     /// a log block whose instant is not in the set is skipped. Empty means no range.
+    /// Only meaningful for a metadata-table read (a `table_path` ending in
+    /// `.hoodie/metadata`): for any other path reader_v2's `base_file_in_range`
+    /// (`crates/core/src/file_group/reader_v2/engine.rs`) drops the whole base
+    /// file whenever a range is set, so a data-table caller passing instants
+    /// would silently get zero base rows.
     pub valid_instants: &'a [&'a str],
 }
 
