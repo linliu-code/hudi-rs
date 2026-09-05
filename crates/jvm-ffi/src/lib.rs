@@ -52,6 +52,8 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::table::{ReadOptions, Table};
 
+pub mod file_group_v2;
+
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
@@ -330,6 +332,65 @@ pub extern "C" fn hudi_ffi_last_error() -> *const c_char {
     })
 }
 
+/// Read one file group through reader_v2 and export it into a caller-allocated
+/// `ArrowArrayStream`. Returns 0 on success, -1 on failure (message via
+/// [`hudi_ffi_last_error`]). `out_stream` is owned by the caller and must be a
+/// fresh, zeroed struct (`ArrowArrayStream.allocateNew` on the JVM side).
+///
+/// Not routed through [`guard`], which returns a pointer: this one reports
+/// through a status code because the stream travels out through `out_stream`.
+/// The error and panic handling is the same, down to clearing the previous
+/// call's message first.
+///
+/// # Safety
+/// All string pointers must be valid NUL-terminated UTF-8; `log_file_names`
+/// must point to `log_file_count` such strings; `out_stream` must be a valid
+/// pointer to writable memory sized for an `ArrowArrayStream`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hudi_ffi_read_file_group_v2_into(
+    table_path: *const c_char,
+    partition_path: *const c_char,
+    base_file_name: *const c_char,
+    log_file_names: *const *const c_char,
+    log_file_count: usize,
+    latest_instant: *const c_char,
+    out_stream: *mut FFI_ArrowArrayStream,
+) -> i32 {
+    const WHAT: &str = "hudi_ffi_read_file_group_v2_into";
+    LAST_ERROR.with(|slot| *slot.borrow_mut() = None);
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+        let table_path = unsafe { as_str(table_path, "table_path") }?;
+        let partition_path = unsafe { as_str(partition_path, "partition_path") }?;
+        let base_file_name = unsafe { as_str(base_file_name, "base_file_name") }?;
+        let logs = unsafe { as_strs(log_file_names, log_file_count, "log_file_names") }?;
+        let latest_instant = unsafe { as_str(latest_instant, "latest_instant") }?;
+        let req = file_group_v2::FileGroupRequest {
+            table_path,
+            partition_path,
+            base_file_name,
+            log_file_names: &logs,
+            latest_instant,
+        };
+        unsafe { file_group_v2::export_file_group_stream_v2(&req, out_stream) }
+    }));
+    match outcome {
+        Ok(Ok(())) => 0,
+        Ok(Err(message)) => {
+            set_error(format!("{WHAT}: {message}"));
+            -1
+        }
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            set_error(format!("{WHAT} panicked: {detail}"));
+            -1
+        }
+    }
+}
+
 /// Panic on purpose, so a caller can prove a panic does not cross the boundary.
 ///
 /// Behind a feature that is off by default, so it is absent from a shipped
@@ -427,6 +488,32 @@ mod tests {
             hudi_ffi_read_metadata_files_partition(std::ptr::null_mut(), std::ptr::null(), 0)
         };
         assert!(stream.is_null(), "a null table must not produce a stream");
+    }
+
+    /// The v2 file-group export reports through its status code, so its refusal
+    /// path is proven separately from the pointer-returning exports above.
+    #[test]
+    fn the_v2_file_group_export_refuses_null_arguments() {
+        let mut stream = FFI_ArrowArrayStream::empty();
+        let rc = unsafe {
+            hudi_ffi_read_file_group_v2_into(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                &mut stream as *mut _,
+            )
+        };
+        assert_eq!(rc, -1, "a null table_path must not be dereferenced");
+        let message = unsafe { CStr::from_ptr(hudi_ffi_last_error()) }
+            .to_str()
+            .unwrap();
+        assert!(
+            message.contains("hudi_ffi_read_file_group_v2_into") && message.contains("table_path"),
+            "the message must name the call and the argument, got {message:?}"
+        );
     }
 
     /// A non-UTF-8 argument is refused with a message rather than panicking.
