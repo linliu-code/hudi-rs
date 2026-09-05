@@ -60,6 +60,7 @@ fn jstring_array_to_vec(
     what: &str,
 ) -> Result<Vec<String>, String> {
     if array.as_raw().is_null() {
+        // Null means no log files (a base-file-only slice), not an error.
         return Ok(Vec::new());
     }
     let len = env
@@ -71,7 +72,15 @@ fn jstring_array_to_vec(
             .get_object_array_element(array, i)
             .map_err(|e| format!("{what}[{i}]: {e}"))?;
         let element = JString::from(element);
-        out.push(jstring_to_string(env, &element, &format!("{what}[{i}]"))?);
+        let value = jstring_to_string(env, &element, &format!("{what}[{i}]"))?;
+        // Release this element's local reference immediately: a JNI call has
+        // a bounded local-reference table, and leaving one per element live
+        // for the whole call risks overflowing it on a file group with many
+        // log files.
+        if let Err(e) = env.delete_local_ref(element) {
+            log::warn!("{what}[{i}]: failed to delete local ref: {e}");
+        }
+        out.push(value);
     }
     Ok(out)
 }
@@ -90,7 +99,9 @@ fn throw(env: &mut JNIEnv, message: String) {
     if matches!(env.exception_check(), Ok(true)) {
         return;
     }
-    let _ = env.throw_new(EXCEPTION_CLASS, message);
+    if let Err(e) = env.throw_new(EXCEPTION_CLASS, message) {
+        log::error!("[hudi-rs-jni] failed to throw NativeReaderException: {e}");
+    }
 }
 
 /// Reads one file group through reader_v2 into the Java-allocated stream at
@@ -108,8 +119,8 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
     latest_instant: JString<'local>,
     stream_address: jlong,
 ) {
-    init_logger();
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+        init_logger();
         let table_path = jstring_to_string(&mut env, &table_path, "tablePath")?;
         let partition_path = jstring_to_string(&mut env, &partition_path, "partition")?;
         let base_file_name = jstring_to_string(&mut env, &base_file_name, "baseFile")?;
@@ -144,8 +155,8 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    init_logger();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
+        init_logger();
         env.new_string(format!("hudi-jni {}", env!("CARGO_PKG_VERSION")))
             .map(|s| s.into_raw())
             .map_err(|e| format!("cannot allocate the version string: {e}"))
