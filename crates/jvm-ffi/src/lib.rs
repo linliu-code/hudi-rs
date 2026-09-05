@@ -39,9 +39,13 @@
 //! # Errors and panics
 //!
 //! A failing call returns null and leaves a message retrievable with
-//! [`hudi_ffi_last_error`] until the next call on the same thread. Panics are
-//! caught at every boundary and turned into that same null-plus-message, because
-//! a panic unwinding into the JVM aborts the process.
+//! [`hudi_ffi_last_error`] until the next call on the same thread. The one
+//! exception is [`hudi_ffi_read_file_group_v2_into`], which writes into a
+//! caller-owned stream and so signals failure by returning `-1`
+//! (`0` on success) rather than null; its message is retrieved the same way.
+//! Panics are caught at every boundary and turned into that same
+//! failure-plus-message, because a panic unwinding into the JVM aborts the
+//! process.
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char};
