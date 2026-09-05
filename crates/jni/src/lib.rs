@@ -109,6 +109,11 @@ fn throw(env: &mut JNIEnv, message: String) {
 
 /// Reads one file group through reader_v2 into the Java-allocated stream at
 /// `stream_address`. Throws `NativeReaderException` on any failure.
+///
+/// `dataSchemaJson` is the Avro JSON of the table's data schema, the way Java's
+/// own `HoodieFileGroupReader` is always given one. It is optional: a null Java
+/// string is "no schema" rather than an error, and the engine then infers the
+/// output schema from the slice — which cannot work for a log-only slice.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReader_readFileGroupInto<
     'local,
@@ -120,6 +125,7 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
     base_file_name: JString<'local>,
     log_file_names: JObjectArray<'local>,
     latest_instant: JString<'local>,
+    data_schema_json: JString<'local>,
     stream_address: jlong,
 ) {
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
@@ -129,6 +135,12 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
         let base_file_name = jstring_to_string(&mut env, &base_file_name, "baseFile")?;
         let logs = jstring_array_to_vec(&mut env, &log_file_names, "logFiles")?;
         let latest_instant = jstring_to_string(&mut env, &latest_instant, "latestInstant")?;
+        // Optional: null means "no schema", so do not throw for it.
+        let data_schema_json = if data_schema_json.as_raw().is_null() {
+            String::new()
+        } else {
+            jstring_to_string(&mut env, &data_schema_json, "dataSchemaJson")?
+        };
         if stream_address == 0 {
             return Err("streamAddress is 0".to_string());
         }
@@ -139,6 +151,7 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
             base_file_name: &base_file_name,
             log_file_names: &log_refs,
             latest_instant: &latest_instant,
+            data_schema_json: &data_schema_json,
         };
         // SAFETY: the address comes from ArrowArrayStream.allocateNew on the Java side.
         unsafe { export_file_group_stream_v2(&req, stream_address as *mut FFI_ArrowArrayStream) }

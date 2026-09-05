@@ -56,6 +56,13 @@ pub struct FileGroupRequest<'a> {
     pub log_file_names: &'a [&'a str],
     /// Latest completed instant to read as of; `""` means everything.
     pub latest_instant: &'a str,
+    /// Avro JSON of the table's data schema; `""` = none (the engine then
+    /// infers as today).
+    ///
+    /// Java's `HoodieFileGroupReader` requires this; a log-only slice cannot be
+    /// read without it because a freshly bootstrapped MDT file group is one
+    /// empty delete block with no schema header.
+    pub data_schema_json: &'a str,
 }
 
 fn join_in_partition(partition: &str, name: &str) -> String {
@@ -69,6 +76,7 @@ fn join_in_partition(partition: &str, name: &str) -> String {
 fn build_reader_context(
     req: &FileGroupRequest<'_>,
     table_config: HashMap<String, String>,
+    schema_handler: FileGroupReaderSchemaHandler,
 ) -> ReaderContext {
     let merge_mode = table_config
         .get(MERGE_MODE_KEY)
@@ -104,7 +112,7 @@ fn build_reader_context(
         merge_strategy_id,
         instant_range: None,
         record_context,
-        schema_handler: FileGroupReaderSchemaHandler::new(),
+        schema_handler,
         table_config,
         hoodie_reader_config: HashMap::new(),
         row_filter_builder: None,
@@ -137,7 +145,7 @@ pub fn read_file_group_v2(req: &FileGroupRequest<'_>) -> Result<RecordBatch, Str
 
     log::info!(
         "[hudi-rs-jni] read_file_group_v2 entered: table_path={} partition={} base_file={} \
-         log_files={} latest_instant={}",
+         log_files={} latest_instant={} has_data_schema={}",
         req.table_path,
         req.partition_path,
         if req.base_file_name.is_empty() {
@@ -151,7 +159,30 @@ pub fn read_file_group_v2(req: &FileGroupRequest<'_>) -> Result<RecordBatch, Str
         } else {
             req.latest_instant
         },
+        !req.data_schema_json.is_empty(),
     );
+
+    // Java's caller always supplies the data schema; when we get one, hand it to
+    // the schema handler as both the data and the requested schema, exactly as
+    // `HoodieBackedTableMetadata` does. Without it the engine has to infer the
+    // output schema from the slice, which is impossible for a log-only slice
+    // whose only block is an empty delete block.
+    let mut schema_handler = FileGroupReaderSchemaHandler::new();
+    if !req.data_schema_json.is_empty() {
+        // Through the `ffi_support` facade, not `avro_to_arrow`: the latter has
+        // no `AvroSchema::Ref` support and panics on the metadata table's own
+        // record schema, whose `ColumnStatsMetadata.maxValue` union references
+        // the wrapper records that `minValue` defines.
+        let schema = hudi::ffi_support::arrow_schema_from_avro_json(req.data_schema_json)
+            .map_err(|e| format!("invalid data schema: {e}"))?;
+        log::debug!(
+            "read_file_group_v2: data schema supplied, {} fields",
+            schema.fields().len()
+        );
+        schema_handler = schema_handler
+            .with_data_schema(schema.clone())
+            .with_requested_schema(schema);
+    }
 
     let table_path = req.table_path.to_string();
     let (storage, table_config) = OBJECT_STORE_RUNTIME.block_on(async move {
@@ -191,7 +222,7 @@ pub fn read_file_group_v2(req: &FileGroupRequest<'_>) -> Result<RecordBatch, Str
         req.partition_path.to_string(),
     );
 
-    let reader_context = Arc::new(build_reader_context(req, table_config));
+    let reader_context = Arc::new(build_reader_context(req, table_config, schema_handler));
     let mut reader = HoodieFileGroupReader::builder()
         .with_reader_context(reader_context)
         .with_storage(storage)

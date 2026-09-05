@@ -346,6 +346,11 @@ pub extern "C" fn hudi_ffi_last_error() -> *const c_char {
 /// The error and panic handling is the same, down to clearing the previous
 /// call's message first.
 ///
+/// `data_schema_json` is the Avro JSON of the table's data schema, the way
+/// Java's `HoodieFileGroupReader` is always given one. It is optional: null or
+/// an empty string means "no schema", and the engine then infers the output
+/// schema from the slice — which cannot work for a log-only slice.
+///
 /// # Safety
 /// All string pointers must be valid NUL-terminated UTF-8; `log_file_names`
 /// must point to `log_file_count` such strings; `out_stream` must be a valid
@@ -358,6 +363,7 @@ pub unsafe extern "C" fn hudi_ffi_read_file_group_v2_into(
     log_file_names: *const *const c_char,
     log_file_count: usize,
     latest_instant: *const c_char,
+    data_schema_json: *const c_char,
     out_stream: *mut FFI_ArrowArrayStream,
 ) -> i32 {
     const WHAT: &str = "hudi_ffi_read_file_group_v2_into";
@@ -368,12 +374,19 @@ pub unsafe extern "C" fn hudi_ffi_read_file_group_v2_into(
         let base_file_name = unsafe { as_str(base_file_name, "base_file_name") }?;
         let logs = unsafe { as_strs(log_file_names, log_file_count, "log_file_names") }?;
         let latest_instant = unsafe { as_str(latest_instant, "latest_instant") }?;
+        // Optional: null is "no schema", not an error.
+        let data_schema_json = if data_schema_json.is_null() {
+            ""
+        } else {
+            unsafe { as_str(data_schema_json, "data_schema_json") }?
+        };
         let req = file_group_v2::FileGroupRequest {
             table_path,
             partition_path,
             base_file_name,
             log_file_names: &logs,
             latest_instant,
+            data_schema_json,
         };
         unsafe { file_group_v2::export_file_group_stream_v2(&req, out_stream) }
     }));
@@ -506,6 +519,7 @@ mod tests {
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
+                std::ptr::null(),
                 std::ptr::null(),
                 &mut stream as *mut _,
             )

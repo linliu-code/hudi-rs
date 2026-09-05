@@ -105,6 +105,7 @@ fn base_only_slice_returns_every_entry_of_the_hfile() {
             base_file_name: base,
             log_file_names: &[],
             latest_instant: "",
+            data_schema_json: "",
         };
         let batch = read_file_group_v2(&req).expect("base-only read");
 
@@ -170,6 +171,7 @@ fn base_plus_logs_slice_merges_without_error() {
         base_file_name: &base,
         log_file_names: &shard_logs,
         latest_instant: "",
+        data_schema_json: "",
     };
     let batch = read_file_group_v2(&req).expect("base+logs read");
     println!(
@@ -197,6 +199,7 @@ fn exported_stream_round_trips_through_the_arrow_c_stream_interface() {
         base_file_name: &hfiles[0],
         log_file_names: &[],
         latest_instant: "",
+        data_schema_json: "",
     };
     let direct = read_file_group_v2(&req).expect("direct read");
 
@@ -222,7 +225,233 @@ fn a_missing_base_file_is_an_error_not_a_panic() {
         base_file_name: "record-index-9999-0_0-0-0_00000000000000000.hfile",
         log_file_names: &[],
         latest_instant: "",
+        data_schema_json: "",
     };
     let err = read_file_group_v2(&req).expect_err("must fail");
     assert!(!err.is_empty());
+}
+
+/// The Avro writer schema the MDT actually used, taken from the first
+/// `record_index` HFile of the fixture. This is what Java hands the file-group
+/// reader (`HoodieBackedTableMetadata` passes the `HoodieMetadataRecord`
+/// schema); reading it back off a sibling HFile keeps the test honest about
+/// what the writer really wrote.
+fn mdt_record_schema_json() -> String {
+    let (hfiles, _) = record_index_files();
+    let path = format!("{}/record_index/{}", mdt_path(), hfiles[0]);
+    let bytes = std::fs::read(&path).expect("read hfile");
+    let reader = HFileReader::new(bytes).expect("parse hfile");
+    let json = reader
+        .avro_schema_json()
+        .expect("read the hfile's avro schema")
+        .expect("the MDT hfile carries a writer schema")
+        .to_string();
+    println!(
+        "mdt_record_schema_json len={} from={}",
+        json.len(),
+        hfiles[0]
+    );
+    json
+}
+
+/// A metadata-table file group that has only its bootstrap log file (no base
+/// file yet) must read the way Java's `HoodieFileGroupReader` reads it: an
+/// empty result carrying the table schema, not an error.
+#[test]
+fn log_only_bootstrap_slice_reads_like_java_empty_result_with_table_schema() {
+    let (hfiles, logs) = record_index_files();
+    let log_only: Vec<&String> = logs
+        .iter()
+        .filter(|l| !hfiles.iter().any(|h| file_id(h) == file_id(l)))
+        .collect();
+    assert!(
+        !log_only.is_empty(),
+        "fixture must carry a log-only record_index shard"
+    );
+    let shard = file_id(log_only[0]);
+    let shard_logs: Vec<&str> = logs
+        .iter()
+        .filter(|l| file_id(l) == shard)
+        .map(String::as_str)
+        .collect();
+
+    let mdt = mdt_path();
+    let schema_json = mdt_record_schema_json();
+    let req = FileGroupRequest {
+        table_path: &mdt,
+        partition_path: "record_index",
+        base_file_name: "",
+        log_file_names: &shard_logs,
+        latest_instant: "",
+        data_schema_json: &schema_json,
+    };
+    let batch = read_file_group_v2(&req).unwrap_or_else(|e| {
+        panic!(
+            "log-only shard {shard} ({} logs) must read: {e}",
+            shard_logs.len()
+        )
+    });
+    println!(
+        "log_only shard={shard} logs={} rows={} columns={:?}",
+        shard_logs.len(),
+        batch.num_rows(),
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        batch.num_rows(),
+        0,
+        "the bootstrap log holds an empty delete block: no records"
+    );
+    assert!(
+        batch.schema().column_with_name("key").is_some(),
+        "the empty result must still carry the table schema"
+    );
+}
+
+/// The no-schema path is unchanged, and its limitation is the documented one:
+/// a log-only slice has nothing to infer an output schema from.
+#[test]
+fn log_only_slice_without_a_schema_still_fails_with_a_clear_error() {
+    let (hfiles, logs) = record_index_files();
+    let log_only: Vec<&String> = logs
+        .iter()
+        .filter(|l| !hfiles.iter().any(|h| file_id(h) == file_id(l)))
+        .collect();
+    assert!(
+        !log_only.is_empty(),
+        "fixture must carry a log-only record_index shard"
+    );
+    let shard = file_id(log_only[0]);
+    let shard_logs: Vec<&str> = logs
+        .iter()
+        .filter(|l| file_id(l) == shard)
+        .map(String::as_str)
+        .collect();
+
+    let mdt = mdt_path();
+    let req = FileGroupRequest {
+        table_path: &mdt,
+        partition_path: "record_index",
+        base_file_name: "",
+        log_file_names: &shard_logs,
+        latest_instant: "",
+        data_schema_json: "",
+    };
+    let err = read_file_group_v2(&req).expect_err("a log-only slice has no schema to infer");
+    println!("log_only_no_schema shard={shard} err={err}");
+    assert!(
+        err.contains("No schema available for merge output"),
+        "the failure must still name the missing merge schema, got {err:?}"
+    );
+}
+
+/// Passing the schema must not change what a base-only slice returns: the
+/// schema handler projects, it does not filter.
+#[test]
+fn base_only_slice_with_explicit_schema_returns_the_same_rows_as_without() {
+    let (hfiles, _) = record_index_files();
+    let mdt = mdt_path();
+    let base = &hfiles[0];
+    let schema_json = mdt_record_schema_json();
+
+    let without = read_file_group_v2(&FileGroupRequest {
+        table_path: &mdt,
+        partition_path: "record_index",
+        base_file_name: base,
+        log_file_names: &[],
+        latest_instant: "",
+        data_schema_json: "",
+    })
+    .expect("base-only read without a schema");
+    let with = read_file_group_v2(&FileGroupRequest {
+        table_path: &mdt,
+        partition_path: "record_index",
+        base_file_name: base,
+        log_file_names: &[],
+        latest_instant: "",
+        data_schema_json: &schema_json,
+    })
+    .expect("base-only read with a schema");
+
+    let columns = |b: &arrow::array::RecordBatch| {
+        b.schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>()
+    };
+    println!(
+        "base_only_parity base={base} rows_without={} rows_with={} columns_without={:?} columns_with={:?}",
+        without.num_rows(),
+        with.num_rows(),
+        columns(&without),
+        columns(&with)
+    );
+    assert_eq!(
+        without.num_rows(),
+        with.num_rows(),
+        "an explicit schema must not add or drop rows"
+    );
+    // The MDT's own writer schema is what the base file was written with, so
+    // handing it back as the requested schema must reproduce the very schema the
+    // no-schema read derives from that base file — meta fields included.
+    assert_eq!(
+        without.schema(),
+        with.schema(),
+        "the MDT writer schema must project to exactly the base-only schema"
+    );
+    let mut keys_without = keys_of(&without);
+    let mut keys_with = keys_of(&with);
+    keys_without.sort();
+    keys_with.sort();
+    assert_eq!(
+        keys_without, keys_with,
+        "an explicit schema must not change which records come out"
+    );
+}
+
+/// The base+logs merge keeps working with an explicit schema.
+#[test]
+fn base_plus_logs_slice_with_explicit_schema_merges_without_error() {
+    let (hfiles, logs) = record_index_files();
+    let base = hfiles
+        .iter()
+        .find(|h| logs.iter().any(|l| file_id(l) == file_id(h)))
+        .unwrap_or(&hfiles[0])
+        .clone();
+    let shard_logs: Vec<&str> = logs
+        .iter()
+        .filter(|l| file_id(l) == file_id(&base))
+        .map(String::as_str)
+        .collect();
+
+    let mdt = mdt_path();
+    let schema_json = mdt_record_schema_json();
+    let req = FileGroupRequest {
+        table_path: &mdt,
+        partition_path: "record_index",
+        base_file_name: &base,
+        log_file_names: &shard_logs,
+        latest_instant: "",
+        data_schema_json: &schema_json,
+    };
+    let batch = read_file_group_v2(&req).expect("base+logs read with a schema");
+    println!(
+        "base_plus_logs_with_schema base={} logs={} rows={}",
+        base,
+        shard_logs.len(),
+        batch.num_rows()
+    );
+    assert!(batch.column_by_name("key").is_some());
+    let keys = keys_of(&batch);
+    assert_eq!(
+        keys.iter().collect::<HashSet<_>>().len(),
+        keys.len(),
+        "merge keeps one row per key"
+    );
 }
