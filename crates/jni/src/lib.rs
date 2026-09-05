@@ -32,7 +32,7 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use hudi_jvm_ffi::file_group_v2::{FileGroupRequest, export_file_group_stream_v2};
 use jni::JNIEnv;
 use jni::objects::{JClass, JObjectArray, JString};
-use jni::sys::{jlong, jstring};
+use jni::sys::{jboolean, jlong, jstring};
 
 const EXCEPTION_CLASS: &str = "org/apache/hudi/io/nativereader/NativeReaderException";
 
@@ -60,7 +60,8 @@ fn jstring_array_to_vec(
     what: &str,
 ) -> Result<Vec<String>, String> {
     if array.as_raw().is_null() {
-        // Null means no log files (a base-file-only slice), not an error.
+        // Null means absent (e.g. no log files for a base-file-only slice, or no lookup-keys /
+        // valid-instants filter), not an error.
         return Ok(Vec::new());
     }
     let len = env
@@ -114,6 +115,11 @@ fn throw(env: &mut JNIEnv, message: String) {
 /// own `HoodieFileGroupReader` is always given one. It is optional: a null Java
 /// string is "no schema" rather than an error, and the engine then infers the
 /// output schema from the slice — which cannot work for a log-only slice.
+///
+/// `lookupKeys` is Java's `Predicates.in` keys, or key prefixes when
+/// `lookupKeysArePrefixes` is set; a null array means the whole slice (no key
+/// filter). `validInstants` is the set of valid instant timestamps; a null
+/// array means no instant filter.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReader_readFileGroupInto<
     'local,
@@ -126,6 +132,9 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
     log_file_names: JObjectArray<'local>,
     latest_instant: JString<'local>,
     data_schema_json: JString<'local>,
+    lookup_keys: JObjectArray<'local>,
+    lookup_keys_are_prefixes: jboolean,
+    valid_instants: JObjectArray<'local>,
     stream_address: jlong,
 ) {
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
@@ -141,10 +150,14 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
         } else {
             jstring_to_string(&mut env, &data_schema_json, "dataSchemaJson")?
         };
+        let lookup_keys = jstring_array_to_vec(&mut env, &lookup_keys, "lookupKeys")?;
+        let valid_instants = jstring_array_to_vec(&mut env, &valid_instants, "validInstants")?;
         if stream_address == 0 {
             return Err("streamAddress is 0".to_string());
         }
         let log_refs: Vec<&str> = logs.iter().map(String::as_str).collect();
+        let key_refs: Vec<&str> = lookup_keys.iter().map(String::as_str).collect();
+        let instant_refs: Vec<&str> = valid_instants.iter().map(String::as_str).collect();
         let req = FileGroupRequest {
             table_path: &table_path,
             partition_path: &partition_path,
@@ -152,10 +165,9 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
             log_file_names: &log_refs,
             latest_instant: &latest_instant,
             data_schema_json: &data_schema_json,
-            // Task 2 wires the real key predicate and valid-instant set through JNI.
-            lookup_keys: &[],
-            lookup_keys_are_prefixes: false,
-            valid_instants: &[],
+            lookup_keys: &key_refs,
+            lookup_keys_are_prefixes: lookup_keys_are_prefixes != 0,
+            valid_instants: &instant_refs,
         };
         // SAFETY: the address comes from ArrowArrayStream.allocateNew on the Java side.
         unsafe { export_file_group_stream_v2(&req, stream_address as *mut FFI_ArrowArrayStream) }
