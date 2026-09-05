@@ -37,8 +37,10 @@ use jni::sys::{jboolean, jlong, jstring};
 /// Revision of the `Java_…` export signatures in this crate. Bump it whenever the
 /// parameter list of any exported `Java_` function changes: the Java side
 /// (`NativeFileGroupReader.REQUIRED_JNI_ABI`) refuses a library that reports a lower
-/// revision, which turns a jar/`libhudi_jni.so` mismatch into a load-time error
-/// instead of a mis-read argument slot (OI-17).
+/// revision, which turns an up-to-date jar loading a STALE `libhudi_jni.so` into a
+/// load-time error instead of a mis-read argument slot (OI-17). The check is
+/// one-directional: a stale jar predating the check cannot protect itself against a
+/// newer library, so deploy the jar and the library together (never library-first).
 ///
 /// History: 1 = the 7-argument `readFileGroupInto` (pre lookup-keys);
 /// 2 = `readFileGroupInto` gained `lookupKeys`, `lookupKeysArePrefixes`, `validInstants`.
