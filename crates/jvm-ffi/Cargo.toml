@@ -42,3 +42,7 @@ ffi-test-hooks = []
 hudi = { path = "../hudi", version = "0.6.0-dev" }
 arrow = { workspace = true, features = ["ffi"] }
 tokio = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+hudi-test = { path = "../test" }
