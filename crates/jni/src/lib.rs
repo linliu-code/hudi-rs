@@ -39,8 +39,12 @@ use jni::sys::{jboolean, jlong, jstring};
 /// (`NativeFileGroupReader.REQUIRED_JNI_ABI`) refuses a library that reports a lower
 /// revision, which turns an up-to-date jar loading a STALE `libhudi_jni.so` into a
 /// load-time error instead of a mis-read argument slot (OI-17). The check is
-/// one-directional: a stale jar predating the check cannot protect itself against a
-/// newer library, so deploy the jar and the library together (never library-first).
+/// `abi < REQUIRED_JNI_ABI`, i.e. one-directional: it rejects a library OLDER than
+/// the jar expects, but any jar whose `REQUIRED_JNI_ABI` is at or below the
+/// library's revision accepts that library unchecked — even when the library is
+/// newer and its meaning has changed underneath the jar. So the check protects a
+/// jar that is upgraded first, never one that lags behind: never deploy the
+/// library ahead of the jar; ship jar and library together.
 ///
 /// History: 1 = the 7-argument `readFileGroupInto` (pre lookup-keys);
 /// 2 = `readFileGroupInto` gained `lookupKeys`, `lookupKeysArePrefixes`, `validInstants`;

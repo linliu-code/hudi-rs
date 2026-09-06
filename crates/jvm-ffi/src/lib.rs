@@ -183,6 +183,12 @@ pub unsafe extern "C" fn hudi_ffi_table_open(
 /// Keys are matched as stored, so a non-partitioned table's record is asked for
 /// as `"."`.
 ///
+/// This is the opposite empty-keys meaning from
+/// [`hudi_ffi_read_file_group_v2_into`]'s `lookup_keys` (non-null with count 0
+/// there means match NOTHING): the `files` partition is a small, bootstrap-only
+/// listing, so a full scan is allowed here, whereas the file-group read mirrors
+/// Java's `EmptyIterator` for an explicit empty key set.
+///
 /// # Safety
 /// `table` must come from [`hudi_ffi_table_open`] and not yet be freed. The
 /// returned stream must be released with [`hudi_ffi_free_stream`] exactly once,
@@ -359,6 +365,12 @@ pub extern "C" fn hudi_ffi_last_error() -> *const c_char {
 /// keys, as prefixes when `lookup_keys_are_prefixes` is set. `valid_instants`
 /// (with `valid_instant_count`) is optional: null or a count of 0 means no
 /// instant filter.
+///
+/// This is the opposite empty-keys meaning from
+/// [`hudi_ffi_read_metadata_files_partition`]'s `keys` (non-null with count 0
+/// there reads everything): the file-group read mirrors Java's `EmptyIterator`
+/// for an explicit empty key set, whereas the `files` partition is a small,
+/// bootstrap-only listing that is allowed a full scan.
 ///
 /// # Safety
 /// All string pointers must be valid NUL-terminated UTF-8; `log_file_names`
