@@ -1226,6 +1226,18 @@ fn si_base_only_prefix_lookup_returns_exactly_the_keys_with_that_prefix() {
     assert!(!all_keys.is_empty());
 }
 
+/// One prefix's read, sorted: the independent per-prefix oracle a multi-prefix
+/// read is checked against.
+fn si_single_prefix_read(mdt: &str, base: &str, prefix: &str) -> Vec<String> {
+    let lookup = [prefix];
+    let mut req = si_request(mdt, base, &[], "");
+    req.lookup_keys = Some(lookup.as_slice());
+    req.lookup_keys_are_prefixes = true;
+    let mut keys = keys_of(&read_file_group_v2(&req).expect("single-prefix read"));
+    keys.sort();
+    keys
+}
+
 #[test]
 fn si_multi_prefix_lookup_is_the_union_and_a_stranger_prefix_adds_nothing() {
     let mdt = mdt_path();
@@ -1234,13 +1246,22 @@ fn si_multi_prefix_lookup_is_the_union_and_a_stranger_prefix_adds_nothing() {
     prefixes.sort();
     prefixes.dedup();
     // Two distinct prefixes when the shard has them, else the one it has.
-    let chosen: Vec<&str> = prefixes.iter().take(2).map(String::as_str).collect();
-    let expected: Vec<String> = all_keys
+    let chosen: Vec<String> = prefixes.iter().take(2).cloned().collect();
+
+    // The reader property under test: reading several prefixes at once must
+    // equal the UNION of reading each of them alone -- not merely "equal to
+    // the filtered oracle", which a reader that ignores the predicate and
+    // returns every row would also satisfy whenever `chosen` happens to cover
+    // every key (as it does on this fixture's 2-key richest shard).
+    let single_reads: Vec<Vec<String>> = chosen
         .iter()
-        .filter(|k| chosen.iter().any(|p| k.starts_with(p)))
-        .cloned()
+        .map(|p| si_single_prefix_read(&mdt, &base, p))
         .collect();
-    let mut lookup: Vec<&str> = chosen.clone();
+    let mut expected: Vec<String> = single_reads.iter().flatten().cloned().collect();
+    expected.sort();
+    expected.dedup();
+
+    let mut lookup: Vec<&str> = chosen.iter().map(String::as_str).collect();
     lookup.push("zzz-no-such-secondary-key$");
     let mut req = si_request(&mdt, &base, &[], "");
     req.lookup_keys = Some(lookup.as_slice());
@@ -1250,12 +1271,40 @@ fn si_multi_prefix_lookup_is_the_union_and_a_stranger_prefix_adds_nothing() {
     let mut keys = keys_of(&batch);
     keys.sort();
     println!(
-        "si_multi_prefix base={base} prefixes={chosen:?} distinct_in_shard={} expected={} got={}",
+        "si_multi_prefix base={base} prefixes={chosen:?} distinct_in_shard={} single_reads={:?} union={} got={}",
         prefixes.len(),
+        single_reads.iter().map(Vec::len).collect::<Vec<_>>(),
         expected.len(),
         keys.len()
     );
-    assert_eq!(keys, expected);
+    assert_eq!(
+        keys, expected,
+        "the multi-prefix read must equal the union of the single-prefix reads"
+    );
+
+    // A reader that ignores the predicate (and just returns every row) would
+    // make each single-prefix read equal the multi-prefix read; with more
+    // than one key in the shard, the real reader's per-prefix reads must each
+    // be a STRICT subset of the union, or this test cannot tell the two apart.
+    if all_keys.len() > 1 {
+        for (p, single) in chosen.iter().zip(single_reads.iter()) {
+            assert!(
+                single.len() < keys.len(),
+                "single-prefix read for {p:?} ({} keys) must be a strict subset of the \
+                 multi-prefix read ({} keys); a reader that ignores the prefix predicate \
+                 would also pass otherwise",
+                single.len(),
+                keys.len()
+            );
+            for k in single {
+                assert!(
+                    keys.contains(k),
+                    "multi-prefix read must contain every key of the single-prefix read \
+                     for {p:?}: missing {k:?}"
+                );
+            }
+        }
+    }
 
     let stranger = ["zzz-no-such-secondary-key$"];
     let mut req_none = si_request(&mdt, &base, &[], "");
@@ -1269,8 +1318,74 @@ fn si_multi_prefix_lookup_is_the_union_and_a_stranger_prefix_adds_nothing() {
     );
 }
 
+/// A base-less SI shard (per `m1-t1-si-fixture-shape.txt`, shards
+/// 0001/0003/0008/0009 never received a base HFile) is exactly what Java's V1
+/// SI path hands the reader for every slice of the partition
+/// (`parallelize(fileSlices)` scans them all): a log-only slice must read
+/// without error under a prefix predicate, fail-loud meaning one erroring
+/// slice would fail the whole lookup.
+#[test]
+fn si_log_only_shard_prefix_lookup_reads_without_error() {
+    let mdt = mdt_path();
+    let schema = mdt_record_schema_json();
+    let (hfiles, logs) = secondary_index_files();
+    let log_only: Vec<&String> = logs
+        .iter()
+        .filter(|l| !hfiles.iter().any(|h| file_id(h) == file_id(l)))
+        .collect();
+    assert!(
+        !log_only.is_empty(),
+        "fixture must carry a log-only secondary_index shard"
+    );
+    let shard = file_id(log_only[0]);
+    let shard_logs: Vec<&str> = logs
+        .iter()
+        .filter(|l| file_id(l) == shard)
+        .map(String::as_str)
+        .collect();
+
+    let (_, all_keys) = richest_si_hfile();
+    let prefix = si_prefix_of(&all_keys[0]);
+    let lookup = [prefix.as_str()];
+    let mut req = si_request(&mdt, "", &shard_logs, &schema);
+    req.lookup_keys = Some(lookup.as_slice());
+    req.lookup_keys_are_prefixes = true;
+    let batch = read_file_group_v2(&req).unwrap_or_else(|e| {
+        panic!("log-only SI shard {shard} with a prefix predicate must read: {e}")
+    });
+    println!(
+        "si_log_only shard={shard} logs={shard_logs:?} prefix={prefix:?} rows={}",
+        batch.num_rows()
+    );
+    if batch.num_rows() > 0 {
+        assert_si_rows(&batch, "si_log_only");
+        for k in keys_of(&batch) {
+            assert!(
+                k.starts_with(&prefix),
+                "returned key {k:?} lacks the prefix {prefix:?}"
+            );
+        }
+    }
+}
+
 /// An SI shard whose logs change the base rows: (base, its logs, base-only keys,
 /// merged keys with no instant range). Panics if no shard has logs.
+///
+/// `hfiles` can carry more than one base-file GENERATION per shard here (e.g.
+/// `secondary-index-rider-idx-0000-0` has one from the table's initial bulk
+/// insert at instant `00000000000000004` and one from a later compaction at
+/// `20251220210130942`), and `file_id()` groups both generations of a shard
+/// under the logs that belong to it. Iterating `hfiles` in sorted order (as
+/// below) tries the OLDER generation of a shard before the newer one, and
+/// that is deliberate, not an oversight: the newer generation is already the
+/// compacted result of folding those same logs into the older base, so
+/// reading it plus the very logs it was compacted from is a no-op (verified:
+/// for shard 0000, `base_keys`/`merged` are `[]`/`[]` against the newer
+/// generation vs. `["rider-J$…"]`/`[]` against the older one) and would make
+/// this function loop past every shard without ever finding one whose logs
+/// change anything. Pairing the OLDER generation with the shard's logs is
+/// what actually exercises "log block changes a row `read_file_group_v2` got
+/// from the base" -- the property this test exists to prove.
 fn si_shard_whose_logs_matter() -> (String, Vec<String>, Vec<String>, Vec<String>) {
     let (hfiles, logs) = secondary_index_files();
     let mdt = mdt_path();
@@ -1364,7 +1479,9 @@ fn si_tombstone_in_a_delete_block_hides_the_base_row_under_a_prefix_lookup() {
     req_none.lookup_keys = Some(lookup.as_slice());
     req_none.lookup_keys_are_prefixes = true;
     req_none.valid_instants = &none;
-    let keys_none = keys_of(&read_file_group_v2(&req_none).expect("prefix, logs excluded"));
+    let batch_none = read_file_group_v2(&req_none).expect("prefix, logs excluded");
+    assert_si_rows(&batch_none, "si_tombstone_logs_excluded");
+    let keys_none = keys_of(&batch_none);
     assert!(
         keys_none.contains(victim),
         "with the tombstone's instant excluded the base row {victim:?} must come back; got {keys_none:?}"
