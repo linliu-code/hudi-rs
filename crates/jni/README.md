@@ -33,6 +33,24 @@ library ahead of the jar; ship jar and library together.**
   depends on (runtime scope, version pinned by the `hudi.jni.native.version` property). This
   is what lets aarch64 CI runners with no access to this repo run the native reader.
 
+## Where the carrier is served from
+
+The Maven coordinates (`io.onehouse.hudi-rs:hudi-jni-native:<version>:<os>-<arch>`) are the same
+regardless of where the jar comes from — only the repository it resolves from changes:
+
+- **CodeArtifact**, via `make jni-deploy` (needs a fresh `codeartifact` token in
+  `~/.m2/settings.xml`).
+- **This machine's local Maven repository**, via `make jni-install`.
+- **A pre-release asset on `onehouseinc/hudi-internal`**:
+  ```
+  gh release create hudi-jni-native/<version> \
+    target/jni-native/hudi-jni-native-<version>-linux-aarch64.jar \
+    --repo onehouseinc/hudi-internal --prerelease --target <a pushed hudi-internal sha>
+  ```
+  hudi-internal's `bot.yml` installs this asset into the runner's local repository before its
+  Maven build when the coordinate does not resolve from CodeArtifact (D-18 in the effort
+  workspace).
+
 ## Make targets
 
 ```
@@ -42,10 +60,13 @@ make jni-jar     # package the staged tree as
                   # target/jni-native/hudi-jni-native-<version>-<os>-<arch>.jar
 make jni-deploy  # mvn deploy:deploy-file the jar to CodeArtifact
                   # (server id `codeartifact` in ~/.m2/settings.xml)
+make jni-install # mvn install:install-file the jar into the local Maven
+                  # repository (~/.m2) for builds on this machine
 ```
 
-`jni-jar` depends on `jni-lib`; `jni-deploy` depends on `jni-jar`. `jar` must come from a JDK
-on `PATH` (e.g. `export JAVA_HOME=~/.jenv/versions/17; export PATH="$JAVA_HOME/bin:$PATH"`).
+`jni-jar` depends on `jni-lib`; `jni-deploy` and `jni-install` depend on `jni-jar`. `jar` must
+come from a JDK on `PATH` (e.g. `export JAVA_HOME=~/.jenv/versions/17;
+export PATH="$JAVA_HOME/bin:$PATH"`).
 
 The staged properties file (`META-INF/hudi-jni-native.properties`) records the hudi-rs commit,
 the JNI ABI, the build timestamp, and the `.so`'s md5:
