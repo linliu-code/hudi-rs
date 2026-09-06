@@ -246,6 +246,20 @@ impl Decoder {
         };
 
         let reader = reader.by_ref().take(content_length);
+        // Java applies a key predicate only through HoodieHFileDataBlock.lookupEngineRecords;
+        // HoodieDataBlock's base implementation throws UnsupportedOperationException for
+        // every other data block. Mirror that (D-14) instead of returning every record of
+        // the block, which is silently wider than the caller asked for.
+        if self.key_predicate.is_some()
+            && matches!(block_type, BlockType::AvroData | BlockType::ParquetData)
+        {
+            return Err(CoreError::LogBlockError(format!(
+                "point lookups are not supported by {block_type:?} log blocks: a key predicate \
+                 can only be applied to HFILE data blocks (Java: HoodieDataBlock.lookupEngineRecords \
+                 throws UnsupportedOperationException); the metadata table writes HFILE blocks, so \
+                 this slice is not a metadata-table record_index slice"
+            )));
+        }
         match block_type {
             BlockType::AvroData => self
                 .decode_avro_record_content(reader, header)
@@ -1302,5 +1316,50 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("mixes"), "got: {err}");
+    }
+
+    /// Java applies a key predicate only through HoodieHFileDataBlock; for any other
+    /// data block HoodieDataBlock.lookupEngineRecords throws UnsupportedOperationException
+    /// ("Point lookups are not supported by this Data block type"). The native decoder
+    /// used to return EVERY record of an Avro/Parquet block under a predicate — silently
+    /// wider than asked. OI-12 / D-14: it now refuses, like Java.
+    #[test]
+    fn test_decode_content_refuses_a_key_predicate_on_an_avro_data_block() {
+        let schema_str =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"long"}]}"#;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes()); // block version
+        buf.extend_from_slice(&0u32.to_be_bytes()); // zero records
+        let header = HashMap::from([(BlockMetadataKey::Schema, schema_str.to_string())]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty())).with_key_predicate(Some(
+            crate::file_group::base_file::reader::KeyPredicate::Keys(vec!["k".to_string()]),
+        ));
+        let len = buf.len() as u64;
+        let mut reader = Cursor::new(buf);
+        let err = decoder
+            .decode_content(
+                &mut reader,
+                &LogFormatVersion::V0,
+                len,
+                &BlockType::AvroData,
+                &header,
+            )
+            .expect_err("a key predicate over an Avro data block must be refused");
+        assert!(
+            err.to_string().contains("point lookups are not supported")
+                && err.to_string().contains("AvroData"),
+            "the error must say why and name the block type, got: {err}"
+        );
+        // Without a predicate the same block decodes (control).
+        let mut reader = Cursor::new(reader.into_inner());
+        Decoder::new(Arc::new(HudiConfigs::empty()))
+            .decode_content(
+                &mut reader,
+                &LogFormatVersion::V0,
+                len,
+                &BlockType::AvroData,
+                &header,
+            )
+            .expect("the same block without a predicate decodes");
     }
 }
