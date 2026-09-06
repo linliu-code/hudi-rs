@@ -22,7 +22,7 @@
 //! and log files across ten shards, `hoodie.table.base.file.format=HFILE`,
 //! `hoodie.record.merge.mode=CUSTOM` with `HoodieMetadataPayload`).
 
-use arrow::array::{Array, RecordBatchReader, StringArray};
+use arrow::array::{Array, BooleanArray, Int32Array, RecordBatchReader, StringArray, StructArray};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use hudi::ffi_support::MAX_INSTANT_TIME;
 use hudi::hfile::HFileReader;
@@ -1052,5 +1052,321 @@ fn a_key_predicate_on_an_avro_data_block_is_refused_like_java() {
     assert!(
         err.contains("point lookups are not supported") && err.contains("AvroData"),
         "got: {err}"
+    );
+}
+
+// ---- secondary_index ----------------------------------------------------
+//
+// The same fixture's `secondary_index_rider_idx` partition: keys are
+// `<escapedSecKey>$<escapedRecKey>` (Java `SecondaryIndexKeyUtils`), Java
+// always looks them up by PREFIX (`<escapedSecKey>$`), and the table's
+// updates/delete wrote SI tombstones as delete-block keys. These tests prove the
+// native reader serves that shape like Java's file group reader (spec §0/§1).
+
+const SI_PARTITION: &str = "secondary_index_rider_idx";
+/// Java `MetadataPartitionType.SECONDARY_INDEX.getRecordType()`.
+const SI_RECORD_TYPE: i32 = 7;
+
+/// (hfile base names, log file names) under the SI partition, both sorted.
+fn secondary_index_files() -> (Vec<String>, Vec<String>) {
+    let dir = format!("{}/{}", mdt_path(), SI_PARTITION);
+    let mut hfiles = Vec::new();
+    let mut logs = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("secondary_index dir") {
+        let name = entry
+            .expect("dir entry")
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+        if name.starts_with("._") {
+            continue;
+        }
+        if name.ends_with(".hfile") {
+            hfiles.push(name);
+        } else if name.starts_with(".secondary-index-") && name.contains(".log.") {
+            logs.push(name);
+        }
+    }
+    hfiles.sort();
+    logs.sort();
+    assert!(
+        !hfiles.is_empty(),
+        "fixture must carry secondary_index HFiles"
+    );
+    (hfiles, logs)
+}
+
+fn si_request<'a>(
+    mdt: &'a str,
+    base: &'a str,
+    logs: &'a [&'a str],
+    schema: &'a str,
+) -> FileGroupRequest<'a> {
+    FileGroupRequest {
+        table_path: mdt,
+        partition_path: SI_PARTITION,
+        base_file_name: base,
+        log_file_names: logs,
+        latest_instant: MAX_INSTANT_TIME,
+        data_schema_json: schema,
+        lookup_keys: None,
+        lookup_keys_are_prefixes: false,
+        valid_instants: &[],
+    }
+}
+
+/// `<escapedSecKey>$` of an SI key: everything up to and including the first
+/// `$` that is not escaped by a backslash (Java `getEscapedSecondaryKeyPrefixFromSecondaryKey`).
+fn si_prefix_of(key: &str) -> String {
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in key.chars() {
+        out.push(c);
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '$' {
+            return out;
+        }
+    }
+    panic!("SI key {key:?} has no unescaped `$` separator");
+}
+
+/// Every row of an SI read must be an SI record that is not a tombstone.
+fn assert_si_rows(batch: &arrow::array::RecordBatch, where_: &str) {
+    let types = batch
+        .column_by_name("type")
+        .expect("`type` column")
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("type is int32");
+    for i in 0..types.len() {
+        assert_eq!(
+            types.value(i),
+            SI_RECORD_TYPE,
+            "{where_}: row {i} is not an SI record"
+        );
+    }
+    let si = batch
+        .column_by_name("SecondaryIndexMetadata")
+        .expect("`SecondaryIndexMetadata` column")
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("SecondaryIndexMetadata is a struct");
+    let deleted = si
+        .column_by_name("isDeleted")
+        .expect("isDeleted field")
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("isDeleted is boolean");
+    for i in 0..deleted.len() {
+        assert!(
+            si.is_null(i) || deleted.is_null(i) || !deleted.value(i),
+            "{where_}: row {i} is a tombstone data record (Java writes SI tombstones as delete-block keys, never as data rows)"
+        );
+    }
+}
+
+/// The SI hfile with the most rows, read base-only, plus its sorted keys (the
+/// independent oracle: an unfiltered read of the same file).
+fn richest_si_hfile() -> (String, Vec<String>) {
+    let (hfiles, _) = secondary_index_files();
+    let mdt = mdt_path();
+    let mut best: Option<(String, Vec<String>)> = None;
+    for base in &hfiles {
+        let batch =
+            read_file_group_v2(&si_request(&mdt, base, &[], "")).expect("SI base-only read");
+        let mut keys = keys_of(&batch);
+        keys.sort();
+        if best.as_ref().is_none_or(|(_, k)| keys.len() > k.len()) {
+            best = Some((base.clone(), keys));
+        }
+    }
+    let (base, keys) = best.expect("an SI hfile");
+    assert!(
+        !keys.is_empty(),
+        "SI shard {base} must hold at least one key"
+    );
+    (base, keys)
+}
+
+#[test]
+fn si_base_only_prefix_lookup_returns_exactly_the_keys_with_that_prefix() {
+    let mdt = mdt_path();
+    let (base, all_keys) = richest_si_hfile();
+    let prefix = si_prefix_of(&all_keys[0]);
+    let expected: Vec<String> = all_keys
+        .iter()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+    let lookup = [prefix.as_str()];
+    let mut req = si_request(&mdt, &base, &[], "");
+    req.lookup_keys = Some(lookup.as_slice());
+    req.lookup_keys_are_prefixes = true;
+    let batch = read_file_group_v2(&req).expect("SI prefix lookup");
+    assert_si_rows(&batch, "si_base_only_prefix");
+    let mut keys = keys_of(&batch);
+    keys.sort();
+    println!(
+        "si_base_only_prefix base={base} prefix={prefix:?} expected={} got={} all={}",
+        expected.len(),
+        keys.len(),
+        all_keys.len()
+    );
+    assert_eq!(keys, expected);
+    for k in &keys {
+        assert!(
+            k.starts_with(&prefix),
+            "returned key {k:?} lacks the prefix {prefix:?}"
+        );
+    }
+    // Control: the unfiltered read of the same file is the oracle and is non-empty.
+    assert!(!all_keys.is_empty());
+}
+
+#[test]
+fn si_multi_prefix_lookup_is_the_union_and_a_stranger_prefix_adds_nothing() {
+    let mdt = mdt_path();
+    let (base, all_keys) = richest_si_hfile();
+    let mut prefixes: Vec<String> = all_keys.iter().map(|k| si_prefix_of(k)).collect();
+    prefixes.sort();
+    prefixes.dedup();
+    // Two distinct prefixes when the shard has them, else the one it has.
+    let chosen: Vec<&str> = prefixes.iter().take(2).map(String::as_str).collect();
+    let expected: Vec<String> = all_keys
+        .iter()
+        .filter(|k| chosen.iter().any(|p| k.starts_with(p)))
+        .cloned()
+        .collect();
+    let mut lookup: Vec<&str> = chosen.clone();
+    lookup.push("zzz-no-such-secondary-key$");
+    let mut req = si_request(&mdt, &base, &[], "");
+    req.lookup_keys = Some(lookup.as_slice());
+    req.lookup_keys_are_prefixes = true;
+    let batch = read_file_group_v2(&req).expect("SI multi-prefix lookup");
+    assert_si_rows(&batch, "si_multi_prefix");
+    let mut keys = keys_of(&batch);
+    keys.sort();
+    println!(
+        "si_multi_prefix base={base} prefixes={chosen:?} distinct_in_shard={} expected={} got={}",
+        prefixes.len(),
+        expected.len(),
+        keys.len()
+    );
+    assert_eq!(keys, expected);
+
+    let stranger = ["zzz-no-such-secondary-key$"];
+    let mut req_none = si_request(&mdt, &base, &[], "");
+    req_none.lookup_keys = Some(stranger.as_slice());
+    req_none.lookup_keys_are_prefixes = true;
+    assert_eq!(
+        read_file_group_v2(&req_none)
+            .expect("stranger prefix")
+            .num_rows(),
+        0
+    );
+}
+
+/// An SI shard whose logs change the base rows: (base, its logs, base-only keys,
+/// merged keys with no instant range). Panics if no shard has logs.
+fn si_shard_whose_logs_matter() -> (String, Vec<String>, Vec<String>, Vec<String>) {
+    let (hfiles, logs) = secondary_index_files();
+    let mdt = mdt_path();
+    let schema = mdt_record_schema_json();
+    for base in &hfiles {
+        let shard_logs: Vec<String> = logs
+            .iter()
+            .filter(|l| file_id(l) == file_id(base))
+            .cloned()
+            .collect();
+        if shard_logs.is_empty() {
+            continue;
+        }
+        let logs_ref: Vec<&str> = shard_logs.iter().map(String::as_str).collect();
+        let mut base_keys =
+            keys_of(&read_file_group_v2(&si_request(&mdt, base, &[], "")).expect("base"));
+        base_keys.sort();
+        let mut merged = keys_of(
+            &read_file_group_v2(&si_request(&mdt, base, &logs_ref, &schema)).expect("merged"),
+        );
+        merged.sort();
+        if merged != base_keys {
+            return (base.clone(), shard_logs, base_keys, merged);
+        }
+    }
+    panic!(
+        "fixture must carry an SI shard whose logs change its rows (the table's 3 updates + 1 delete)"
+    );
+}
+
+/// Java applies EVERY delete-block key whatever the key spec
+/// (`KeyBasedFileGroupRecordBuffer.processDeleteBlock`), so an SI tombstone
+/// written after a base row hides that row under a prefix lookup; excluding the
+/// tombstone's instant (Java's `validInstantTimestamps`) brings it back.
+#[test]
+fn si_tombstone_in_a_delete_block_hides_the_base_row_under_a_prefix_lookup() {
+    let mdt = mdt_path();
+    let schema = mdt_record_schema_json();
+    let (base, shard_logs, base_keys, merged) = si_shard_whose_logs_matter();
+    let logs: Vec<&str> = shard_logs.iter().map(String::as_str).collect();
+    let deleted: Vec<&String> = base_keys.iter().filter(|k| !merged.contains(k)).collect();
+    println!(
+        "si_tombstone base={base} logs={} base_keys={} merged={} deleted={deleted:?}",
+        logs.len(),
+        base_keys.len(),
+        merged.len()
+    );
+    let Some(victim) = deleted.first() else {
+        // The shard's logs only ADD rows: still prove the added rows are reachable by prefix.
+        let added: Vec<&String> = merged.iter().filter(|k| !base_keys.contains(k)).collect();
+        let prefix = si_prefix_of(added[0]);
+        let lookup = [prefix.as_str()];
+        let mut req = si_request(&mdt, &base, &logs, &schema);
+        req.lookup_keys = Some(lookup.as_slice());
+        req.lookup_keys_are_prefixes = true;
+        let keys = keys_of(&read_file_group_v2(&req).expect("prefix over base+logs"));
+        assert!(
+            keys.contains(added[0]),
+            "a log-added SI row must be reachable by its prefix"
+        );
+        println!(
+            "si_tombstone: no tombstone in this shard; proved log-added row {:?} via prefix {prefix:?}",
+            added[0]
+        );
+        return;
+    };
+    let prefix = si_prefix_of(victim);
+    let lookup = [prefix.as_str()];
+
+    // With every completed instant valid (or no range at all) the tombstone applies.
+    let instants = mdt_completed_instants();
+    let full: Vec<&str> = instants.iter().map(String::as_str).collect();
+    let mut req = si_request(&mdt, &base, &logs, &schema);
+    req.lookup_keys = Some(lookup.as_slice());
+    req.lookup_keys_are_prefixes = true;
+    req.valid_instants = &full;
+    let batch = read_file_group_v2(&req).expect("prefix over base+logs");
+    assert_si_rows(&batch, "si_tombstone");
+    let keys = keys_of(&batch);
+    assert!(
+        !keys.contains(victim),
+        "tombstoned key {victim:?} must not be returned under prefix {prefix:?}; got {keys:?}"
+    );
+    for k in &keys {
+        assert!(k.starts_with(&prefix));
+    }
+
+    // Excluding every log instant reproduces the base row (Java would too: no valid log block).
+    let none: Vec<&str> = vec!["00000000000000000"];
+    let mut req_none = si_request(&mdt, &base, &logs, &schema);
+    req_none.lookup_keys = Some(lookup.as_slice());
+    req_none.lookup_keys_are_prefixes = true;
+    req_none.valid_instants = &none;
+    let keys_none = keys_of(&read_file_group_v2(&req_none).expect("prefix, logs excluded"));
+    assert!(
+        keys_none.contains(victim),
+        "with the tombstone's instant excluded the base row {victim:?} must come back; got {keys_none:?}"
     );
 }
