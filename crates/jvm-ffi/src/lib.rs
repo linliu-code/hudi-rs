@@ -353,12 +353,12 @@ pub extern "C" fn hudi_ffi_last_error() -> *const c_char {
 /// an empty string means "no schema", and the engine then infers the output
 /// schema from the slice — which cannot work for a log-only slice.
 ///
-/// `lookup_keys` (with `lookup_key_count` and `lookup_keys_are_prefixes`) and
-/// `valid_instants` (with `valid_instant_count`) are both optional: a null
-/// pointer with a count of 0, or a non-null pointer with a count of 0, both
-/// mean ABSENT — the whole slice, never "match nothing". When `lookup_keys` is
-/// non-empty, `lookup_keys_are_prefixes` selects exact-key matching (`false`)
-/// or prefix matching (`true`).
+/// `lookup_keys` is tri-state: a NULL pointer (count must be 0) means no
+/// predicate — the whole slice; a non-null pointer with `lookup_key_count == 0`
+/// means match nothing (zero rows, Java's EmptyIterator); otherwise the listed
+/// keys, as prefixes when `lookup_keys_are_prefixes` is set. `valid_instants`
+/// (with `valid_instant_count`) is optional: null or a count of 0 means no
+/// instant filter.
 ///
 /// # Safety
 /// All string pointers must be valid NUL-terminated UTF-8; `log_file_names`
@@ -398,7 +398,18 @@ pub unsafe extern "C" fn hudi_ffi_read_file_group_v2_into(
         } else {
             unsafe { as_str(data_schema_json, "data_schema_json") }?
         };
-        let lookup_keys = unsafe { as_strs(lookup_keys, lookup_key_count, "lookup_keys") }?;
+        // Tri-state (D-12): a null pointer is "no predicate"; a non-null pointer with
+        // a count of 0 is "match nothing"; otherwise the listed keys.
+        let lookup_keys_vec = if lookup_keys.is_null() {
+            if lookup_key_count != 0 {
+                return Err(format!(
+                    "lookup_keys is null but lookup_key_count is {lookup_key_count}"
+                ));
+            }
+            None
+        } else {
+            Some(unsafe { as_strs(lookup_keys, lookup_key_count, "lookup_keys") }?)
+        };
         let valid_instants =
             unsafe { as_strs(valid_instants, valid_instant_count, "valid_instants") }?;
         let req = file_group_v2::FileGroupRequest {
@@ -408,7 +419,7 @@ pub unsafe extern "C" fn hudi_ffi_read_file_group_v2_into(
             log_file_names: &logs,
             latest_instant,
             data_schema_json,
-            lookup_keys: &lookup_keys,
+            lookup_keys: lookup_keys_vec.as_deref(),
             lookup_keys_are_prefixes,
             valid_instants: &valid_instants,
         };
@@ -449,6 +460,8 @@ pub extern "C" fn hudi_ffi_panic_for_test() -> *mut FFI_ArrowArrayStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::ffi_stream::ArrowArrayStreamReader;
+    use std::ffi::CString;
 
     /// A panic inside a guarded body becomes null plus a message, not an abort.
     ///
@@ -600,6 +613,85 @@ mod tests {
         assert_eq!(
             message, "outer: outer failed",
             "the outer thread keeps its own"
+        );
+    }
+
+    fn mdt_and_richest_hfile() -> (String, String) {
+        let mdt = format!(
+            "{}/.hoodie/metadata",
+            hudi_test::QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro()
+        );
+        let dir = format!("{mdt}/record_index");
+        let mut best: Option<(String, u64)> = None;
+        for entry in std::fs::read_dir(&dir).expect("record_index dir") {
+            let name = entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string();
+            if name.starts_with("._") || !name.ends_with(".hfile") {
+                continue;
+            }
+            let bytes = std::fs::read(format!("{dir}/{name}")).expect("read hfile");
+            let n = hudi::hfile::HFileReader::new(bytes)
+                .expect("hfile")
+                .num_entries();
+            if best.as_ref().is_none_or(|(_, m)| n > *m) {
+                best = Some((name, n));
+            }
+        }
+        let (base, n) = best.expect("an hfile");
+        assert!(n > 0, "the control hfile must hold rows");
+        (mdt, base)
+    }
+
+    fn rows_via_c_abi(lookup_keys: *const *const c_char, lookup_key_count: usize) -> usize {
+        let (mdt, base) = mdt_and_richest_hfile();
+        let mdt_c = CString::new(mdt).unwrap();
+        let part_c = CString::new("record_index").unwrap();
+        let base_c = CString::new(base).unwrap();
+        let instant_c = CString::new(hudi::ffi_support::MAX_INSTANT_TIME).unwrap();
+        let mut stream = FFI_ArrowArrayStream::empty();
+        let rc = unsafe {
+            hudi_ffi_read_file_group_v2_into(
+                mdt_c.as_ptr(),
+                part_c.as_ptr(),
+                base_c.as_ptr(),
+                std::ptr::null(),
+                0,
+                instant_c.as_ptr(),
+                std::ptr::null(),
+                lookup_keys,
+                lookup_key_count,
+                false,
+                std::ptr::null(),
+                0,
+                &mut stream,
+            )
+        };
+        assert_eq!(rc, 0, "read failed: {:?}", unsafe {
+            let p = hudi_ffi_last_error();
+            if p.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(p).to_string_lossy().to_string())
+            }
+        });
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.expect("stream");
+        reader.map(|b| b.expect("batch").num_rows()).sum()
+    }
+
+    /// D-12 at the C boundary: a null `lookup_keys` reads the whole slice, a non-null
+    /// pointer with a count of 0 reads nothing.
+    #[test]
+    fn c_abi_lookup_keys_null_is_absent_and_empty_is_match_nothing() {
+        let whole = rows_via_c_abi(std::ptr::null(), 0);
+        assert!(whole > 0, "the control read must return rows");
+        let none: [*const c_char; 0] = [];
+        let empty = rows_via_c_abi(none.as_ptr(), 0);
+        assert_eq!(
+            empty, 0,
+            "a non-null pointer with count 0 must match nothing"
         );
     }
 }
