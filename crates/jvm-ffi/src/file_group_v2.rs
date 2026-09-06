@@ -66,14 +66,13 @@ pub struct FileGroupRequest<'a> {
     /// empty delete block with no schema header.
     pub data_schema_json: &'a str,
     /// Keys (or key prefixes) to look up — Java's `Predicates.in(keys)` /
-    /// `Predicates.startsWithAny(prefixes)` on the reader context. Already
-    /// encoded, sorted and deduplicated by the caller. Empty means NO predicate
-    /// (the whole slice), never "match nothing". Java never sends an empty key
-    /// set: `HoodieBackedTableMetadata.readSliceAndFilterByKeysIntoList` returns
-    /// an empty iterator before it builds any reader, and the native seam
-    /// (`NativeRecordIndexSliceReader.toLookup`) throws on an empty list as a
-    /// second guard.
-    pub lookup_keys: &'a [&'a str],
+    /// `Predicates.startsWithAny(prefixes)` on the reader context, already
+    /// encoded, sorted and deduplicated by the caller. Tri-state (D-12):
+    /// `None` = no predicate (the whole slice, the base toy's read);
+    /// `Some(&[])` = match NOTHING (zero rows — Java's `EmptyIterator` for an
+    /// empty key set in `readSliceAndFilterByKeysIntoList`);
+    /// `Some(keys)` = exactly these keys / prefixes.
+    pub lookup_keys: Option<&'a [&'a str]>,
     /// `true`: `lookup_keys` are prefixes; `false`: exact keys.
     pub lookup_keys_are_prefixes: bool,
     /// Explicit valid-instant set — Java's `InstantRange.EXACT_MATCH(validInstantTimestamps)`:
@@ -86,6 +85,24 @@ pub struct FileGroupRequest<'a> {
     /// file, unlike the per-block log filtering; unresolvable instant = keep),
     /// so a data-table caller must include the base file's instant.
     pub valid_instants: &'a [&'a str],
+}
+
+impl Default for FileGroupRequest<'_> {
+    /// All-empty: refused by `read_file_group_v2` on `table_path`. Exists so callers
+    /// and tests can use struct-update syntax without naming every field.
+    fn default() -> Self {
+        Self {
+            table_path: "",
+            partition_path: "",
+            base_file_name: "",
+            log_file_names: &[],
+            latest_instant: "",
+            data_schema_json: "",
+            lookup_keys: None,
+            lookup_keys_are_prefixes: false,
+            valid_instants: &[],
+        }
+    }
 }
 
 fn join_in_partition(partition: &str, name: &str) -> String {
@@ -117,16 +134,16 @@ fn build_reader_context(
         .unwrap_or_default();
     let latest_commit_time = req.latest_instant.to_string();
     let record_context = RecordContext::new(&table_config, req.partition_path.to_string());
-    let key_predicate = if req.lookup_keys.is_empty() {
-        None
-    } else {
-        let keys: Vec<String> = req.lookup_keys.iter().map(|k| k.to_string()).collect();
-        Some(if req.lookup_keys_are_prefixes {
+    // `Some(&[])` deliberately builds an EMPTY matcher: it admits no key, so the
+    // base-file read and every HFile log block yield zero rows — Java's EmptyIterator.
+    let key_predicate = req.lookup_keys.map(|keys| {
+        let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        if req.lookup_keys_are_prefixes {
             KeyPredicate::Prefixes(keys)
         } else {
             KeyPredicate::Keys(keys)
-        })
-    };
+        }
+    });
     let instant_range = if req.valid_instants.is_empty() {
         None
     } else {
@@ -202,7 +219,9 @@ pub fn read_file_group_v2(req: &FileGroupRequest<'_>) -> Result<RecordBatch, Str
         req.log_file_names.len(),
         req.latest_instant,
         !req.data_schema_json.is_empty(),
-        req.lookup_keys.len(),
+        req.lookup_keys
+            .map(|k| k.len().to_string())
+            .unwrap_or_else(|| "none".to_string()),
         req.lookup_keys_are_prefixes,
         req.valid_instants.len(),
     );

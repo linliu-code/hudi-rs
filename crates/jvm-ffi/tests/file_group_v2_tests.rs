@@ -107,7 +107,7 @@ fn base_only_slice_returns_every_entry_of_the_hfile() {
             log_file_names: &[],
             latest_instant: MAX_INSTANT_TIME,
             data_schema_json: "",
-            lookup_keys: &[],
+            lookup_keys: None,
             lookup_keys_are_prefixes: false,
             valid_instants: &[],
         };
@@ -176,7 +176,7 @@ fn base_plus_logs_slice_merges_without_error() {
         log_file_names: &shard_logs,
         latest_instant: MAX_INSTANT_TIME,
         data_schema_json: "",
-        lookup_keys: &[],
+        lookup_keys: None,
         lookup_keys_are_prefixes: false,
         valid_instants: &[],
     };
@@ -207,7 +207,7 @@ fn exported_stream_round_trips_through_the_arrow_c_stream_interface() {
         log_file_names: &[],
         latest_instant: MAX_INSTANT_TIME,
         data_schema_json: "",
-        lookup_keys: &[],
+        lookup_keys: None,
         lookup_keys_are_prefixes: false,
         valid_instants: &[],
     };
@@ -236,7 +236,7 @@ fn a_missing_base_file_is_an_error_not_a_panic() {
         log_file_names: &[],
         latest_instant: MAX_INSTANT_TIME,
         data_schema_json: "",
-        lookup_keys: &[],
+        lookup_keys: None,
         lookup_keys_are_prefixes: false,
         valid_instants: &[],
     };
@@ -297,7 +297,7 @@ fn log_only_bootstrap_slice_reads_like_java_empty_result_with_table_schema() {
         log_file_names: &shard_logs,
         latest_instant: MAX_INSTANT_TIME,
         data_schema_json: &schema_json,
-        lookup_keys: &[],
+        lookup_keys: None,
         lookup_keys_are_prefixes: false,
         valid_instants: &[],
     };
@@ -357,7 +357,7 @@ fn log_only_slice_without_a_schema_still_fails_with_a_clear_error() {
         log_file_names: &shard_logs,
         latest_instant: MAX_INSTANT_TIME,
         data_schema_json: "",
-        lookup_keys: &[],
+        lookup_keys: None,
         lookup_keys_are_prefixes: false,
         valid_instants: &[],
     };
@@ -385,7 +385,7 @@ fn base_only_slice_with_explicit_schema_returns_the_same_rows_as_without() {
         log_file_names: &[],
         latest_instant: MAX_INSTANT_TIME,
         data_schema_json: "",
-        lookup_keys: &[],
+        lookup_keys: None,
         lookup_keys_are_prefixes: false,
         valid_instants: &[],
     })
@@ -397,7 +397,7 @@ fn base_only_slice_with_explicit_schema_returns_the_same_rows_as_without() {
         log_file_names: &[],
         latest_instant: MAX_INSTANT_TIME,
         data_schema_json: &schema_json,
-        lookup_keys: &[],
+        lookup_keys: None,
         lookup_keys_are_prefixes: false,
         valid_instants: &[],
     })
@@ -464,7 +464,7 @@ fn base_plus_logs_slice_with_explicit_schema_merges_without_error() {
         log_file_names: &shard_logs,
         latest_instant: MAX_INSTANT_TIME,
         data_schema_json: &schema_json,
-        lookup_keys: &[],
+        lookup_keys: None,
         lookup_keys_are_prefixes: false,
         valid_instants: &[],
     };
@@ -498,7 +498,7 @@ fn request<'a>(
         log_file_names: logs,
         latest_instant: MAX_INSTANT_TIME,
         data_schema_json: schema,
-        lookup_keys: &[],
+        lookup_keys: None,
         lookup_keys_are_prefixes: false,
         valid_instants: &[],
     }
@@ -550,7 +550,7 @@ fn a_keys_predicate_returns_exactly_the_asked_for_keys_that_exist() {
     let wanted = all_keys[0].clone();
     let lookup = [wanted.as_str(), "no-such-key-zzz"];
     let mut req = request(&mdt, &base, &[], "");
-    req.lookup_keys = &lookup;
+    req.lookup_keys = Some(lookup.as_slice());
     let batch = read_file_group_v2(&req).expect("keys lookup");
     let keys = keys_of(&batch);
     println!("keys_predicate base={base} asked={lookup:?} got={keys:?}");
@@ -562,7 +562,7 @@ fn a_keys_predicate_returns_exactly_the_asked_for_keys_that_exist() {
     // proves the predicate filters rather than being ignored.
     let missing = ["no-such-key-zzz"];
     let mut req_missing = request(&mdt, &base, &[], "");
-    req_missing.lookup_keys = &missing;
+    req_missing.lookup_keys = Some(missing.as_slice());
     let missing_batch = read_file_group_v2(&req_missing).expect("missing-key lookup");
     assert_eq!(
         missing_batch.num_rows(),
@@ -575,7 +575,7 @@ fn a_keys_predicate_returns_exactly_the_asked_for_keys_that_exist() {
     let other_rows = a_key_in_another_hfile(&base).map(|other_key| {
         let lookup_other = [other_key.as_str()];
         let mut req_other = request(&mdt, &base, &[], "");
-        req_other.lookup_keys = &lookup_other;
+        req_other.lookup_keys = Some(lookup_other.as_slice());
         let other_batch = read_file_group_v2(&req_other).expect("other-shard-key lookup");
         other_batch.num_rows()
     });
@@ -613,7 +613,7 @@ fn a_prefixes_predicate_returns_only_keys_with_the_prefix() {
         .collect();
     let lookup = [prefix.as_str(), "zzz-no-such-prefix"];
     let mut req = request(&mdt, &base, &[], "");
-    req.lookup_keys = &lookup;
+    req.lookup_keys = Some(lookup.as_slice());
     req.lookup_keys_are_prefixes = true;
     let batch = read_file_group_v2(&req).expect("prefix lookup");
     let mut keys = keys_of(&batch);
@@ -632,7 +632,7 @@ fn a_prefixes_predicate_returns_only_keys_with_the_prefix() {
     // Negative: an unmatched prefix, alone, must return nothing.
     let missing_prefix = ["zzz-no-such-prefix"];
     let mut req_missing = request(&mdt, &base, &[], "");
-    req_missing.lookup_keys = &missing_prefix;
+    req_missing.lookup_keys = Some(missing_prefix.as_slice());
     req_missing.lookup_keys_are_prefixes = true;
     let missing_batch = read_file_group_v2(&req_missing).expect("missing-prefix lookup");
     assert_eq!(
@@ -655,7 +655,7 @@ fn a_prefixes_predicate_returns_only_keys_with_the_prefix() {
         );
         let lookup_other = [other_prefix.as_str()];
         let mut req_other = request(&mdt, &base, &[], "");
-        req_other.lookup_keys = &lookup_other;
+        req_other.lookup_keys = Some(lookup_other.as_slice());
         req_other.lookup_keys_are_prefixes = true;
         let other_batch = read_file_group_v2(&req_other).expect("other-shard-prefix lookup");
         other_batch.num_rows()
@@ -679,7 +679,7 @@ fn a_prefixes_predicate_returns_only_keys_with_the_prefix() {
 }
 
 #[test]
-fn empty_lookup_keys_and_empty_valid_instants_read_the_whole_slice() {
+fn absent_lookup_keys_and_empty_valid_instants_read_the_whole_slice() {
     let mdt = mdt_path();
     let (base, all_keys) = richest_hfile();
     let req = request(&mdt, &base, &[], "");
@@ -692,7 +692,7 @@ fn empty_lookup_keys_and_empty_valid_instants_read_the_whole_slice() {
     assert_eq!(
         batch.num_rows() as u64,
         expected,
-        "an empty predicate and an empty instant set must read every entry of the HFile"
+        "an ABSENT predicate (None) and an empty instant set must read every entry of the HFile"
     );
 }
 
@@ -738,7 +738,7 @@ fn a_keys_predicate_on_base_plus_logs_returns_the_merged_row() {
     );
     let lookup = [target.as_str()];
     let mut req = request(&mdt, &base, &logs, &schema);
-    req.lookup_keys = &lookup;
+    req.lookup_keys = Some(lookup.as_slice());
     let batch = read_file_group_v2(&req).expect("keys lookup on base+logs");
     assert_eq!(keys_of(&batch), vec![target]);
 
@@ -751,7 +751,7 @@ fn a_keys_predicate_on_base_plus_logs_returns_the_merged_row() {
     );
     let missing = ["no-such-key-zzz"];
     let mut req_missing = request(&mdt, &base, &logs, &schema);
-    req_missing.lookup_keys = &missing;
+    req_missing.lookup_keys = Some(missing.as_slice());
     let missing_batch = read_file_group_v2(&req_missing).expect("missing-key lookup on base+logs");
     println!("base_plus_logs negative_rows={}", missing_batch.num_rows());
     assert_eq!(
@@ -879,7 +879,7 @@ fn a_keys_predicate_on_a_log_only_slice_reads_without_error() {
     let schema_json = mdt_record_schema_json();
     let lookup = ["no-such-key-zzz"];
     let mut req = request(&mdt, "", &shard_logs, &schema_json);
-    req.lookup_keys = &lookup;
+    req.lookup_keys = Some(lookup.as_slice());
     let batch = read_file_group_v2(&req)
         .unwrap_or_else(|e| panic!("log-only shard {shard} with a key predicate must read: {e}"));
     println!("log_only_predicate shard={shard} rows={}", batch.num_rows());
@@ -905,4 +905,53 @@ fn an_empty_latest_instant_is_refused() {
         err.contains("latest_instant is empty"),
         "the error must name the argument, got: {err}"
     );
+}
+
+/// Java returns an EmptyIterator for zero keys before building any reader
+/// (`readSliceAndFilterByKeysIntoList`: "If no keys to lookup, we must return early,
+/// otherwise, the hfile lookup will return all records."). OI-14 / D-12: an EMPTY key
+/// set (as opposed to an ABSENT one) reads nothing, on a base-only and a base+logs slice,
+/// for exact keys and for prefixes.
+#[test]
+fn an_empty_key_set_reads_nothing() {
+    let mdt = mdt_path();
+    let (base, all_keys) = richest_hfile();
+    assert!(!all_keys.is_empty(), "the control slice must hold rows");
+    let empty: [&str; 0] = [];
+    for prefixes in [false, true] {
+        let mut req = request(&mdt, &base, &[], "");
+        req.lookup_keys = Some(empty.as_slice());
+        req.lookup_keys_are_prefixes = prefixes;
+        let batch = read_file_group_v2(&req).expect("empty key set");
+        assert_eq!(
+            batch.num_rows(),
+            0,
+            "an empty key set (prefixes={prefixes}) must read nothing, got {:?}",
+            keys_of(&batch)
+        );
+        let whole = read_file_group_v2(&request(&mdt, &base, &[], "")).expect("whole slice");
+        assert_eq!(
+            batch.schema(),
+            whole.schema(),
+            "the empty batch keeps the slice schema"
+        );
+    }
+    let schema = mdt_record_schema_json();
+    let (base, shard_logs) = base_plus_logs_shard();
+    let logs: Vec<&str> = shard_logs.iter().map(String::as_str).collect();
+    let mut req = request(&mdt, &base, &logs, &schema);
+    req.lookup_keys = Some(empty.as_slice());
+    let batch = read_file_group_v2(&req).expect("empty key set on base+logs");
+    assert_eq!(batch.num_rows(), 0, "base+logs: got {:?}", keys_of(&batch));
+}
+
+/// `FileGroupRequest::default()` is all-empty and is refused on its first check, so
+/// struct-update syntax can never produce a silently-wider read (OI-25 rs-c).
+#[test]
+fn default_request_is_all_empty_and_refused_on_table_path() {
+    let req = FileGroupRequest::default();
+    assert!(req.lookup_keys.is_none());
+    assert!(req.log_file_names.is_empty() && req.valid_instants.is_empty());
+    let err = read_file_group_v2(&req).expect_err("a default request has no table");
+    assert!(err.contains("table_path is empty"), "got: {err}");
 }

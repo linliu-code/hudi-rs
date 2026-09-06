@@ -101,6 +101,19 @@ fn jstring_array_to_vec(
     Ok(out)
 }
 
+/// Like [`jstring_array_to_vec`] but keeps the null / empty distinction: `None` for a
+/// null array (no predicate), `Some(vec![])` for an empty one (match nothing) — D-12.
+fn jstring_array_to_option_vec(
+    env: &mut JNIEnv,
+    array: &JObjectArray,
+    what: &str,
+) -> Result<Option<Vec<String>>, String> {
+    if array.as_raw().is_null() {
+        return Ok(None);
+    }
+    jstring_array_to_vec(env, array, what).map(Some)
+}
+
 fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
     panic
         .downcast_ref::<&str>()
@@ -130,10 +143,11 @@ fn throw(env: &mut JNIEnv, message: String) {
 /// string is "no schema" rather than an error, and the engine then infers the
 /// output schema from the slice — which cannot work for a log-only slice.
 ///
-/// `lookupKeys` is Java's `Predicates.in` keys, or key prefixes when
-/// `lookupKeysArePrefixes` is set; a null array means the whole slice (no key
-/// filter). `validInstants` is the set of valid instant timestamps; a null
-/// array means no instant filter.
+/// `lookupKeys` is tri-state: a null array means the whole slice (no key
+/// filter); an EMPTY array means match nothing (zero rows, Java's EmptyIterator
+/// for an empty key set); otherwise the keys, as prefixes when
+/// `lookupKeysArePrefixes` is set. `validInstants` is the set of valid instant
+/// timestamps; a null array means no instant filter.
 ///
 /// Changing this parameter list requires bumping [`JNI_ABI_VERSION`].
 #[unsafe(no_mangle)]
@@ -166,13 +180,15 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
         } else {
             jstring_to_string(&mut env, &data_schema_json, "dataSchemaJson")?
         };
-        let lookup_keys = jstring_array_to_vec(&mut env, &lookup_keys, "lookupKeys")?;
+        let lookup_keys = jstring_array_to_option_vec(&mut env, &lookup_keys, "lookupKeys")?;
         let valid_instants = jstring_array_to_vec(&mut env, &valid_instants, "validInstants")?;
         if stream_address == 0 {
             return Err("streamAddress is 0".to_string());
         }
         let log_refs: Vec<&str> = logs.iter().map(String::as_str).collect();
-        let key_refs: Vec<&str> = lookup_keys.iter().map(String::as_str).collect();
+        let key_refs: Option<Vec<&str>> = lookup_keys
+            .as_ref()
+            .map(|keys| keys.iter().map(String::as_str).collect());
         let instant_refs: Vec<&str> = valid_instants.iter().map(String::as_str).collect();
         let req = FileGroupRequest {
             table_path: &table_path,
@@ -181,7 +197,7 @@ pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReade
             log_file_names: &log_refs,
             latest_instant: &latest_instant,
             data_schema_json: &data_schema_json,
-            lookup_keys: &key_refs,
+            lookup_keys: key_refs.as_deref(),
             lookup_keys_are_prefixes: lookup_keys_are_prefixes != 0,
             valid_instants: &instant_refs,
         };
