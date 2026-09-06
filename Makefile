@@ -177,6 +177,12 @@ jni-deploy: jni-jar ## Deploy the carrier jar to CodeArtifact (server id `codear
 	  -Dversion=$(JNI_VERSION) -Dclassifier=$(JNI_OS)-$(JNI_ARCH) -Dpackaging=jar -DgeneratePom=true \
 	  -DrepositoryId=codeartifact -Durl=$(CODEARTIFACT_URL)
 
+.PHONY: jni-install
+jni-install: jni-jar ## Install the carrier jar into the local Maven repository (~/.m2) for builds on this machine
+	$(info --- Install $(JNI_JAR) into the local Maven repository as io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH) ---)
+	mvn -B -ntp install:install-file -Dfile=$(JNI_JAR) -DgroupId=io.onehouse.hudi-rs -DartifactId=hudi-jni-native \
+	  -Dversion=$(JNI_VERSION) -Dclassifier=$(JNI_OS)-$(JNI_ARCH) -Dpackaging=jar -DgeneratePom=true
+
 .PHONY: coverage
 coverage: coverage-rust ## Generate coverage report (alias for coverage-rust)
 
