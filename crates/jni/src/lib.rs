@@ -43,8 +43,12 @@ use jni::sys::{jboolean, jlong, jstring};
 /// newer library, so deploy the jar and the library together (never library-first).
 ///
 /// History: 1 = the 7-argument `readFileGroupInto` (pre lookup-keys);
-/// 2 = `readFileGroupInto` gained `lookupKeys`, `lookupKeysArePrefixes`, `validInstants`.
-pub const JNI_ABI_VERSION: u32 = 2;
+/// 2 = `readFileGroupInto` gained `lookupKeys`, `lookupKeysArePrefixes`, `validInstants`;
+/// 3 = same parameter list, changed meaning of two inputs: an EMPTY `lookupKeys` array
+///     means match-nothing (was: whole slice, D-12) and an empty `latestInstant` is refused
+///     (was: read everything, D-13). Bumped so a jar that still expects the old meanings
+///     refuses this library rather than mis-reading a lookup.
+pub const JNI_ABI_VERSION: u32 = 3;
 
 const EXCEPTION_CLASS: &str = "org/apache/hudi/io/nativereader/NativeReaderException";
 
