@@ -955,3 +955,63 @@ fn default_request_is_all_empty_and_refused_on_table_path() {
     let err = read_file_group_v2(&req).expect_err("a default request has no table");
     assert!(err.contains("table_path is empty"), "got: {err}");
 }
+
+/// The DATA table (not its metadata table) of the same fixture: MOR with Avro log
+/// blocks. `city=chennai` holds file id `6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0` with a
+/// base parquet at instant 20251220210108078 and two later `.log.1_…` files, i.e. a
+/// slice whose log blocks are AVRO_DATA_BLOCKs. With a key predicate the native read
+/// must fail like Java's HoodieDataBlock.lookupEngineRecords does (OI-12 / D-14); the
+/// same slice without a predicate reads fine (control).
+#[test]
+fn a_key_predicate_on_an_avro_data_block_is_refused_like_java() {
+    let table = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+    let partition = "city=chennai";
+    let dir = format!("{table}/{partition}");
+    let mut base: Option<String> = None;
+    let mut logs: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("partition dir") {
+        let name = entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+        if name.starts_with("._") {
+            continue;
+        }
+        if name.ends_with(".parquet") && name.contains("_20251220210108078") {
+            base = Some(name);
+        } else if name.starts_with(".6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_")
+            && name.contains(".log.")
+        {
+            logs.push(name);
+        }
+    }
+    let base = base.expect("the fixture's first chennai base file");
+    assert!(
+        !logs.is_empty(),
+        "the fixture's chennai slice must carry Avro log files"
+    );
+    logs.sort();
+    let log_refs: Vec<&str> = logs.iter().map(String::as_str).collect();
+    let control = FileGroupRequest {
+        table_path: &table,
+        partition_path: partition,
+        base_file_name: &base,
+        log_file_names: &log_refs,
+        latest_instant: MAX_INSTANT_TIME,
+        ..FileGroupRequest::default()
+    };
+    let batch =
+        read_file_group_v2(&control).expect("the data-table slice reads without a predicate");
+    assert!(batch.num_rows() > 0, "control read must return rows");
+
+    let lookup = ["no-such-key"];
+    let mut req = control;
+    req.lookup_keys = Some(lookup.as_slice());
+    let err =
+        read_file_group_v2(&req).expect_err("a key predicate over Avro log blocks must be refused");
+    assert!(
+        err.contains("point lookups are not supported") && err.contains("AvroData"),
+        "got: {err}"
+    );
+}
