@@ -71,7 +71,10 @@ pub struct FileGroupRequest<'a> {
     /// `None` = no predicate (the whole slice, the base toy's read);
     /// `Some(&[])` = match NOTHING (zero rows — Java's `EmptyIterator` for an
     /// empty key set in `readSliceAndFilterByKeysIntoList`);
-    /// `Some(keys)` = exactly these keys / prefixes.
+    /// `Some(keys)` = exactly these keys / prefixes — on a slice whose base file
+    /// can seek by key (HFile — every metadata-table slice); a base file in a
+    /// format that cannot (parquet) still returns every row, as Java does, so a
+    /// non-MDT caller must filter (`crates/core/src/file_group/base_file/reader.rs:112-118`).
     pub lookup_keys: Option<&'a [&'a str]>,
     /// `true`: `lookup_keys` are prefixes; `false`: exact keys.
     pub lookup_keys_are_prefixes: bool,

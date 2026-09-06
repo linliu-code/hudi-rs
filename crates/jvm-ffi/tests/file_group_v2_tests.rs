@@ -890,6 +890,45 @@ fn a_keys_predicate_on_a_log_only_slice_reads_without_error() {
     );
 }
 
+/// Minor: `Some(&[])` on a LOG-ONLY slice (no base file to even attempt a
+/// key-based seek against) must still take the match-nothing path (D-12)
+/// rather than falling back to a full scan the way an absent predicate would.
+#[test]
+fn an_empty_keys_predicate_on_a_log_only_slice_reads_zero_rows() {
+    let (hfiles, logs) = record_index_files();
+    let log_only: Vec<&String> = logs
+        .iter()
+        .filter(|l| !hfiles.iter().any(|h| file_id(h) == file_id(l)))
+        .collect();
+    assert!(
+        !log_only.is_empty(),
+        "fixture must carry a log-only record_index shard"
+    );
+    let shard = file_id(log_only[0]);
+    let shard_logs: Vec<&str> = logs
+        .iter()
+        .filter(|l| file_id(l) == shard)
+        .map(String::as_str)
+        .collect();
+
+    let mdt = mdt_path();
+    let schema_json = mdt_record_schema_json();
+    let empty: [&str; 0] = [];
+    let mut req = request(&mdt, "", &shard_logs, &schema_json);
+    req.lookup_keys = Some(empty.as_slice());
+    let batch = read_file_group_v2(&req)
+        .unwrap_or_else(|e| panic!("log-only shard {shard} with an empty key set must read: {e}"));
+    println!(
+        "log_only_empty_keys shard={shard} rows={}",
+        batch.num_rows()
+    );
+    assert_eq!(
+        batch.num_rows(),
+        0,
+        "an empty key set on a log-only slice must yield zero rows"
+    );
+}
+
 /// Java never has an "empty" latest instant: `readSliceWithFilter` passes the last
 /// completed instant or SOLO_COMMIT_TIMESTAMP. The old native contract mapped "" to
 /// MAX_INSTANT_TIME (read everything) — the opposite direction from Java's fallback
