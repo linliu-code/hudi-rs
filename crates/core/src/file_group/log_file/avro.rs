@@ -201,6 +201,14 @@ impl AvroBlockDecoder {
         self
     }
 
+    /// The rewrite chain, in the order [`Self::flush`] applies it. Test-only:
+    /// the chain is an implementation detail of the rewrite branch, and the only
+    /// thing outside it that can observe the chain is the batch's schema.
+    #[cfg(test)]
+    pub(crate) fn rewrite_targets(&self) -> &[SchemaRef] {
+        &self.rewrite_to
+    }
+
     /// Decode one record body, returning a batch once enough rows have accrued.
     pub fn decode(&mut self, body: &[u8]) -> Result<Option<RecordBatch>> {
         self.framed.clear();

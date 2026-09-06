@@ -1808,6 +1808,55 @@ fn v6_record_index_hfiles_read_under_the_current_metadata_schema() {
         rim_children.iter().any(|n| n == "position"),
         "recordIndexMetadata.position must be filled from its default; got {rim_children:?}"
     );
+
+    // The VALUES of the default fills, on the real artefact rather than only in a
+    // synthetic unit test. `ColumnStatsMetadata` is null on every record_index
+    // row, so `isTightBound` is asserted on the file whose column stats are
+    // present — none here — and on the struct's own validity instead: what must
+    // hold is that `isTightBound` is a non-nullable boolean carrying `false`
+    // wherever the struct itself is valid, which is what Java's resolver writes.
+    let cs = batch
+        .column_by_name("ColumnStatsMetadata")
+        .expect("ColumnStatsMetadata column")
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("ColumnStatsMetadata is a struct");
+    let tight = cs
+        .column_by_name("isTightBound")
+        .expect("isTightBound field")
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("isTightBound is boolean");
+    for i in 0..tight.len() {
+        assert!(
+            cs.is_null(i) || (!tight.is_null(i) && !tight.value(i)),
+            "row {i}: isTightBound must be the Avro default `false`, not null"
+        );
+    }
+    // `position` is nullable with `default: null`, so Java fills it with null.
+    let rim = batch
+        .column_by_name("recordIndexMetadata")
+        .expect("recordIndexMetadata column")
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("recordIndexMetadata is a struct");
+    let position = rim.column_by_name("position").expect("position field");
+    for i in 0..position.len() {
+        assert!(
+            rim.is_null(i) || position.is_null(i),
+            "row {i}: position must be the Avro default `null`"
+        );
+    }
+    // `SecondaryIndexMetadata` is nullable with `default: null`.
+    let si = batch
+        .column_by_name("SecondaryIndexMetadata")
+        .expect("SecondaryIndexMetadata column");
+    for i in 0..si.len() {
+        assert!(
+            si.is_null(i),
+            "row {i}: SecondaryIndexMetadata must be the Avro default `null`"
+        );
+    }
 }
 
 /// The path the failing Java test actually takes: `readSliceWithFilter` with a

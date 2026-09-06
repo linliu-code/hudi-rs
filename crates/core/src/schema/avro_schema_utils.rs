@@ -78,6 +78,58 @@ fn types_equivalent(a: &DataType, b: &DataType) -> bool {
     }
 }
 
+/// Whether two Avro schema JSONs describe the same schema, for the purpose of
+/// deciding that resolving one against the other would be a no-op.
+///
+/// Needed because the two JSONs that meet at that decision are never the same
+/// string even when they are the same schema. The reader side is
+/// [`append_mandatory_fields_avro_json`]'s output, i.e. `serde_json::to_string`
+/// of a parsed `Value` — and `serde_json` is built here without `preserve_order`,
+/// so its objects are `BTreeMap`s and it re-emits keys **alphabetically**. The
+/// writer side is whatever Java Avro's `Schema.toString()` wrote into the file,
+/// which is not key-sorted. A `!=` on the two strings is therefore always true.
+///
+/// The comparison is structural (`serde_json::Value` equality, which is
+/// key-order and whitespace insensitive) with `"doc"` stripped, and deliberately
+/// nothing else:
+///
+/// * **Not** Avro's Parsing Canonical Form, the obvious candidate. It strips
+///   `logicalType` along with `doc`/`default`/`aliases`, so a writer `"long"` and
+///   a reader `{"type":"long","logicalType":"timestamp-micros"}` share a canonical
+///   form — and skipping resolution there would decode `Int64` where the required
+///   schema says `Timestamp`. Equal canonical forms do not license skipping.
+/// * `doc` is dropped because it is prose: it cannot change a decoded value, a
+///   type, or a branch.
+/// * Everything else counts as a difference and makes the read resolve, including
+///   `default`, `aliases` and `avro.java.string`. Some of those would in fact be
+///   harmless to ignore; being wrong in this direction costs one resolving
+///   decoder, and being wrong in the other costs correctness.
+pub(crate) fn avro_schema_json_equivalent(a_json: &str, b_json: &str) -> crate::Result<bool> {
+    use serde_json::Value;
+
+    fn strip_doc(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.remove("doc");
+                for (_, v) in map.iter_mut() {
+                    strip_doc(v);
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip_doc),
+            _ => {}
+        }
+    }
+
+    let parse = |json: &str| -> crate::Result<Value> {
+        serde_json::from_str(json)
+            .map_err(|e| crate::error::CoreError::Schema(format!("bad avro json: {e}")))
+    };
+    let (mut a, mut b) = (parse(a_json)?, parse(b_json)?);
+    strip_doc(&mut a);
+    strip_doc(&mut b);
+    Ok(a == b)
+}
+
 /// Append top-level field definitions (copied verbatim from `source_json`) to
 /// `base_json` for every name in `field_names` not already present in base.
 ///
@@ -489,5 +541,49 @@ mod tests {
         let out = append_mandatory_fields_avro_json(requested, data, &["not_a_field"]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["fields"].as_array().unwrap().len(), 1);
+    }
+
+    /// The comparison the HFile cost gate runs. What must be equal is what the
+    /// producers actually differ by (key order, whitespace, prose); what must NOT
+    /// be equal is anything that changes a decoded type or value.
+    #[test]
+    fn avro_schema_json_equivalence_ignores_key_order_and_doc_but_nothing_else() {
+        let base = r#"{"type":"record","name":"R","namespace":"ns","fields":[
+            {"name":"a","type":"long"},{"name":"b","type":["null","string"],"default":null}]}"#;
+
+        // Key order and whitespace: the exact difference between Java Avro's
+        // `Schema.toString()` and `serde_json`'s key-sorted re-serialization.
+        let reordered = r#"{"fields":[{"type":"long","name":"a"},
+            {"default":null,"name":"b","type":["null","string"]}],
+            "namespace":"ns","name":"R","type":"record"}"#;
+        assert!(avro_schema_json_equivalent(base, reordered).unwrap());
+
+        // `doc` is prose.
+        let documented = r#"{"type":"record","name":"R","namespace":"ns","doc":"hi","fields":[
+            {"name":"a","type":"long","doc":"an a"},
+            {"name":"b","type":["null","string"],"default":null}]}"#;
+        assert!(avro_schema_json_equivalent(base, documented).unwrap());
+
+        // A logical type changes the decoded Arrow type — Avro's Parsing
+        // Canonical Form strips it, which is why this is not canonical form.
+        let logical = r#"{"type":"record","name":"R","namespace":"ns","fields":[
+            {"name":"a","type":{"type":"long","logicalType":"timestamp-micros"}},
+            {"name":"b","type":["null","string"],"default":null}]}"#;
+        assert!(!avro_schema_json_equivalent(base, logical).unwrap());
+
+        // An added field is the whole point of resolving.
+        let evolved = r#"{"type":"record","name":"R","namespace":"ns","fields":[
+            {"name":"a","type":"long"},{"name":"b","type":["null","string"],"default":null},
+            {"name":"c","type":"boolean","default":false}]}"#;
+        assert!(!avro_schema_json_equivalent(base, evolved).unwrap());
+
+        // A changed default changes what a reader-only field is filled with.
+        let redefaulted = r#"{"type":"record","name":"R","namespace":"ns","fields":[
+            {"name":"a","type":"long"},{"name":"b","type":["null","string"],"default":null},
+            {"name":"c","type":"boolean","default":true}]}"#;
+        assert!(!avro_schema_json_equivalent(evolved, redefaulted).unwrap());
+
+        // Malformed input is an error, not a false "equivalent".
+        assert!(avro_schema_json_equivalent(base, "{not json").is_err());
     }
 }

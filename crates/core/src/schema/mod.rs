@@ -21,6 +21,7 @@ use crate::metadata::meta_field::MetaField;
 use crate::schema::resolver::sanitize_avro_schema_str;
 use arrow_schema::{Schema, SchemaRef};
 use serde_json::Value;
+use std::sync::Arc;
 
 pub mod avro_schema_utils;
 pub mod batch_evolution;
@@ -28,6 +29,90 @@ pub mod delete;
 pub mod extended_promotion;
 pub mod parquet_list_norm;
 pub mod resolver;
+
+/// Rewrite every `+00:00`-spelled timestamp zone as `UTC`, recursively.
+///
+/// The two converters disagree on the spelling of the same zone: `avro_to_arrow`
+/// (and the parquet reader) write `UTC`, `arrow-avro` writes the offset `+00:00`.
+/// Arrow compares timezones as strings, so a required schema spelled one way and
+/// a base batch spelled the other are judged to have different types. The log
+/// decoder already normalises its batches the same way
+/// (`log_file::avro::normalize_utc_timestamps`); this keeps every schema derived
+/// from the decoder route on that side of the disagreement, so switching those
+/// conversions to it changed which schemas can be converted and nothing else.
+///
+/// Every caller that converts an Avro JSON through
+/// `ffi_support::arrow_schema_from_avro_json` and then compares or concatenates
+/// the result against a parquet-derived or `avro_to_arrow`-derived schema must
+/// run it through here. Today that is
+/// `FileGroupReaderSchemaHandler::prepare_required_schema` (the required schema)
+/// and `log_file::content`'s rewrite targets.
+///
+/// The recursion covers `Struct`, `List`, `LargeList`, `Map` and `Union`, which
+/// is every nested type `arrow-avro` emits that can contain a timestamp: an Avro
+/// `array` becomes `List`, a `map` becomes `Map`, a `fixed` becomes
+/// `FixedSizeBinary` and an `enum` becomes `Dictionary(Int32, Utf8)` — neither of
+/// the last two can hold one. `FixedSizeList`, `Dictionary`, `RunEndEncoded` and
+/// the list-view types are therefore not walked.
+pub(crate) fn normalize_utc_timezone_spelling(
+    schema: &arrow_schema::Schema,
+) -> arrow_schema::Schema {
+    use arrow_schema::{DataType, Field};
+
+    fn is_utc_alias(tz: &str) -> bool {
+        matches!(tz, "+00:00" | "+0000" | "00:00" | "Z" | "z")
+    }
+
+    fn fix(dt: &DataType) -> Option<DataType> {
+        match dt {
+            DataType::Timestamp(unit, Some(tz)) if is_utc_alias(tz) => {
+                Some(DataType::Timestamp(*unit, Some("UTC".into())))
+            }
+            DataType::Struct(fields) => {
+                let fixed: Vec<_> = fields.iter().map(fix_field).collect();
+                fields
+                    .iter()
+                    .zip(&fixed)
+                    .any(|(a, b)| a != b)
+                    .then(|| DataType::Struct(fixed.into()))
+            }
+            DataType::List(f) => (fix_field(f) != *f).then(|| DataType::List(fix_field(f))),
+            DataType::LargeList(f) => {
+                (fix_field(f) != *f).then(|| DataType::LargeList(fix_field(f)))
+            }
+            DataType::Map(f, sorted) => {
+                (fix_field(f) != *f).then(|| DataType::Map(fix_field(f), *sorted))
+            }
+            DataType::Union(fields, mode) => {
+                let fixed: Vec<_> = fields.iter().map(|(id, f)| (id, fix_field(f))).collect();
+                fields
+                    .iter()
+                    .zip(&fixed)
+                    .any(|((_, a), (_, b))| a != b)
+                    .then(|| {
+                        DataType::Union(
+                            fixed.iter().map(|(id, f)| (*id, f.clone())).collect(),
+                            *mode,
+                        )
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    fn fix_field(field: &arrow_schema::FieldRef) -> arrow_schema::FieldRef {
+        match fix(field.data_type()) {
+            Some(dt) => Arc::new(
+                Field::new(field.name(), dt, field.is_nullable())
+                    .with_metadata(field.metadata().clone()),
+            ),
+            None => field.clone(),
+        }
+    }
+
+    let fields: Vec<_> = schema.fields().iter().map(fix_field).collect();
+    arrow_schema::Schema::new_with_metadata(fields, schema.metadata().clone())
+}
 
 pub fn prepend_meta_fields(schema: SchemaRef) -> Result<Schema> {
     let meta_field_schema = MetaField::schema();

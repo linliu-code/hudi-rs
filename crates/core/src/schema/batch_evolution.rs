@@ -252,6 +252,12 @@ fn is_container(dt: &DataType) -> bool {
 /// * no default on a non-nullable field → a loud error, as Java throws
 ///   `SchemaCompatibilityException`.
 ///
+/// One deliberate divergence: Java tests `defaultVal() instanceof JsonProperties.Null`
+/// FIRST and puts `null` unconditionally, so an explicit `"default": null` on a
+/// non-nullable field writes a null into a non-nullable Avro slot. That schema is
+/// invalid Avro in the first place; here it is an error, which is the safer of the
+/// two and cannot mask a genuine schema mistake.
+///
 /// `what` names the level for the message ("column" / "struct child").
 fn fill_absent_field(target_field: &FieldRef, len: usize, what: &str) -> Result<ArrayRef> {
     let default_json = target_field.metadata().get(AVRO_FIELD_DEFAULT_KEY);
@@ -349,7 +355,8 @@ fn constant_array_from_avro_default(
         }
         other => {
             return Err(CoreError::Schema(format!(
-                "evolution: '{name}' is absent and its Avro default {value} cannot be                  materialised for type {other}"
+                "evolution: '{name}' is absent and its Avro default {value} cannot be \
+                 materialised for type {other}"
             )));
         }
     };
@@ -611,7 +618,9 @@ pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<Ar
         (DataType::Union(sfields, smode), DataType::Union(tfields, tmode)) => {
             if *smode != UnionMode::Dense || *tmode != UnionMode::Dense {
                 return Err(CoreError::Schema(format!(
-                    "evolution: union '{}' is {smode:?} -> {tmode:?}; only dense unions are                      evolved (arrow-avro emits dense, and a sparse layout would need a                      different rebuild)",
+                    "evolution: union '{}' is {smode:?} -> {tmode:?}; only dense unions \
+                     are evolved (arrow-avro emits dense, and a sparse layout would need \
+                     a different rebuild)",
                     target_field.name()
                 )));
             }
@@ -642,7 +651,8 @@ pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<Ar
                     .find(|(_, tf)| tf.name() == sf.name())
                     .ok_or_else(|| {
                         CoreError::Schema(format!(
-                            "evolution: union '{}' branch '{}' has no branch of that name in                              the target union",
+                            "evolution: union '{}' branch '{}' has no branch of that \
+                             name in the target union",
                             target_field.name(),
                             sf.name()
                         ))
@@ -672,12 +682,15 @@ pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<Ar
             let type_ids: arrow_buffer::ScalarBuffer<i8> = ua
                 .type_ids()
                 .iter()
-                .map(|sid| remap.get(sid).map(|(tid, _)| *tid).ok_or_else(|| {
-                    CoreError::Schema(format!(
-                        "evolution: union '{}' holds type id {sid} that its own schema does                          not declare",
-                        target_field.name()
-                    ))
-                }))
+                .map(|sid| {
+                    remap.get(sid).map(|(tid, _)| *tid).ok_or_else(|| {
+                        CoreError::Schema(format!(
+                            "evolution: union '{}' holds type id {sid} that its own schema \
+                         does not declare",
+                            target_field.name()
+                        ))
+                    })
+                })
                 .collect::<Result<Vec<i8>>>()?
                 .into();
 

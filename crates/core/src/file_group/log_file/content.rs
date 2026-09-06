@@ -382,14 +382,30 @@ impl Decoder {
                     // path now supplies a reader schema this line is on it — a
                     // `todo!()` here would be a panic at the JNI boundary, not an
                     // error.
-                    let required_arrow =
+                    //
+                    // Both targets go through `normalize_utc_timezone_spelling`
+                    // for the same reason `prepare_required_schema` does: they
+                    // come off the arrow-avro decoder, which spells a UTC zone
+                    // `+00:00`, and they have to agree with `required_schema` and
+                    // with the base batches, which spell it `UTC`. Arrow compares
+                    // timezones as strings, so without this a log batch and a
+                    // base batch of the same table are judged to have different
+                    // types.
+                    let required_converted =
                         crate::ffi_support::arrow_schema_from_avro_json(required_json)?;
+                    let required_arrow: Arc<Schema> = Arc::new(
+                        crate::schema::normalize_utc_timezone_spelling(&required_converted),
+                    );
                     let resolved = AvroBlockDecoder::try_new_with_registered(
                         &self.registered_for(writer_schema_json)?,
                         Some(required_json),
                         1,
                     )
-                    .map(|decoder| decoder.schema())
+                    .map(|decoder| -> Arc<Schema> {
+                        Arc::new(crate::schema::normalize_utc_timezone_spelling(
+                            &decoder.schema(),
+                        ))
+                    })
                     .inspect_err(|e| {
                         log::debug!(
                             "log block rewrite has no resolved schema to take defaults from \
@@ -699,7 +715,7 @@ mod tests {
     use apache_avro::types::Record as AvroRecord;
     use apache_avro::types::Value as AvroValue;
     use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use parquet::arrow::ArrowWriter;
     use std::io::{BufReader, Cursor};
     use std::sync::Arc;
@@ -1404,5 +1420,66 @@ mod tests {
                 &header,
             )
             .expect("the same block without a predicate decodes");
+    }
+
+    /// The log rewrite path's targets must spell a UTC timestamp zone `UTC`, not
+    /// `+00:00`.
+    ///
+    /// Both targets come off the arrow-avro decoder, which spells that zone as
+    /// the offset, while `required_schema` and every parquet-derived base batch
+    /// spell it `UTC`. Arrow compares timezones as strings, so a target left
+    /// unnormalised makes a log batch and a base batch of the same table
+    /// disagree by type. The rewrite branch is selected by giving the reader
+    /// schema one more field than the writer's, which is what Java's
+    /// `recordNeedsRewriteForExtendedAvroTypePromotion` keys on
+    /// (`HoodieAvroUtils.java:1461`).
+    #[test]
+    fn the_log_rewrite_targets_spell_a_utc_timestamp_zone_utc() -> Result<()> {
+        let writer_schema_json = r#"{
+            "type": "record",
+            "name": "TzRecord",
+            "fields": [
+                {"name": "id", "type": "long"},
+                {"name": "ts", "type": {"type": "long", "logicalType": "timestamp-micros"}}
+            ]
+        }"#;
+        // One extra field, so `record_needs_rewrite_for_extended_promotion` is
+        // true and the decoder takes the rewrite branch rather than resolving.
+        let reader_schema_json = r#"{
+            "type": "record",
+            "name": "TzRecord",
+            "fields": [
+                {"name": "id", "type": "long"},
+                {"name": "ts", "type": {"type": "long", "logicalType": "timestamp-micros"}},
+                {"name": "added", "type": ["null", "string"], "default": null}
+            ]
+        }"#;
+
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(reader_schema_json.to_string()));
+        let avro = decoder.avro_decoder_for(writer_schema_json, &HashMap::new())?;
+
+        let targets = avro.rewrite_targets();
+        assert_eq!(
+            targets.len(),
+            2,
+            "the rewrite runs through the resolved schema and then the required one"
+        );
+        for (i, target) in targets.iter().enumerate() {
+            let ts = target.field_with_name("ts").expect("ts field");
+            assert_eq!(
+                ts.data_type(),
+                &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                "rewrite target {i} must spell the zone `UTC`, got {:?}",
+                ts.data_type()
+            );
+        }
+        // The resolved target is the one that carries the Avro defaults; the
+        // required target is the plain conversion. Both are normalised.
+        assert!(
+            targets[0].field_with_name("added").is_ok(),
+            "the resolved target carries the reader-only field"
+        );
+        Ok(())
     }
 }
