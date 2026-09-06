@@ -101,6 +101,74 @@ pub struct FileGroupReaderSchemaHandler {
     pub reader_schema_json: Option<String>,
 }
 
+/// Rewrite every `+00:00`-spelled timestamp zone as `UTC`, recursively.
+///
+/// The two converters disagree on the spelling of the same zone: `avro_to_arrow`
+/// (and the parquet reader) write `UTC`, `arrow-avro` writes the offset `+00:00`.
+/// Arrow compares timezones as strings, so a required schema spelled one way and
+/// a base batch spelled the other are judged to have different types. The log
+/// decoder already normalises its batches the same way
+/// (`log_file::avro::normalize_utc_timestamps`); this keeps the required schema
+/// on that side of the disagreement, so switching this conversion to the decoder
+/// route changed which schemas can be converted and nothing else.
+fn normalize_utc_timezone_spelling(schema: &arrow_schema::Schema) -> arrow_schema::Schema {
+    use arrow_schema::{DataType, Field};
+
+    fn is_utc_alias(tz: &str) -> bool {
+        matches!(tz, "+00:00" | "+0000" | "00:00" | "Z" | "z")
+    }
+
+    fn fix(dt: &DataType) -> Option<DataType> {
+        match dt {
+            DataType::Timestamp(unit, Some(tz)) if is_utc_alias(tz) => {
+                Some(DataType::Timestamp(*unit, Some("UTC".into())))
+            }
+            DataType::Struct(fields) => {
+                let fixed: Vec<_> = fields.iter().map(fix_field).collect();
+                fields
+                    .iter()
+                    .zip(&fixed)
+                    .any(|(a, b)| a != b)
+                    .then(|| DataType::Struct(fixed.into()))
+            }
+            DataType::List(f) => (fix_field(f) != *f).then(|| DataType::List(fix_field(f))),
+            DataType::LargeList(f) => {
+                (fix_field(f) != *f).then(|| DataType::LargeList(fix_field(f)))
+            }
+            DataType::Map(f, sorted) => {
+                (fix_field(f) != *f).then(|| DataType::Map(fix_field(f), *sorted))
+            }
+            DataType::Union(fields, mode) => {
+                let fixed: Vec<_> = fields.iter().map(|(id, f)| (id, fix_field(f))).collect();
+                fields
+                    .iter()
+                    .zip(&fixed)
+                    .any(|((_, a), (_, b))| a != b)
+                    .then(|| {
+                        DataType::Union(
+                            fixed.iter().map(|(id, f)| (*id, f.clone())).collect(),
+                            *mode,
+                        )
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    fn fix_field(field: &arrow_schema::FieldRef) -> arrow_schema::FieldRef {
+        match fix(field.data_type()) {
+            Some(dt) => Arc::new(
+                Field::new(field.name(), dt, field.is_nullable())
+                    .with_metadata(field.metadata().clone()),
+            ),
+            None => field.clone(),
+        }
+    }
+
+    let fields: Vec<_> = schema.fields().iter().map(fix_field).collect();
+    arrow_schema::Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
 impl FileGroupReaderSchemaHandler {
     pub fn new() -> Self {
         Self::default()
@@ -404,7 +472,15 @@ impl FileGroupReaderSchemaHandler {
                      (data/requested JSONs were provided): {e}"
                     ))
                 })?;
-            let arrow = crate::schema::resolver::avro_json_to_arrow_schema(&required_json)
+            // Through the arrow-avro decoder, not `resolver::avro_json_to_arrow_schema`
+            // -> `avro_to_arrow`: the latter still `todo!()`s on `AvroSchema::Ref`
+            // (OI-10) and the metadata table's own record schema is full of them —
+            // `ColumnStatsMetadata.maxValue` references the wrapper records that
+            // `minValue` defines. It is also the conversion the FFI boundary and
+            // the HFile base-file reader already use, so the required schema here
+            // and the schema a resolved decode emits cannot drift.
+            let arrow = crate::ffi_support::arrow_schema_from_avro_json(&required_json)
+                .map(|schema| normalize_utc_timezone_spelling(&schema))
                 .map_err(|e| {
                     crate::error::CoreError::Schema(format!(
                         "required avro json -> arrow failed on the FFI path: {e}"

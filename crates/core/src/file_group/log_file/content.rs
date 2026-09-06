@@ -30,7 +30,6 @@ use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::delete_record_list_schema_json;
 use crate::schema::extended_promotion::record_needs_rewrite_for_extended_promotion;
 use crate::schema::parquet_list_norm::normalize_parquet_metadata;
-use crate::schema::resolver::avro_json_to_arrow_schema;
 use crate::storage::RowFilterBuilder;
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -296,6 +295,23 @@ impl Decoder {
         Ok(())
     }
 
+    /// The registration for `writer_schema_json`, built once per writer schema
+    /// rather than once per block. Compared, not hashed: a block with a
+    /// different schema must not reuse another's fingerprint. One entry, since
+    /// a log file normally carries one schema and a file that alternates simply
+    /// re-registers rather than growing a map.
+    fn registered_for(&self, writer_schema_json: &str) -> Result<RegisteredWriterSchema> {
+        let mut slot = self.registered.borrow_mut();
+        match slot.as_ref() {
+            Some((json, reg)) if json == writer_schema_json => Ok(reg.clone()),
+            _ => {
+                let reg = RegisteredWriterSchema::new(writer_schema_json)?;
+                *slot = Some((writer_schema_json.to_string(), reg.clone()));
+                Ok(reg)
+            }
+        }
+    }
+
     /// A decoder for records written with `writer_schema_json`, resolved up to
     /// the reader schema when the block's header permits it.
     ///
@@ -342,8 +358,46 @@ impl Decoder {
                         "log block rewritten rather than resolved: its schema differs from the \
                          table's in a way Avro does not define a promotion for"
                     );
-                    let target = avro_json_to_arrow_schema(required_json)?;
-                    (None, Some(Arc::new(target)))
+                    // Java's rewrite (`HoodieAvroUtils.rewriteRecordWithNewSchema`,
+                    // reached from `HoodieAvroDataBlock:196`) fills a reader field the
+                    // writer never wrote from that field's Avro DEFAULT. Nothing in
+                    // an Arrow schema converted from a reader schema alone says what
+                    // that default is — `arrow-avro` records it only on a schema it
+                    // produced by RESOLVING writer against reader. So the rewrite
+                    // goes through the resolved schema first, which carries the
+                    // defaults and the reader's union branches, and then through the
+                    // plain required schema, which is what the merge downstream
+                    // expects (the two differ only by that metadata, so the second
+                    // step converts nothing).
+                    //
+                    // Resolution the writer's schema cannot support is exactly the
+                    // case this branch exists for, so a resolved schema that cannot
+                    // be built is not an error: the rewrite then runs as it always
+                    // did, straight to the required schema.
+                    //
+                    // Through the arrow-avro decoder rather than
+                    // `resolver::avro_json_to_arrow_schema` -> `avro_to_arrow`, which
+                    // still `todo!()`s on `AvroSchema::Ref` (OI-10). The metadata
+                    // table's own record schema is full of refs, and since the JNI
+                    // path now supplies a reader schema this line is on it — a
+                    // `todo!()` here would be a panic at the JNI boundary, not an
+                    // error.
+                    let required_arrow =
+                        crate::ffi_support::arrow_schema_from_avro_json(required_json)?;
+                    let resolved = AvroBlockDecoder::try_new_with_registered(
+                        &self.registered_for(writer_schema_json)?,
+                        Some(required_json),
+                        1,
+                    )
+                    .map(|decoder| decoder.schema())
+                    .inspect_err(|e| {
+                        log::debug!(
+                            "log block rewrite has no resolved schema to take defaults from \
+                             ({e}); rewriting straight to the required schema"
+                        );
+                    })
+                    .ok();
+                    (None, Some((resolved, required_arrow)))
                 } else {
                     (Some(required_json), None)
                 }
@@ -351,28 +405,17 @@ impl Decoder {
             None => (None, None),
         };
 
-        // Registered once per writer schema rather than once per block. Compared,
-        // not hashed: a block with a different schema must not reuse another's
-        // fingerprint. One entry, since a log file normally carries one schema and
-        // a file that alternates simply re-registers rather than growing a map.
-        let registered = {
-            let mut slot = self.registered.borrow_mut();
-            match slot.as_ref() {
-                Some((json, reg)) if json == writer_schema_json => reg.clone(),
-                _ => {
-                    let reg = RegisteredWriterSchema::new(writer_schema_json)?;
-                    *slot = Some((writer_schema_json.to_string(), reg.clone()));
-                    reg
-                }
-            }
-        };
+        let registered = self.registered_for(writer_schema_json)?;
         let mut decoder = AvroBlockDecoder::try_new_with_registered(
             &registered,
             reader_schema_json,
             self.batch_size,
         )?;
-        if let Some(rewrite_to) = rewrite_to {
-            decoder = decoder.with_rewrite_to(rewrite_to);
+        if let Some((resolved, required_arrow)) = rewrite_to {
+            if let Some(resolved) = resolved {
+                decoder = decoder.with_rewrite_to(resolved);
+            }
+            decoder = decoder.with_rewrite_to(required_arrow);
         }
         Ok(decoder)
     }

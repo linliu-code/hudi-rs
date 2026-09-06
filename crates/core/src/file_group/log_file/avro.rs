@@ -60,9 +60,9 @@ pub struct AvroBlockDecoder {
     prefix: [u8; 10],
     /// Reused across records so framing costs one copy, not one allocation.
     framed: Vec<u8>,
-    /// When set, each batch is projected to this schema after decoding. See
-    /// [`AvroBlockDecoder::with_rewrite_to`].
-    rewrite_to: Option<SchemaRef>,
+    /// Schemas each decoded batch is projected through, in order, after
+    /// decoding. See [`AvroBlockDecoder::with_rewrite_to`].
+    rewrite_to: Vec<SchemaRef>,
 }
 
 /// A writer schema that has been parsed and fingerprinted once.
@@ -168,7 +168,7 @@ impl AvroBlockDecoder {
             batch_size,
             prefix,
             framed: Vec::new(),
-            rewrite_to: None,
+            rewrite_to: Vec::new(),
         })
     }
 
@@ -190,8 +190,14 @@ impl AvroBlockDecoder {
     /// converted afterwards. Mirrors what the Java reader does when
     /// `recordNeedsRewriteForExtendedAvroTypePromotion` says so: read
     /// writer-to-writer, then promote.
+    ///
+    /// Called more than once, the schemas apply in the order they were added.
+    /// That is how a rewrite reaches a schema whose Avro DEFAULTS it needs:
+    /// `arrow-avro` records a field's default only on a schema it produced by
+    /// resolving, so the resolved schema goes first and carries the defaults,
+    /// and the caller's own target follows to strip the metadata back off.
     pub fn with_rewrite_to(mut self, schema: SchemaRef) -> Self {
-        self.rewrite_to = Some(schema);
+        self.rewrite_to.push(schema);
         self
     }
 
@@ -235,12 +241,13 @@ impl AvroBlockDecoder {
             CoreError::LogBlockError(format!("Failed to flush decoded records: {e}"))
         })?;
         let batch = batch.map(normalize_utc_timestamps).transpose()?;
-        match (batch, self.rewrite_to.as_ref()) {
-            (Some(batch), Some(target)) => {
-                crate::schema::batch_evolution::project_batch_to_schema(&batch, target).map(Some)
-            }
-            (batch, _) => Ok(batch),
+        let Some(mut batch) = batch else {
+            return Ok(None);
+        };
+        for target in &self.rewrite_to {
+            batch = crate::schema::batch_evolution::project_batch_to_schema(&batch, target)?;
         }
+        Ok(Some(batch))
     }
 }
 

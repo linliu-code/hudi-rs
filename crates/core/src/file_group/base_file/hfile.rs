@@ -42,6 +42,20 @@ const DECODE_BATCH_SIZE: usize = 1024;
 /// Only reached if a reader reports no budget, which a ranged reader always does.
 const DEFAULT_WINDOW_BUDGET_FALLBACK: u64 = 16 * 1024 * 1024;
 
+/// Everything a window needs to rebuild its own Avro decoder.
+///
+/// The registration and the reader schema always travel together — a rebuilt
+/// decoder that dropped the reader schema would decode the next window in the
+/// writer's shape and disagree with the stream's declared schema — so they are
+/// carried as one.
+#[derive(Debug, Clone)]
+struct DecoderRecipe {
+    registered: RegisteredWriterSchema,
+    /// `None` when the file's writer schema already is the reader schema; see
+    /// [`HFileBaseFileReader::decoded_schema`].
+    reader_schema_json: Option<String>,
+}
+
 /// Reads HFile base files.
 #[derive(Debug)]
 pub struct HFileBaseFileReader {
@@ -53,12 +67,24 @@ impl HFileBaseFileReader {
         Self { storage }
     }
 
-    /// The record schema an HFile was written with, as Avro JSON and as Arrow.
+    /// The record schema an HFile's values decode to, as Arrow, plus the decoder
+    /// and the registration that produce it.
     ///
     /// An HFile stores each value Avro-encoded and carries the schema it used in
     /// its own file info. Decoding against that is what makes a base file and a
     /// log block of the same table yield the same columns, which is the whole
     /// reason they can merge; handing the value on as bytes does not.
+    ///
+    /// `reader_schema_json` is Avro's READER schema, when the caller has one: the
+    /// values are then resolved to it as they decode, exactly as Java's
+    /// `GenericDatumReader(writerSchema, readerSchema)` does
+    /// (`HoodieNativeAvroHFileReader:453`) — union branches matched by full name,
+    /// reader-only fields filled from their declared defaults. The returned Arrow
+    /// schema is the resolved one, so the read that follows is already in the
+    /// shape the caller asked for. A reader schema equal to the file's own writer
+    /// schema is dropped rather than honoured: it would resolve to itself, and
+    /// building a decoder with a reader schema costs about 380us against 154us
+    /// without.
     ///
     /// The decoder and the registration come back rather than being dropped, because
     /// building a decoder is the dominant cost of reading a small HFile: `arrow_avro`
@@ -70,7 +96,13 @@ impl HFileBaseFileReader {
     fn decoded_schema(
         reader: &HFileReader,
         relative_path: &str,
-    ) -> Result<(SchemaRef, AvroBlockDecoder, RegisteredWriterSchema)> {
+        reader_schema_json: Option<&str>,
+    ) -> Result<(
+        SchemaRef,
+        AvroBlockDecoder,
+        RegisteredWriterSchema,
+        Option<String>,
+    )> {
         let json = reader
             .avro_schema_json()
             .map_err(|e| {
@@ -84,16 +116,24 @@ impl HFileBaseFileReader {
                 ))
             })?
             .to_string();
+        // Resolution the file does not need is resolution nobody should pay for:
+        // a table written by the reader's own release hands back its own schema.
+        let reader_schema_json: Option<String> = reader_schema_json
+            .filter(|reader_json| *reader_json != json)
+            .map(str::to_string);
         // The schema comes from the decoder, not from converting the Avro JSON:
         // `avro_to_arrow` does not handle named-type references, and the metadata
         // table's record schema uses them.
         let registered = RegisteredWriterSchema::new(&json)
             .map_err(|e| StorageError::Creation(format!("{e}")))?;
-        let decoder =
-            AvroBlockDecoder::try_new_with_registered(&registered, None, DECODE_BATCH_SIZE)
-                .map_err(|e| StorageError::Creation(format!("{e}")))?;
+        let decoder = AvroBlockDecoder::try_new_with_registered(
+            &registered,
+            reader_schema_json.as_deref(),
+            DECODE_BATCH_SIZE,
+        )
+        .map_err(|e| StorageError::Creation(format!("{e}")))?;
         let schema = decoder.schema();
-        Ok((schema, decoder, registered))
+        Ok((schema, decoder, registered, reader_schema_json))
     }
 
     /// The projected schema, or an error naming a column the file does not have.
@@ -179,7 +219,15 @@ impl HFileBaseFileReader {
             ));
         }
 
-        let (full_schema, decoder, registered) = Self::decoded_schema(&reader, relative_path)?;
+        let (full_schema, decoder, registered, reader_schema_json) = Self::decoded_schema(
+            &reader,
+            relative_path,
+            options.reader_schema_json.as_deref(),
+        )?;
+        let recipe = DecoderRecipe {
+            registered,
+            reader_schema_json,
+        };
         let schema = Self::project(&full_schema, options.projection.as_deref())?;
         let projection: Option<Vec<String>> =
             options.projection.as_ref().map(|names| names.to_vec());
@@ -211,7 +259,7 @@ impl HFileBaseFileReader {
                 // flush (arrow-rs#10876), so carrying one across a window boundary
                 // would decode the next window against stale offsets.
                 Some(decoder),
-                registered,
+                recipe,
                 false,
             ),
             |(
@@ -221,7 +269,7 @@ impl HFileBaseFileReader {
                 projection,
                 key_predicate,
                 decoder,
-                registered,
+                recipe,
                 failed,
             )| async move {
                 // Sticky: once a window fails the read is not whole, so no
@@ -237,7 +285,7 @@ impl HFileBaseFileReader {
                     projection.as_deref(),
                     key_predicate.as_ref(),
                     decoder,
-                    &registered,
+                    &recipe,
                 )
                 .await;
                 let failed = item.is_err();
@@ -250,7 +298,7 @@ impl HFileBaseFileReader {
                         projection,
                         key_predicate,
                         None,
-                        registered,
+                        recipe,
                         failed,
                     ),
                 ))
@@ -322,7 +370,7 @@ async fn decode_window(
     projection: Option<&[String]>,
     key_predicate: Option<&KeyPredicate>,
     decoder: Option<AvroBlockDecoder>,
-    registered: &RegisteredWriterSchema,
+    recipe: &DecoderRecipe,
 ) -> Result<RecordBatch> {
     let mut records = reader
         .read_records_batched(window)
@@ -352,8 +400,12 @@ async fn decode_window(
     // half of the cost and is immutable.
     let mut decoder = match decoder {
         Some(decoder) => decoder,
-        None => AvroBlockDecoder::try_new_with_registered(registered, None, DECODE_BATCH_SIZE)
-            .map_err(|e| StorageError::Creation(format!("{e}")))?,
+        None => AvroBlockDecoder::try_new_with_registered(
+            &recipe.registered,
+            recipe.reader_schema_json.as_deref(),
+            DECODE_BATCH_SIZE,
+        )
+        .map_err(|e| StorageError::Creation(format!("{e}")))?,
     };
     let mut batches: Vec<RecordBatch> = Vec::new();
     for record in &records {
@@ -2041,5 +2093,107 @@ mod tests {
             "every bloom-filter record must carry a non-empty filter buffer"
         );
         Ok(())
+    }
+
+    /// `decoded_schema` resolves to the caller's Avro reader schema, and skips
+    /// it when the file was written with that very schema.
+    ///
+    /// The v6 metadata-table fixture is the pair that makes the difference
+    /// visible: its `HoodieMetadataRecord` predates `SecondaryIndexMetadata`,
+    /// `ColumnStatsMetadata.isTightBound`/`valueType`,
+    /// `recordIndexMetadata.position` and two union branches. Read against the
+    /// current schema it must come out with ALL of them — that is what Java's
+    /// `GenericDatumReader(writerSchema, readerSchema)` gives — and read against
+    /// its own schema it must not pay for a resolution that resolves nothing.
+    #[test]
+    fn decoded_schema_resolves_to_the_reader_schema_and_skips_an_identical_one() {
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR").replace("/core", "/test"))
+            .join("data/metadata_v6_record_index");
+        let table = hudi_test::extract_test_table(&fixture_dir.join("v6_record_index_014.zip"))
+            .join("v6_record_index_014");
+        let name = "record-index-0005-0_4-1636-3849_20260505162917195001.hfile";
+        let bytes = std::fs::read(table.join("record_index").join(name)).expect("read v6 hfile");
+        let reader = crate::hfile::HFileReader::new(bytes).expect("parse v6 hfile");
+        let writer_json = reader
+            .avro_schema_json()
+            .expect("read the writer schema")
+            .expect("a v6 MDT hfile carries one")
+            .to_string();
+        let reader_json =
+            std::fs::read_to_string(fixture_dir.join("HoodieMetadataRecord-with-meta-fields.avsc"))
+                .expect("read the current HoodieMetadataRecord schema");
+        let reader_json = reader_json.trim();
+        assert_ne!(
+            writer_json, reader_json,
+            "the fixture must actually be schema-evolved"
+        );
+
+        // Writer schema only: the file's own eleven fields.
+        let (writer_schema, _, _, none_kept) =
+            HFileBaseFileReader::decoded_schema(&reader, name, None).unwrap();
+        assert!(none_kept.is_none());
+        let writer_names: Vec<&str> = writer_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            !writer_names.contains(&"SecondaryIndexMetadata"),
+            "the v6 writer schema has no SecondaryIndexMetadata; got {writer_names:?}"
+        );
+
+        // Resolved: the reader schema's field set, including what the writer
+        // never wrote.
+        let (resolved, _, _, kept) =
+            HFileBaseFileReader::decoded_schema(&reader, name, Some(reader_json)).unwrap();
+        assert_eq!(
+            kept.as_deref(),
+            Some(reader_json),
+            "a reader schema that differs must be honoured"
+        );
+        let resolved_names: Vec<&str> = resolved
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            resolved_names.contains(&"SecondaryIndexMetadata"),
+            "the resolved schema must carry the reader's added column; got {resolved_names:?}"
+        );
+        let arrow_schema::DataType::Struct(cs) = resolved
+            .field_with_name("ColumnStatsMetadata")
+            .unwrap()
+            .data_type()
+            .clone()
+        else {
+            panic!("ColumnStatsMetadata is not a struct");
+        };
+        let min_value: &arrow_schema::FieldRef = cs
+            .iter()
+            .find(|f: &&arrow_schema::FieldRef| f.name() == "minValue")
+            .expect("minValue");
+        let arrow_schema::DataType::Union(branches, _) = min_value.data_type() else {
+            panic!("minValue is not a union");
+        };
+        assert_eq!(
+            branches.len(),
+            14,
+            "the resolved union carries the reader schema's branches"
+        );
+        assert!(
+            cs.iter()
+                .any(|f: &arrow_schema::FieldRef| f.name() == "isTightBound"),
+            "isTightBound arrives from its Avro default"
+        );
+
+        // The cost gate: a reader schema that IS the writer schema is dropped,
+        // so no decoder pays for a resolution that resolves nothing.
+        let (same, _, _, dropped) =
+            HFileBaseFileReader::decoded_schema(&reader, name, Some(&writer_json)).unwrap();
+        assert!(
+            dropped.is_none(),
+            "a reader schema equal to the writer schema must be dropped"
+        );
+        assert_eq!(same, writer_schema);
     }
 }

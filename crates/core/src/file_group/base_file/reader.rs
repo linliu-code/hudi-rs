@@ -142,6 +142,24 @@ pub struct BaseFileReadOptions {
     /// one: pruning removes base rows before a log merge could have updated them
     /// into a match. The caller installs it only when that cannot happen.
     pub row_group_selector: Option<RowGroupSelector>,
+    /// Avro JSON of the schema the file's records must be RESOLVED to as they
+    /// are decoded — Avro's reader schema, against the file's own writer schema.
+    ///
+    /// This is what Java does for every metadata-table read
+    /// (`GenericDatumReader(writerSchema, readerSchema)` in
+    /// `HoodieNativeAvroHFileReader`): a union branch is matched by its full
+    /// name rather than by position, and a reader field the writer never wrote
+    /// arrives from its declared Avro default. Neither is expressible after the
+    /// fact in Arrow, which is why it has to be handed to the decoder rather
+    /// than applied to the decoded batch.
+    ///
+    /// Only the HFile reader honors this; Parquet and Lance ignore it (their
+    /// files carry no Avro writer schema to resolve from). When it is `None`,
+    /// or when it is the file's own writer schema verbatim, the file is decoded
+    /// exactly as before — building a decoder WITH a reader schema costs about
+    /// 380us against 154us without, per batch rebuild, so the identical case is
+    /// not made to pay for it.
+    pub reader_schema_json: Option<String>,
 }
 
 // `row_filter` holds a closure, which has no `Debug`. Report whether one is set
@@ -156,6 +174,7 @@ impl std::fmt::Debug for BaseFileReadOptions {
             .field("row_filter", &self.row_filter.is_some())
             .field("row_index_column", &self.row_index_column)
             .field("row_group_selector", &self.row_group_selector.is_some())
+            .field("reader_schema_json", &self.reader_schema_json.is_some())
             .finish()
     }
 }
@@ -200,6 +219,13 @@ impl BaseFileReadOptions {
     /// Sets the known base-file size in bytes.
     pub fn with_known_file_size(mut self, size: u64) -> Self {
         self.known_file_size = Some(size);
+        self
+    }
+
+    /// Resolves the file's records to `reader_schema_json` as they are decoded.
+    /// See [`Self::reader_schema_json`].
+    pub fn with_reader_schema_json(mut self, reader_schema_json: impl Into<String>) -> Self {
+        self.reader_schema_json = Some(reader_schema_json.into());
         self
     }
 
@@ -280,14 +306,20 @@ pub trait BaseFileReader: Send + Sync {
     /// metadata alone should override it: the caller wants the schema in order to
     /// decide what to read next, so the read that follows is a second open, and
     /// only the override keeps this one from setting up a decode nobody polls.
+    ///
+    /// `options` is the same options the read that follows will use, because the
+    /// answer depends on them: with a
+    /// [`reader_schema_json`](BaseFileReadOptions::reader_schema_json) the HFile
+    /// reader reports the RESOLVED schema, which is the one its batches will
+    /// carry. Only the fields that shape the schema are consulted; a projection
+    /// or a predicate here changes nothing.
     fn read_schema<'a>(
         &'a self,
         relative_path: &'a str,
+        options: BaseFileReadOptions,
     ) -> BoxFuture<'a, Result<arrow_schema::SchemaRef>> {
         Box::pin(async move {
-            let stream = self
-                .read_stream(relative_path, BaseFileReadOptions::new())
-                .await?;
+            let stream = self.read_stream(relative_path, options).await?;
             Ok(stream.schema().clone())
         })
     }
