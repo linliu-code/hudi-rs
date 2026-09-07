@@ -192,10 +192,12 @@ jni-jar: jni-lib ## Package the staged library as hudi-jni-native-<version>-<os>
 jni-jar-multi: jni-lib ## Package this arch's library plus JNI_EXTRA_NATIVE_DIR (native/<os>-<arch>/libhudi_jni.so from other legs) as ONE jar
 	test -n "$(JNI_EXTRA_NATIVE_DIR)" || { echo "JNI_EXTRA_NATIVE_DIR is required"; exit 2; }
 	cp -r $(JNI_EXTRA_NATIVE_DIR)/native/. $(JNI_STAGE)/native/
-	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\narch=%s\n' "$$(git rev-parse HEAD)" \
+	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\n' "$$(git rev-parse HEAD)" \
 	  "$$(grep -o 'JNI_ABI_VERSION: u32 = [0-9]*' crates/jni/src/lib.rs | grep -o '[0-9]*$$')" \
-	  "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$(ls $(JNI_STAGE)/native | paste -sd,)" > $(JNI_STAGE)/META-INF/hudi-jni-native.properties
-	for d in $(JNI_STAGE)/native/*; do printf 'md5.%s=%s\n' "$$(basename $$d)" "$$(md5sum $$d/libhudi_jni.so | cut -d' ' -f1)" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties; done
+	  "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" > $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+	archs=""; for a in x86_64 aarch64; do [ -d $(JNI_STAGE)/native/linux-$$a ] && archs="$${archs:+$$archs,}linux-$$a"; done; \
+	  printf 'arch=%s\n' "$$archs" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+	for a in x86_64 aarch64; do [ -d $(JNI_STAGE)/native/linux-$$a ] && printf 'md5.linux-%s=%s\n' "$$a" "$$(md5sum $(JNI_STAGE)/native/linux-$$a/libhudi_jni.so | cut -d' ' -f1)" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties; done
 	rm -f $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar && jar cf $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar -C $(JNI_STAGE) . && unzip -l $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar
 
 .PHONY: jni-deploy

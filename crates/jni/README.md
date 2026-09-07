@@ -135,6 +135,10 @@ md5.linux-aarch64=<md5 of native/linux-aarch64/libhudi_jni.so>
 ```
 
 (the single-arch jar's properties file keeps its original shape — see "Make targets" below.)
+The `x86_64` then `aarch64` order is fixed — both the workflow's `package` job and
+`jni-jar-multi` iterate the two arches in that same order (only the ones actually present), so
+`arch=` and the `md5.linux-<arch>=` lines always come out identical between CI and a local
+build, whichever arch this machine's `jni-lib` staged first.
 
 ### Consumer side (hudi-internal)
 
