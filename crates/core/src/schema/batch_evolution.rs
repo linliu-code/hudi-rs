@@ -730,6 +730,13 @@ pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<Ar
             // source type id -> (target type id, target branch field). A source
             // branch the target does not name is a narrowing or a rename, which
             // is not legal Hudi evolution — fail rather than drop the values.
+            //
+            // Deliberate divergence from Java, recorded as OI-61(b): Java's
+            // `HoodieAvroUtils.rewriteRecordWithNewSchema` refuses a narrowed union
+            // per ROW (rows before the offending one were already emitted); this
+            // refuses per BATCH (no row of the batch is emitted). Both are loud and
+            // neither returns wrong data — the only observable difference is where
+            // the error surfaces, which no index lookup depends on.
             let mut remap: std::collections::HashMap<i8, (i8, FieldRef)> =
                 std::collections::HashMap::with_capacity(sfields.len());
             for (sid, sf) in sfields.iter() {
