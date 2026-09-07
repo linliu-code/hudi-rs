@@ -33,13 +33,65 @@ Built as a `cdylib` (`libhudi_jni.so` on Linux). Two `Java_…` symbols:
 - `Java_org_apache_hudi_io_nativereader_NativeFileGroupReader_version` — a liveness probe for
   the loader; returns `"hudi-jni <crate version> abi=<JNI_ABI_VERSION>"`.
 
-`JNI_ABI_VERSION` (`crates/jni/src/lib.rs`) is the revision of the `Java_…` export signatures.
-It is bumped whenever the parameter list of any exported function changes. The Java side
-(`NativeFileGroupReader.REQUIRED_JNI_ABI`) refuses to load a library that reports a lower
-revision, turning a stale `libhudi_jni.so` under an up-to-date jar into a load-time error
-instead of a mis-read argument slot. The check is one-directional (`abi < REQUIRED_JNI_ABI`):
-it protects a jar that is upgraded first, never one that lags behind — **never deploy the
-library ahead of the jar; ship jar and library together.**
+`JNI_ABI_VERSION` (`crates/jni/src/lib.rs`) is the revision of the `Java_…` export contract.
+The Java side (`NativeFileGroupReader.REQUIRED_JNI_ABI`, `NativeFileGroupReader.java:56,91`)
+refuses to load a library that reports a lower revision, turning a stale `libhudi_jni.so`
+under an up-to-date jar into a load-time error instead of a mis-read argument slot. The check
+is one-directional (`abi < REQUIRED_JNI_ABI`): it protects a jar that is upgraded first, never
+one that lags behind — **never deploy the library ahead of the jar; ship jar and library
+together.**
+
+### When to bump it
+
+This is the rule, stated once; the history entries on the constant in `crates/jni/src/lib.rs`
+record which change triggered which revision.
+
+**Bump when either holds:**
+
+1. **The parameter list of any exported `Java_…` function changes** — arity, order, or types.
+   A jar built against the old list would otherwise read the wrong argument slots.
+2. **The change makes some old-jar/new-library or new-jar/old-library pairing unsafe** — i.e.
+   that pairing would produce *wrong results*, or an *unrecoverable failure where the same
+   input previously worked*. The parameter list can be untouched and this can still hold:
+   revision 3 was bumped for exactly that shape (an empty `lookupKeys` array changed from
+   "whole slice" to "match nothing", D-12; an empty `latestInstant` went from "read
+   everything" to refused, D-13), because a jar still holding the old meanings would have
+   mis-read a lookup against the new library.
+
+**Do not bump when** a change only turns a *failure* into a *correct result*, and every input
+that previously succeeded produces *byte-identical* output. Nothing a jar can be holding is
+made unsafe by that: the old jar gets strictly more working reads and identical bytes on the
+rest, and the old library gets exactly the behaviour it always had. Bumping there would break
+a deployment that works, in exchange for no protection.
+
+#### Worked example — `638ce3b`, which did **not** bump (OI-58 / RV-4)
+
+`638ce3b` ("resolve an older HFile's Avro schema up to the reader schema, as Java does")
+changed what the native side does with the *same* `dataSchemaJson` argument. Before it, the
+string only produced an Arrow projection target and was then discarded (`reader_schema_json`
+stayed `None`); after it, the same string is also retained in Avro form and becomes the reader
+schema at decode time for the base HFile and every log block, with `required_schema` replaced
+by a UTC-normalised derivation (`crates/jvm-ffi/src/file_group_v2.rs:249-263`). That is a
+changed *meaning* of an input, so rule 2 is the one to check — and it does not fire, in either
+direction:
+
+- **Old jar (pre-`638ce3b`) + new library.** For a table whose writer schema differs from the
+  reader schema (a v6 `record_index` HFile under the current `HoodieMetadataRecord`), the read
+  previously threw and now returns the correct rows — an error becoming a correct result. For
+  a table whose writer schema *equals* the reader schema, the output is byte-identical, values
+  and schema alike; that is not an argument but a test:
+  `v8_record_index_read_is_unchanged_when_the_writer_schema_is_the_reader_schema`
+  (`crates/jvm-ffi/tests/file_group_v2_tests.rs:2088`) reads every v8 `record_index` shard both
+  with the file's own schema as the requested schema and with none at all, and asserts the two
+  batches are equal. No previously-succeeding input changes.
+- **New jar + old library.** The v6 case keeps the pre-fix loud failure — unchanged, not newly
+  broken — and the v8 case is unchanged. Nothing regresses relative to what that pairing
+  already did.
+- **No caller relied on the old meaning.** `HoodieBackedTableMetadata` is the only caller of
+  this export and always passes the same constant `SCHEMA`, so nothing depended on
+  `dataSchemaJson` being discarded after projection.
+
+So `638ce3b` sits squarely in the "do not bump" case, and `JNI_ABI_VERSION` stays at 3.
 
 ## How hudi-internal loads it
 

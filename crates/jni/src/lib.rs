@@ -46,6 +46,12 @@ use jni::sys::{jboolean, jlong, jstring};
 /// jar that is upgraded first, never one that lags behind: never deploy the
 /// library ahead of the jar; ship jar and library together.
 ///
+/// The sentence above is the first clause of the rule, not all of it: a change that
+/// leaves the parameter list alone can still make a jar/library pairing unsafe, and a
+/// change that turns an error into a correct result with byte-identical output for every
+/// previously-succeeding input does not bump. The rule is stated once, with the `638ce3b`
+/// worked example, in `crates/jni/README.md` ("When to bump it").
+///
 /// History: 1 = the 7-argument `readFileGroupInto` (pre lookup-keys);
 /// 2 = `readFileGroupInto` gained `lookupKeys`, `lookupKeysArePrefixes`, `validInstants`;
 /// 3 = same parameter list, changed meaning of two inputs: an EMPTY `lookupKeys` array
