@@ -440,10 +440,10 @@ impl HFileReader {
         // The shared helper, not a second copy of it: two places building an
         // `HFileRecord` from a `KeyValue` is how the predicate path and the scan path
         // would drift on what a record key is.
-        Ok(data_block
+        data_block
             .iter()
-            .map(|kv| Self::key_value_to_record(&kv))
-            .collect())
+            .map(|kv| Ok(Self::key_value_to_record(&kv?)))
+            .collect()
     }
 
     /// The data blocks a key predicate can be satisfied from.
@@ -610,7 +610,7 @@ impl HFileReader {
             }
             let data_block = DataBlock::from_block(block);
             for kv in data_block.iter() {
-                records.push(Self::key_value_to_record(&kv));
+                records.push(Self::key_value_to_record(&kv?));
             }
         }
         Ok(records)

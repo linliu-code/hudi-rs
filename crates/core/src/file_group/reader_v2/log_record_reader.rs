@@ -41,6 +41,7 @@
 //! Drain deque via `pollLast` (tail-first) = oldest instant processed first.
 
 use crate::Result;
+use crate::error::CoreError;
 use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType, LogBlock};
 use crate::file_group::log_file::reader::LogFileReader;
 use crate::file_group::reader_v2::buffer::HoodieFileGroupRecordBuffer;
@@ -180,20 +181,47 @@ pub fn forward_scan_pass1(
     for block in all_blocks {
         total_log_blocks += 1;
 
-        // Gate 1: Corrupt blocks → skip
+        // Gate 1: Corrupt blocks → skip.
+        //
+        // This is the ONLY block a header failure is allowed to skip, and it is
+        // skipped because Java skips it: `AbstractHoodieLogRecordScanner.java:488-493`
+        // ("Ignore the corrupt blocks. No further handling is required for them"),
+        // for a block `HoodieLogFileReader.readBlock` explicitly manufactured as
+        // corrupt after failing to parse it (`HoodieLogFileReader.java:128-146`).
+        // Every other unreadable header below returns `Err` rather than skipping.
+        //
+        // At `warn`, not `debug`: a skipped block changes the row count, and a
+        // CI run under `-Pwarn-log` must carry a trace of it. (Java logs this at
+        // debug; the level is the only place hudi-rs deliberately diverges.)
         if block.block_type == BlockType::Corrupted {
-            log::debug!("[Pass1] Gate1: corrupt block #{total_log_blocks} skipped");
+            log::warn!(
+                "[Pass1] Gate1: corrupt block #{total_log_blocks} skipped (the one block type \
+                 skipped by design, matching AbstractHoodieLogRecordScanner.java:488-493)"
+            );
             total_corrupt_blocks += 1;
             continue;
         }
 
-        let instant_time = match block.instant_time() {
-            Ok(t) => t.to_string(),
-            Err(_) => {
-                log::debug!("[Pass1] block #{total_log_blocks} has no instant time, skipping");
-                continue;
-            }
-        };
+        // A non-corrupt block whose INSTANT_TIME cannot be read is a failure, not
+        // a skip. Skipping it silently drops that instant's updates (MISSING
+        // rows) or its deletes (wrong EXTRA rows), and the previous `continue`
+        // did so at `debug` level, invisible in CI. Java is loud here too: the
+        // very next thing it does with this header is
+        // `compareTimestamps(logBlock.getLogBlockHeader().get(INSTANT_TIME), GREATER_THAN, ...)`
+        // (`AbstractHoodieLogRecordScanner.java:495`, and `:293` in the v1 scan),
+        // whose predicate is `commit1.compareTo(commit2)`
+        // (`InstantComparison.java:32,37`) -- a null header value throws there.
+        let instant_time = block
+            .instant_time()
+            .map_err(|e| {
+                CoreError::LogBlockError(format!(
+                    "[Pass1] log block #{total_log_blocks} (type {:?}) has no readable instant \
+                     time: {e}. Only an explicit corrupt block may be skipped; a block whose \
+                     header cannot be read would silently change the row count.",
+                    block.block_type,
+                ))
+            })?
+            .to_string();
 
         // Gate 2: Future blocks → skip (instant > latestInstantTime)
         if block.block_type != BlockType::Command && instant_time.as_str() > latest_instant_time {
@@ -252,13 +280,28 @@ pub fn forward_scan_pass1(
             }
             BlockType::Command if block.is_rollback_block() => {
                 total_rollbacks += 1;
-                if let Ok(target) = block.target_instant_time() {
-                    let target = target.to_string();
-                    log::debug!("[Pass1] ROLLBACK: removing instant={target}");
-                    target_rollback_instants.insert(target.clone());
-                    ordered_instants_list.retain(|t| t != &target);
-                    instant_to_blocks_map.remove(&target);
-                }
+                // Same rule, and the more damaging direction: ignoring a rollback
+                // block whose TARGET_INSTANT_TIME cannot be read leaves the
+                // rolled-back instant merged into the result -- wrong EXTRA rows,
+                // from a write that was explicitly undone. Java dereferences this
+                // header unconditionally
+                // (`AbstractHoodieLogRecordScanner.java:349`,
+                // `targetInstantForCommandBlock.contentEquals(...)`), so a missing
+                // value throws there.
+                let target = block
+                    .target_instant_time()
+                    .map_err(|e| {
+                        CoreError::LogBlockError(format!(
+                            "[Pass1] rollback command block #{total_log_blocks} \
+                             (instant={instant_time}) has no readable target instant time: {e}. \
+                             Ignoring it would leave the rolled-back instant merged in."
+                        ))
+                    })?
+                    .to_string();
+                log::debug!("[Pass1] ROLLBACK: removing instant={target}");
+                target_rollback_instants.insert(target.clone());
+                ordered_instants_list.retain(|t| t != &target);
+                instant_to_blocks_map.remove(&target);
             }
             _ => {}
         }
@@ -2380,5 +2423,97 @@ mod tests {
             gated.instant_to_blocks_map.contains_key("T2_done"),
             "the committed instant must still be merged"
         );
+    }
+
+    // =====================================================================
+    // Fail-loud on an unreadable log block header (OI-59 / RV-10)
+    //
+    // Java skips exactly one kind of block by design -- an explicit
+    // CORRUPT_BLOCK (`AbstractHoodieLogRecordScanner.java:488-493`, and the
+    // `readBlock` that manufactures it at `HoodieLogFileReader.java:128-146`).
+    // Every other unreadable header is loud there: a data/delete block with no
+    // INSTANT_TIME reaches `compareTimestamps(null, GREATER_THAN, ...)`
+    // (`AbstractHoodieLogRecordScanner.java:495`), whose predicate is
+    // `commit1.compareTo(commit2)` (`InstantComparison.java:32,37`) and throws;
+    // a rollback block with no TARGET_INSTANT_TIME reaches
+    // `targetInstantForCommandBlock.contentEquals(...)`
+    // (`AbstractHoodieLogRecordScanner.java:349`) and throws.
+    // =====================================================================
+
+    /// A data block whose header carries no instant time must fail the scan, not
+    /// be dropped: dropping it loses that instant's updates (MISSING rows) with
+    /// no trace at `warn` level.
+    #[test]
+    fn test_pass1_errs_on_a_data_block_with_no_instant_time() {
+        let mut block = make_data_block("20250101");
+        block.header.remove(&BlockMetadataKey::InstantTime);
+
+        let err = forward_scan_pass1(
+            vec![block, make_data_block("20250102")],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect_err("a block whose instant time cannot be read must not be skipped");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("instant time"),
+            "the error must name what could not be read, got: {msg}"
+        );
+    }
+
+    /// Same for a delete block -- dropping one silently resurrects the records it
+    /// deletes (wrong EXTRA rows).
+    #[test]
+    fn test_pass1_errs_on_a_delete_block_with_no_instant_time() {
+        let mut block = make_delete_block("20250101");
+        block.header.remove(&BlockMetadataKey::InstantTime);
+
+        forward_scan_pass1(vec![block], MAX_INSTANT_TIME, &None, "utc", None)
+            .expect_err("a delete block whose instant time cannot be read must not be skipped");
+    }
+
+    /// A rollback block whose TARGET_INSTANT_TIME cannot be read must fail the
+    /// scan. Ignoring it leaves the rolled-back instant merged into the result --
+    /// wrong EXTRA rows, and the failure mode the reviewer flagged.
+    #[test]
+    fn test_pass1_errs_on_a_rollback_block_with_no_target_instant() {
+        let mut rollback = make_rollback_block("20250102", "20250101");
+        rollback.header.remove(&BlockMetadataKey::TargetInstantTime);
+
+        let err = forward_scan_pass1(
+            vec![make_data_block("20250101"), rollback],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect_err("a rollback block with an unreadable target must not be ignored");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("target instant") || msg.contains("Target instant"),
+            "the error must name what could not be read, got: {msg}"
+        );
+    }
+
+    /// The one sanctioned skip stays a skip: an explicit corrupt block is still
+    /// counted and stepped over, exactly as Java does, and does not become an
+    /// error just because the fail-loud rule above tightened.
+    #[test]
+    fn test_pass1_still_skips_an_explicit_corrupt_block() {
+        let result = forward_scan_pass1(
+            vec![make_corrupt_block(), make_data_block("20250101")],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect("a corrupt block is the one block type Java skips by design");
+
+        assert_eq!(result.total_corrupt_blocks, 1);
+        assert_eq!(result.ordered_instants_list, vec!["20250101"]);
     }
 }
