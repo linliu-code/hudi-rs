@@ -243,14 +243,20 @@ impl DataBlock {
         // silently short key or value -- a wrong seek result on the scanner path,
         // not an error. O(1) per record: two adds and a compare against a field
         // already in cache, on bytes the caller is about to read anyway.
-        let declared_end = offset
-            .saturating_add(KEY_VALUE_HEADER_SIZE)
-            .saturating_add(kv.key_length())
-            .saturating_add(kv.value_length());
+        //
+        // Bounded on `record_size()`, which includes the trailing MVCC byte
+        // (`key.rs`, `KEY_VALUE_HEADER_SIZE + key + value + 1`), because that is
+        // what the iterator and both scanner walks advance by. Bounding on
+        // key+value alone left one hole: a block truncated exactly at the final
+        // record's MVCC byte passed the guard, `next()` then advanced the offset
+        // one past `content_end`, `is_valid_offset` said false, and the iteration
+        // ended with `None` -- the truncation reported as a normal end of block.
+        let declared_end = offset.saturating_add(kv.record_size());
         if declared_end > self.content_end {
             return Err(HFileError::InvalidFormat(format!(
                 "corrupt HFile data block: the record at offset {offset} declares key={} \
-                 value={} bytes, ending at {declared_end}, past the block content end {}",
+                 value={} bytes, ending at {declared_end} with its MVCC byte, past the block \
+                 content end {}",
                 kv.key_length(),
                 kv.value_length(),
                 self.content_end,
@@ -612,6 +618,50 @@ mod tests {
         assert!(
             matches!(err, HFileError::InvalidFormat(_)),
             "expected InvalidFormat, got: {err:?}"
+        );
+    }
+
+    /// The one hole the key+value bound left: a block truncated exactly at the
+    /// final record's MVCC byte. `record_size()` counts that byte
+    /// (`key.rs`, `KEY_VALUE_HEADER_SIZE + key + value + 1`) and the iterator and
+    /// both scanner walks advance by it, so under the old bound the record passed,
+    /// the offset moved one past `content_end`, `is_valid_offset` said false and
+    /// the iteration ended with `None` -- a truncated block reported as a normal
+    /// end of block, with `Ok` and one record short.
+    #[test]
+    fn test_read_key_value_errs_when_the_block_is_truncated_at_the_mvcc_byte() {
+        let mut data = one_key_value(b"abc", b"xy");
+        data.pop().expect("drop the trailing MVCC byte");
+        let content_end = data.len();
+        let block = DataBlock { data, content_end };
+
+        let err = block
+            .read_key_value(0)
+            .expect_err("a record whose MVCC byte is missing overruns the block");
+        assert!(
+            matches!(err, HFileError::InvalidFormat(_)),
+            "expected InvalidFormat, got: {err:?}"
+        );
+    }
+
+    /// The same truncation seen through the iterator, which is where it used to
+    /// disappear: one `Err`, not one silent `None`.
+    #[test]
+    fn test_data_block_iterator_errs_when_the_block_is_truncated_at_the_mvcc_byte() {
+        let mut data = one_key_value(b"abc", b"xy");
+        data.pop().expect("drop the trailing MVCC byte");
+        let content_end = data.len();
+        let block = DataBlock { data, content_end };
+
+        let results: Vec<Result<KeyValue>> = block.iter().collect();
+        assert_eq!(
+            results.len(),
+            1,
+            "the truncation must be reported, not swallowed by an early None"
+        );
+        assert!(
+            results[0].is_err(),
+            "the only item must be the truncation error"
         );
     }
 }

@@ -384,8 +384,18 @@ pub fn forward_scan_pass1(
             // Gate 1 above `continue`s on every corrupt block, so this arm cannot
             // be reached. Named rather than left to a wildcard so the match stays
             // exhaustive by enumeration.
+            //
+            // `return Err`, not `unreachable!`: the panic was safe today because
+            // the JNI boundary catches unwinds (`crates/jni/src/lib.rs:188,240`),
+            // but the crate's stated rule is no reachable panic, and under a
+            // `panic = "abort"` profile this would kill the JVM instead of raising
+            // a Java exception. An `Err` costs nothing and keeps the rule uniform.
             BlockType::Corrupted => {
-                unreachable!("corrupt blocks are skipped by Gate 1 before classification")
+                return Err(CoreError::LogBlockError(format!(
+                    "[Pass1] log block #{total_log_blocks} reached classification as a corrupt \
+                     block. Gate 1 skips every corrupt block before this point, so this is a \
+                     broken invariant inside Pass 1, not bad input."
+                )));
             }
         }
     }
@@ -1132,7 +1142,13 @@ impl BaseHoodieLogRecordReader {
                         )?;
                     }
                 }
-                _ => {}
+                // Nothing to decode. Enumerated rather than left to `_ => {}` for
+                // the same reason as the Pass 1 classify match: a block type added
+                // to `BlockType` later must be a compile error here, not a silent
+                // pass-through. Pass 2 only ever enqueues the four data/delete
+                // types above (`instant_to_blocks_map` is filled by exactly that
+                // arm of Pass 1), so none of these three actually arrives.
+                BlockType::Command | BlockType::CdcData | BlockType::Corrupted => {}
             }
 
             match block.block_type {
@@ -1152,10 +1168,17 @@ impl BaseHoodieLogRecordReader {
                         self.record_buffer.process_delete_block(block)
                     )?;
                 }
-                BlockType::Corrupted => {
-                    log::warn!("Found corrupt block not rolled back");
-                }
-                _ => {}
+                // Nothing to merge, and nothing reaches here: Pass 2 builds its
+                // deque only from `instant_to_blocks_map`, which Pass 1 fills from
+                // the data/delete arm alone -- a command block is consumed by the
+                // rollback arm, a corrupt block is skipped by Gate 1, and a CDC
+                // block is an error. The `BlockType::Corrupted =>
+                // warn!("Found corrupt block not rolled back")` that used to sit
+                // here is deleted rather than kept: it described a state that
+                // cannot occur, and a `warn` that can never fire is worse than no
+                // arm at all. Enumerated, not `_ => {}`, so a new `BlockType` is a
+                // compile error here.
+                BlockType::Command | BlockType::CdcData | BlockType::Corrupted => {}
             }
         }
         Ok(())
