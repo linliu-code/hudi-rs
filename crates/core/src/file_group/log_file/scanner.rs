@@ -116,13 +116,15 @@ impl CollectedBlocks {
         let mut out = Vec::new();
         for block in self.all_blocks.into_iter().flatten() {
             if block.block_type == BlockType::Command {
-                if block.command_block_type()? == CommandBlock::Rollback {
-                    continue; // rollback blocks carry no content
-                }
-                continue; // other command kinds: nothing to merge (none exist today; keep the shape total)
+                // Defence in depth: `rollback_targets_of` already read every command block's
+                // type (and its own `?` would have failed loud) while collecting rollback
+                // targets, above. Exhaustive on purpose here too: a command type added later
+                // must be classified explicitly rather than falling into a silent skip.
+                let CommandBlock::Rollback = block.command_block_type()?;
+                continue; // rollback blocks carry no content
             }
             if block.block_type == BlockType::Corrupted {
-                continue; // an explicit corrupt block was already counted by the reader; Java skips it too
+                continue; // an explicit corrupt block was already reported (warned) by the reader; Java skips it too
             }
             let instant = block.instant_time().map_err(|e| {
                 crate::error::CoreError::LogBlockError(format!(
