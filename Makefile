@@ -147,8 +147,16 @@ JNI_ARCH ?= $(shell uname -m | sed 's/arm64/aarch64/;s/amd64/x86_64/')
 JNI_OS ?= linux
 JNI_OUT ?= target/jni-native
 JNI_STAGE := $(JNI_OUT)/stage
+# Where cargo actually writes the release build; overridden by jni-lib-portable so a container
+# build never touches this host's normal target/release/libhudi_jni.so (D-27, OI-72).
+JNI_CARGO_TARGET_DIR ?= target
 # internal-only default; override for other hosts
 CODEARTIFACT_URL ?= https://onehouse-194159489498.d.codeartifact.us-west-2.amazonaws.com/maven/onehouse-internal/
+
+# D-27: manylinux_2_28 images for the portable (glibc<=2.28-floor) container build; jni-lib-portable
+DOCKER_MANYLINUX_x86_64  := quay.io/pypa/manylinux_2_28_x86_64
+DOCKER_MANYLINUX_aarch64 := quay.io/pypa/manylinux_2_28_aarch64
+JNI_PORTABLE_OUT ?= target/jni-portable
 
 # JNI_MULTI=1 switches jni-jar/jni-install/jni-deploy onto the classifier-less multi-arch jar
 # name (the same one jni-jar-multi produces) instead of the single-arch classifier jar; it does
@@ -171,13 +179,14 @@ jni-lib: ## Build libhudi_jni.so (release) and stage a stripped copy under targe
 	$(info --- Build hudi-jni (release) ---)
 	test -z "$$(git status --porcelain)" || { echo "dirty tree; set JNI_ALLOW_DIRTY=1 to override"; test -n "$(JNI_ALLOW_DIRTY)"; }
 	rm -rf $(JNI_STAGE)
-	./build-wrapper.sh cargo build -p hudi-jni --release
+	CARGO_TARGET_DIR=$(JNI_CARGO_TARGET_DIR) ./build-wrapper.sh cargo build -p hudi-jni --release
 	mkdir -p $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH) $(JNI_STAGE)/META-INF
-	strip -o $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so target/release/libhudi_jni.so
-	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\nmd5=%s\narch=%s-%s\n' \
+	strip -o $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so $(JNI_CARGO_TARGET_DIR)/release/libhudi_jni.so
+	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\nglibc.floor=%s\nmd5=%s\narch=%s-%s\n' \
 	  "$$(git rev-parse HEAD)" \
 	  "$$(grep -o 'JNI_ABI_VERSION: u32 = [0-9]*' crates/jni/src/lib.rs | grep -o '[0-9]*$$')" \
 	  "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+	  "$$(objdump -T $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)" \
 	  "$$(md5sum $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so | cut -d' ' -f1)" \
 	  "$(JNI_OS)" "$(JNI_ARCH)" > $(JNI_STAGE)/META-INF/hudi-jni-native.properties
 	cat $(JNI_STAGE)/META-INF/hudi-jni-native.properties
@@ -198,7 +207,36 @@ jni-jar-multi: jni-lib ## Package this arch's library plus JNI_EXTRA_NATIVE_DIR 
 	archs=""; for a in x86_64 aarch64; do [ -d $(JNI_STAGE)/native/linux-$$a ] && archs="$${archs:+$$archs,}linux-$$a"; done; \
 	  printf 'arch=%s\n' "$$archs" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties
 	for a in x86_64 aarch64; do [ -d $(JNI_STAGE)/native/linux-$$a ] && printf 'md5.linux-%s=%s\n' "$$a" "$$(md5sum $(JNI_STAGE)/native/linux-$$a/libhudi_jni.so | cut -d' ' -f1)" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties; done
+	for a in x86_64 aarch64; do [ -d $(JNI_STAGE)/native/linux-$$a ] && printf 'glibc.floor.linux-%s=%s\n' "$$a" "$$(objdump -T $(JNI_STAGE)/native/linux-$$a/libhudi_jni.so | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties; done
 	rm -f $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar && jar cf $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar -C $(JNI_STAGE) . && unzip -l $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar
+
+# D-27 (OI-72): jni-lib builds on THIS host, whose glibc floor is whatever this box happens to
+# run (documented, not asserted) — jni-lib-portable instead builds inside a manylinux_2_28
+# container (glibc 2.28) with librocksdb-sys's -lstdc++/-lgcc_s force-static via
+# .github/jni-portable/static-cxx-linker.sh (see that file for why RUSTFLAGS alone doesn't do
+# it), so the resulting .so's floor is <=2.28 regardless of this box's own glibc. Stages under
+# $(JNI_PORTABLE_OUT), and builds cargo into $(JNI_PORTABLE_OUT)/cargo-target — NEVER
+# target/release or target/jni-native/stage, which other gates on this box depend on.
+.PHONY: jni-lib-portable
+jni-lib-portable: ## D-27: build libhudi_jni.so inside a manylinux_2_28 container (glibc<=2.28 floor, static libstdc++/libgcc); stages under target/jni-portable, never touches target/release
+	mkdir -p $(JNI_PORTABLE_OUT)
+	docker run --rm -v "$$(pwd):/work" -w /work $(DOCKER_MANYLINUX_$(JNI_ARCH)) bash -c '\
+	  set -euo pipefail; \
+	  git config --global --add safe.directory /work; \
+	  dnf install -y -q clang clang-devel; \
+	  ARCH=$$(uname -m); [ "$$ARCH" = aarch64 ] && PARCH=aarch_64 || PARCH=x86_64; \
+	  curl -sL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-linux-$${PARCH}.zip"; \
+	  mkdir -p /usr/local/protoc && (cd /usr/local/protoc && unzip -q -o /tmp/protoc.zip); \
+	  ln -sf /usr/local/protoc/bin/protoc /usr/local/bin/protoc; \
+	  curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none; \
+	  export PATH="$$HOME/.cargo/bin:$$PATH"; \
+	  cp .github/jni-portable/static-cxx-linker.sh /usr/local/bin/static-cxx-linker.sh; \
+	  chmod +x /usr/local/bin/static-cxx-linker.sh; \
+	  export REAL_CC=$$(command -v gcc); \
+	  export RUSTFLAGS="-C linker=/usr/local/bin/static-cxx-linker.sh"; \
+	  make jni-lib JNI_ARCH=$(JNI_ARCH) JNI_ALLOW_DIRTY=1 JNI_OUT=$(JNI_PORTABLE_OUT) JNI_CARGO_TARGET_DIR=$(JNI_PORTABLE_OUT)/cargo-target; \
+	  chown -R --reference=/work/Makefile /work/$(JNI_PORTABLE_OUT) \
+	'
 
 .PHONY: jni-deploy
 jni-deploy: $(JNI_DEPLOY_PREREQ) ## Deploy the carrier jar to CodeArtifact (server id `codeartifact` in ~/.m2/settings.xml); JNI_MULTI=1 deploys the classifier-less multi-arch jar (needs JNI_EXTRA_NATIVE_DIR)

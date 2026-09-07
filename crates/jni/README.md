@@ -85,10 +85,12 @@ Triggers:
   optional `version` input; defaults to the tag's suffix, else `0.5.0-dev.<short sha>`.
 
 A `build` job matrix runs BOTH Linux arches in parallel — `x86_64` on `ubuntu-24.04`,
-`aarch64` on `ubuntu-24.04-arm` — each leg: `make jni-lib JNI_ARCH=<arch>`, an assertion that
-the `.so` exports exactly 2 `Java_...` symbols, and a **JNI load smoke**
-(`.github/jni-smoke/org/apache/hudi/io/nativereader/NativeFileGroupReader.java` — same
-package/class as the real reader, only the `version()` liveness probe) that `System.load`s the
+`aarch64` on `ubuntu-24.04-arm` — each leg builds INSIDE a `manylinux_2_28_<arch>` container
+(D-27, below), asserts the `.so` exports exactly 2 `Java_...` symbols, asserts the portability
+floor, and runs the **JNI load smoke** twice: once on the runner itself and once inside an
+`eclipse-temurin:17-jdk-jammy` container (glibc 2.35, older than the runner's own glibc 2.39) —
+both via `.github/jni-smoke/org/apache/hudi/io/nativereader/NativeFileGroupReader.java` (same
+package/class as the real reader, only the `version()` liveness probe), which `System.load`s the
 just-built library and checks its output matches `SMOKE hudi-jni .* abi=3`. Each leg uploads its
 `.so` plus properties as a workflow artifact (`libhudi_jni-linux-<arch>`).
 
@@ -101,13 +103,55 @@ resolves with `dependency:get` against a clean local `~/.m2/repository`. A new c
 version; never an overwrite. If the OIDC assume fails, the jar still exists as a workflow
 artifact and the orchestrator falls back to the release-asset route above.
 
-### Local fallback (`make jni-jar-multi`)
+### The glibc floor (D-27)
 
-When CI isn't available (or to rehearse the assembly locally), build this machine's arch and
-merge in another arch's library built elsewhere:
+A Rust cdylib links the versioned glibc symbols of the BUILD host's libc, so a library built
+directly on the `ubuntu-24.04`/`ubuntu-24.04-arm` runners (glibc 2.39) cannot load on any older
+host — Amazon Linux 2023 (2.34), RHEL/Alma 8 (2.28), or even this box (2.35). The first cut of
+this workflow did exactly that and failed to load anywhere but the runners themselves
+(`investigations/m3-carrier-glibc-floor/`). Fix: each leg's `make jni-lib` now runs inside
+`quay.io/pypa/manylinux_2_28_<arch>` (AlmaLinux 8, glibc 2.28), which pins the *glibc* floor to
+2.28 for free. The *libstdc++*/*libgcc* floor (from `librocksdb-sys`, a C++ dependency) is a
+second, independent problem: `RUSTFLAGS`'s `-C link-arg=-static-libstdc++
+-C link-arg=-static-libgcc` do **not** remove it — those flags only rewrite gcc's own
+*automatic* C++-runtime linking, and have no effect on the *explicit* `-lstdc++`/`-lgcc_s` that
+`librocksdb-sys` emits (measured empirically: even a `g++`-driven link with an explicit
+`-lstdc++` keeps a dynamic `libstdc++.so.6` NEEDED entry alongside `-static-libstdc++`). The
+actual fix is `.github/jni-portable/static-cxx-linker.sh`, a linker wrapper installed via
+`RUSTFLAGS="-C linker=..."` that rewrites `-lstdc++`/`-lgcc_s` **in place** (same position in
+the link line, so ordering relative to the archives that need them — which `--as-needed`
+depends on — is preserved) into `-Wl,-Bstatic -lstdc++ -Wl,-Bdynamic` /
+`-Wl,-Bstatic -lgcc -Wl,-Bdynamic`. It only touches the `libhudi_jni` cdylib's own final link
+(matched by `"libhudi_jni"` appearing in the arguments); every other link (build scripts,
+proc-macros, host helper binaries) passes through untouched.
+
+The workflow's **Portability floor** step (after the container build, on the runner) fails the
+job unless, on the just-built `.so`:
+- max `GLIBC_` symbol version (`objdump -T ... | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1`)
+  is `<= 2.28`;
+- there are zero versioned `GLIBCXX_`/`CXXABI_` imports;
+- `readelf -d`'s NEEDED list contains neither `libstdc++.so.6` nor `libgcc_s.so.1`.
+
+The measured floor is written into the properties as `glibc.floor=<version>` (single-arch,
+`jni-lib`) or `glibc.floor.linux-<arch>=<version>` per arch (multi-arch, the workflow's
+`package` job and `jni-jar-multi` — both re-measure with the same `objdump` one-liner rather
+than trusting a leg's own properties file).
+
+### Local fallback (`make jni-jar-multi`, `make jni-lib-portable`)
+
+`make jni-lib` always builds on THIS host, whichever glibc that happens to be (documented via
+`glibc.floor=`, not asserted) — a normal local build is not floor-2.28. `make jni-lib-portable`
+instead runs the SAME container build the workflow does (`docker run` against
+`quay.io/pypa/manylinux_2_28_<arch>`, the `static-cxx-linker.sh` wrapper, `JNI_ARCH` picking
+the image), staging under `target/jni-portable/` — it never touches `target/release/` or the
+plain `jni-lib`'s `target/jni-native/stage/`, so it is safe to run alongside other gates on a
+shared box. Needs `docker`; only builds THIS machine's arch (no cross-arch emulation).
+
+To assemble a full multi-arch jar locally (CI-built or floor-2.28), merge in another arch's
+library built elsewhere:
 
 ```
-make jni-lib                                          # this machine's arch, into target/jni-native/stage
+make jni-lib                                          # or jni-lib-portable; this machine's arch, into target/jni-native/stage
 make jni-jar-multi JNI_EXTRA_NATIVE_DIR=/path/to/dir  # dir holds native/linux-<other-arch>/libhudi_jni.so
 ```
 
@@ -132,13 +176,16 @@ built=<UTC timestamp>
 arch=linux-x86_64,linux-aarch64
 md5.linux-x86_64=<md5 of native/linux-x86_64/libhudi_jni.so>
 md5.linux-aarch64=<md5 of native/linux-aarch64/libhudi_jni.so>
+glibc.floor.linux-x86_64=<max GLIBC_ symbol version in native/linux-x86_64/libhudi_jni.so>
+glibc.floor.linux-aarch64=<max GLIBC_ symbol version in native/linux-aarch64/libhudi_jni.so>
 ```
 
-(the single-arch jar's properties file keeps its original shape — see "Make targets" below.)
-The `x86_64` then `aarch64` order is fixed — both the workflow's `package` job and
-`jni-jar-multi` iterate the two arches in that same order (only the ones actually present), so
-`arch=` and the `md5.linux-<arch>=` lines always come out identical between CI and a local
-build, whichever arch this machine's `jni-lib` staged first.
+(the single-arch jar's properties file keeps its original shape plus `glibc.floor=<version>` —
+see "Make targets" below.) The `x86_64` then `aarch64` order is fixed — both the workflow's
+`package` job and `jni-jar-multi` iterate the two arches in that same order (only the ones
+actually present) for BOTH the `md5.linux-<arch>=` and `glibc.floor.linux-<arch>=` lines, so
+they always come out identical between CI and a local build, whichever arch this machine's
+`jni-lib`/`jni-lib-portable` staged first.
 
 ### Consumer side (hudi-internal)
 
@@ -153,9 +200,14 @@ runner — only the `hudi.jni.native.version` property needs to move in lockstep
 
 ```
 make jni-lib        # cargo build -p hudi-jni --release; strip the .so; stage it plus
-                     # META-INF/hudi-jni-native.properties under target/jni-native/stage
-                     # (rm -rf's the stage dir first; refuses a dirty tree unless
-                     # JNI_ALLOW_DIRTY=1)
+                     # META-INF/hudi-jni-native.properties (incl. glibc.floor=) under
+                     # target/jni-native/stage (rm -rf's the stage dir first; refuses a
+                     # dirty tree unless JNI_ALLOW_DIRTY=1); builds on THIS host, whatever
+                     # its glibc happens to be
+make jni-lib-portable  # D-27: same build, inside quay.io/pypa/manylinux_2_28_<JNI_ARCH>
+                     # (docker) with the static-cxx-linker wrapper; glibc floor <=2.28;
+                     # stages under target/jni-portable, never target/release or
+                     # target/jni-native/stage
 make jni-jar        # package the staged tree as
                      # target/jni-native/hudi-jni-native-<version>-<os>-<arch>.jar;
                      # JNI_MULTI=1 drops the classifier (same name jni-jar-multi
@@ -178,12 +230,13 @@ make jni-install     # mvn install:install-file the jar into the local Maven
 JAVA_HOME=~/.jenv/versions/17; export PATH="$JAVA_HOME/bin:$PATH"`).
 
 The staged properties file (`META-INF/hudi-jni-native.properties`) records the hudi-rs commit,
-the JNI ABI, the build timestamp, and the `.so`'s md5:
+the JNI ABI, the build timestamp, the measured glibc floor (D-27), and the `.so`'s md5:
 
 ```
 hudi-rs.sha=<git rev-parse HEAD>
 abi=<JNI_ABI_VERSION>
 built=<UTC timestamp>
+glibc.floor=<max GLIBC_ symbol version in the staged .so, via objdump -T>
 md5=<md5 of the stripped .so>
 arch=<os>-<arch>
 ```
