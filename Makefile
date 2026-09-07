@@ -218,7 +218,7 @@ jni-jar-multi: jni-lib ## Package this arch's library plus JNI_EXTRA_NATIVE_DIR 
 # $(JNI_PORTABLE_OUT), and builds cargo into $(JNI_PORTABLE_OUT)/cargo-target — NEVER
 # target/release or target/jni-native/stage, which other gates on this box depend on.
 .PHONY: jni-lib-portable
-jni-lib-portable: ## D-27: build libhudi_jni.so inside a manylinux_2_28 container (glibc<=2.28 floor, static libstdc++/libgcc); stages under target/jni-portable, never touches target/release
+jni-lib-portable: ## D-27: build libhudi_jni.so inside a manylinux_2_28 container (glibc<=2.28 floor, static libstdc++/libgcc/libgcc_eh, -Wl,-z,defs, asserts no undefined unwinder/C++ symbols); stages under target/jni-portable, never touches target/release
 	mkdir -p $(JNI_PORTABLE_OUT)
 	docker run --rm -v "$$(pwd):/work" -w /work $(DOCKER_MANYLINUX_$(JNI_ARCH)) bash -c '\
 	  set -euo pipefail; \
@@ -237,6 +237,11 @@ jni-lib-portable: ## D-27: build libhudi_jni.so inside a manylinux_2_28 containe
 	  make jni-lib JNI_ARCH=$(JNI_ARCH) JNI_ALLOW_DIRTY=1 JNI_OUT=$(JNI_PORTABLE_OUT) JNI_CARGO_TARGET_DIR=$(JNI_PORTABLE_OUT)/cargo-target; \
 	  chown -R --reference=/work/Makefile /work/$(JNI_PORTABLE_OUT) \
 	'
+	@echo 'nm -D --undefined-only (all _Unwind_/__cxa_/__gxx_ hits, for the record):'
+	@nm -D --undefined-only $(JNI_PORTABLE_OUT)/stage/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so | grep -E '_Unwind_|__cxa_|__gxx_' || true
+	UNDEF=$$(nm -D --undefined-only $(JNI_PORTABLE_OUT)/stage/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so | awk '$$1=="U" && $$2 ~ /_Unwind_|__cxa_|__gxx_/ && $$2 !~ /@GLIB/' | grep -c . || true); \
+	  echo "undefined unwinder/C++ symbols (excluding weak and glibc-versioned @GLIBC_x.y, which libc.so.6 legitimately provides): $$UNDEF"; \
+	  [ "$$UNDEF" -eq 0 ] || { echo "FAIL: $$UNDEF unresolved unwinder/C++ symbols"; exit 1; }
 
 .PHONY: jni-deploy
 jni-deploy: $(JNI_DEPLOY_PREREQ) ## Deploy the carrier jar to CodeArtifact (server id `codeartifact` in ~/.m2/settings.xml); JNI_MULTI=1 deploys the classifier-less multi-arch jar (needs JNI_EXTRA_NATIVE_DIR)

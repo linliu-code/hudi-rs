@@ -120,22 +120,58 @@ second, independent problem: `RUSTFLAGS`'s `-C link-arg=-static-libstdc++
 actual fix is `.github/jni-portable/static-cxx-linker.sh`, a linker wrapper installed via
 `RUSTFLAGS="-C linker=..."` that rewrites `-lstdc++`/`-lgcc_s` **in place** (same position in
 the link line, so ordering relative to the archives that need them — which `--as-needed`
-depends on — is preserved) into `-Wl,-Bstatic -lstdc++ -Wl,-Bdynamic` /
-`-Wl,-Bstatic -lgcc -Wl,-Bdynamic`. It only touches the `libhudi_jni` cdylib's own final link
+depends on — is preserved): `-lstdc++` becomes `-Wl,-Bstatic -lstdc++ -Wl,-Bdynamic`; `-lgcc_s`
+becomes the ABSOLUTE paths of **both** `libgcc_eh.a` and `libgcc.a` (resolved via
+`gcc -print-file-name=...`, which the wrapper verifies actually exists — see the trap below for
+why `libgcc.a` alone is not enough). It only touches the `libhudi_jni` cdylib's own final link
 (matched by `"libhudi_jni"` appearing in the arguments); every other link (build scripts,
-proc-macros, host helper binaries) passes through untouched.
+proc-macros, host helper binaries) passes through untouched — an earlier unconditional version
+of this wrapper broke a `zerocopy` build-script link this way.
 
 The workflow's **Portability floor** step (after the container build, on the runner) fails the
 job unless, on the just-built `.so`:
 - max `GLIBC_` symbol version (`objdump -T ... | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1`)
   is `<= 2.28`;
 - there are zero versioned `GLIBCXX_`/`CXXABI_` imports;
-- `readelf -d`'s NEEDED list contains neither `libstdc++.so.6` nor `libgcc_s.so.1`.
+- `readelf -d`'s NEEDED list contains neither `libstdc++.so.6` nor `libgcc_s.so.1`;
+- `nm -D --undefined-only`'s `_Unwind_`/`__cxa_`/`__gxx_` hits, EXCLUDING weak symbols (`w`,
+  e.g. `__cxa_pure_virtual` — libstdc++'s own convention leaves this one optional) and symbols
+  with an `@GLIBC_x.y` version tag (e.g. `__cxa_atexit@GLIBC_2.17` — legitimately provided by
+  `libc.so.6` itself, present in ANY C++ binary, static or dynamic), come to zero.
 
 The measured floor is written into the properties as `glibc.floor=<version>` (single-arch,
 `jni-lib`) or `glibc.floor.linux-<arch>=<version>` per arch (multi-arch, the workflow's
 `package` job and `jni-jar-multi` — both re-measure with the same `objdump` one-liner rather
 than trusting a leg's own properties file).
+
+#### The trap: "it loads for me" is not proof (fix round 3)
+
+The first version of this wrapper mapped `-lgcc_s` to `libgcc.a` alone. `libgcc.a` does **not**
+carry the unwinder (`_Unwind_*`) — that lives in **`libgcc_eh.a`** — so the resulting `.so` had
+19 undefined `_Unwind_*`/`__cxa_*` symbols and no `libgcc_s.so.1` NEEDED to resolve them
+dynamically either. Nothing failed the *link* (a shared object links fine with undefined
+symbols by default — `-Wl,-z,defs`, added as defense in depth, catches a plain *unversioned*
+undefined symbol but was measured to NOT catch this specific class: `_Unwind_*`/`__cxa_*`
+references carry an explicit ELF symbol-version requirement, e.g. `_Unwind_Resume@GCC_3.0`,
+and GNU ld's `-z,defs` does not treat an unresolved *versioned* reference as a hard error the
+way it does a plain one — confirmed directly by relinking a throwing C++ object without
+`libgcc_eh.a` and watching the link succeed anyway). The "Portability floor" step at the time
+only checked glibc-symbol versions and NEEDED, so it passed too. It even passed a full Java
+module-test run locally — but only because this box's own JVM already had `libgcc_s.so.1`
+loaded in the *process's global symbol scope*, silently satisfying the `dlopen` at runtime. The
+CI runner's Temurin JVM does not, and the identical load there threw `UnsatisfiedLinkError:
+undefined symbol: _Unwind_GetTextRelBase` (hudi-rs run 34164782183,
+`investigations/m3-carrier-unwinder-symbols/`).
+
+**A native library loading successfully in one process proves only that whatever happened to
+already be loaded in that process's global scope covered its gaps — never trust it as proof of
+a clean, self-contained link.** The only trustworthy checks are static: `nm -D
+--undefined-only <so> | grep -E '_Unwind_|__cxa_|__gxx_'` (then apply the weak/`@GLIBC_`
+exclusions above) and, independently, loading the library in a process guaranteed to have
+nothing preloaded (`env -i PATH=/usr/bin:/bin <jdk>/bin/java -cp ... NativeFileGroupReader
+<so>` — no ambient JVM, no inherited `LD_PRELOAD`) plus `ldd <so>` showing no "not found".
+Both are run as part of the local proof (`evidence/m3-t1-fix2-portable-floor.txt`, "fix round
+3" section) and as workflow steps.
 
 ### Local fallback (`make jni-jar-multi`, `make jni-lib-portable`)
 
