@@ -130,6 +130,14 @@ impl<'a> CompletionGate<'a> {
     }
 }
 
+/// Stand-in printed for a command block that carries no readable `INSTANT_TIME`
+/// header — a shape Java tolerates (`AbstractHoodieLogRecordScanner.java:486`
+/// reads the header with a map `get`, and its `COMMAND_BLOCK` arm at `:530-540`
+/// never touches the value). It reaches log lines only; no gate, map key or
+/// comparison ever sees it, because every one of them is guarded by
+/// `block_type != BlockType::Command`.
+const NO_INSTANT_TIME_HEADER: &str = "<no INSTANT_TIME header>";
+
 /// Run Pass 1: forward scan with 5 gates.
 ///
 /// Processes a flat list of blocks (from all log files, in file-read order)
@@ -205,26 +213,45 @@ pub fn forward_scan_pass1(
             continue;
         }
 
-        // A non-corrupt block whose INSTANT_TIME cannot be read is a failure, not
-        // a skip. Skipping it silently drops that instant's updates (MISSING
-        // rows) or its deletes (wrong EXTRA rows), and the previous `continue`
-        // did so at `debug` level, invisible in CI. Java is loud here too: the
-        // very next thing it does with this header is
+        // Java reads this header with a plain map `get`
+        // (`AbstractHoodieLogRecordScanner.java:486`), which yields null on absence
+        // and never throws, and it dereferences the value only where the block type
+        // makes it meaningful: the data/delete gate at `:494-495`
+        // (`logBlock.isDataOrDeleteBlock() && compareTimestamps(...)`) and the two
+        // gates at `:499-509`, both behind `getBlockType() != COMMAND_BLOCK`. The
+        // `COMMAND_BLOCK` arm at `:530-540` reads only `COMMAND_BLOCK_TYPE` and
+        // `TARGET_INSTANT_TIME`. So Java processes a command block with an absent
+        // or unreadable `INSTANT_TIME` normally, and requiring it here would be a
+        // divergence FROM the gold. The `?` is therefore scoped to exactly the
+        // population Java dereferences it for -- the same `!= Command` predicate
+        // the gates below already use.
+        //
+        // For that population an unreadable INSTANT_TIME is a failure, not a skip:
+        // skipping it silently drops that instant's updates (MISSING rows) or its
+        // deletes (wrong EXTRA rows), and the previous `continue` did so at `debug`
+        // level, invisible in CI. Java is loud there too: the very next thing it
+        // does with the header is
         // `compareTimestamps(logBlock.getLogBlockHeader().get(INSTANT_TIME), GREATER_THAN, ...)`
-        // (`AbstractHoodieLogRecordScanner.java:495`, and `:293` in the v1 scan),
-        // whose predicate is `commit1.compareTo(commit2)`
+        // (`AbstractHoodieLogRecordScanner.java:494-495`, and `:293` in the v1
+        // scan), whose predicate is `commit1.compareTo(commit2)`
         // (`InstantComparison.java:32,37`) -- a null header value throws there.
-        let instant_time = block
-            .instant_time()
-            .map_err(|e| {
-                CoreError::LogBlockError(format!(
+        let instant_time = match block.instant_time() {
+            Ok(instant_time) => instant_time.to_string(),
+            // Command blocks only. Nothing below reads this value for them: every
+            // gate is guarded by `!= BlockType::Command`, and the command arm's
+            // own errors name TARGET_INSTANT_TIME, the header that arm reads. The
+            // placeholder exists solely so the shared trace line has something to
+            // print.
+            Err(_) if block.block_type == BlockType::Command => NO_INSTANT_TIME_HEADER.to_string(),
+            Err(e) => {
+                return Err(CoreError::LogBlockError(format!(
                     "[Pass1] log block #{total_log_blocks} (type {:?}) has no readable instant \
                      time: {e}. Only an explicit corrupt block may be skipped; a block whose \
                      header cannot be read would silently change the row count.",
                     block.block_type,
-                ))
-            })?
-            .to_string();
+                )));
+            }
+        };
 
         // Gate 2: Future blocks → skip (instant > latestInstantTime)
         if block.block_type != BlockType::Command && instant_time.as_str() > latest_instant_time {
@@ -291,11 +318,18 @@ pub fn forward_scan_pass1(
             // `UnsupportedOperationException("Command type not yet supported.")` for
             // both shapes (`AbstractHoodieLogRecordScanner.java:540`).
             BlockType::Command => {
+                // `TARGET_INSTANT_TIME`, not `INSTANT_TIME`: those are the only two
+                // headers Java's `COMMAND_BLOCK` arm reads
+                // (`AbstractHoodieLogRecordScanner.java:530-540`), and a command
+                // block is not required to carry an `INSTANT_TIME` at all, so
+                // naming it here could only ever print the placeholder.
+                let target_for_errors = block.target_instant_time().unwrap_or("<unreadable>");
                 let command = block.command_block_type().map_err(|e| {
                     CoreError::LogBlockError(format!(
-                        "[Pass1] command block #{total_log_blocks} (instant={instant_time}) has \
-                         no readable command block type: {e}. Ignoring it would silently drop a \
-                         rollback and leave the rolled-back instant merged in."
+                        "[Pass1] command block #{total_log_blocks} \
+                         (target_instant={target_for_errors}) has no readable command block \
+                         type: {e}. Ignoring it would silently drop a rollback and leave the \
+                         rolled-back instant merged in."
                     ))
                 })?;
                 // Exhaustive on purpose: a command type added later must be
@@ -314,9 +348,9 @@ pub fn forward_scan_pass1(
                     .target_instant_time()
                     .map_err(|e| {
                         CoreError::LogBlockError(format!(
-                            "[Pass1] rollback command block #{total_log_blocks} \
-                             (instant={instant_time}) has no readable target instant time: {e}. \
-                             Ignoring it would leave the rolled-back instant merged in."
+                            "[Pass1] rollback command block #{total_log_blocks} has no readable \
+                             target instant time: {e}. Ignoring it would leave the rolled-back \
+                             instant merged in."
                         ))
                     })?
                     .to_string();
@@ -2651,5 +2685,43 @@ mod tests {
 
         assert_eq!(result.total_corrupt_blocks, 1);
         assert_eq!(result.ordered_instants_list, vec!["20250101"]);
+    }
+
+    /// Java never dereferences `INSTANT_TIME` for a command block, so hudi-rs must
+    /// not either. `AbstractHoodieLogRecordScanner.java:486` reads the header with
+    /// a plain map `get` (null on absence, no throw); `:494-495` dereferences it
+    /// only under `isDataOrDeleteBlock()`; `:499-509` gates on it only when
+    /// `getBlockType() != COMMAND_BLOCK`; and the `COMMAND_BLOCK` arm at `:530-540`
+    /// reads only `COMMAND_BLOCK_TYPE` and `TARGET_INSTANT_TIME`. A rollback block
+    /// with an absent `INSTANT_TIME` therefore rolls its target back in Java, and
+    /// hard-failing the whole scan on it would be a divergence FROM the gold
+    /// introduced BY the fail-loud wave.
+    #[test]
+    fn test_pass1_processes_a_command_block_with_no_instant_time() {
+        let mut rollback = make_rollback_block("20250102", "20250101");
+        rollback.header.remove(&BlockMetadataKey::InstantTime);
+
+        let result = forward_scan_pass1(
+            vec![make_data_block("20250101"), rollback],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect("Java processes a command block whose INSTANT_TIME header is absent");
+
+        assert_eq!(
+            result.total_rollbacks, 1,
+            "the rollback must be counted, not rejected"
+        );
+        assert!(
+            result.ordered_instants_list.is_empty(),
+            "the rollback's target must still be removed, got {:?}",
+            result.ordered_instants_list,
+        );
+        assert!(
+            !result.instant_to_blocks_map.contains_key("20250101"),
+            "the rolled-back instant's blocks must be dropped"
+        );
     }
 }
