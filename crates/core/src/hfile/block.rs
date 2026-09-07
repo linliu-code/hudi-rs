@@ -272,7 +272,6 @@ impl DataBlock {
     }
 
     /// Iterate over all key-value pairs in the block.
-    #[allow(dead_code)]
     pub fn iter(&self) -> DataBlockIterator<'_> {
         DataBlockIterator {
             block: self,
