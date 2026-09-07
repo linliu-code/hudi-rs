@@ -325,7 +325,34 @@ pub fn forward_scan_pass1(
                 ordered_instants_list.retain(|t| t != &target);
                 instant_to_blocks_map.remove(&target);
             }
-            _ => {}
+            // No `_` arm, deliberately: with every variant named, a block type
+            // added to `BlockType` later is a COMPILE error here rather than a
+            // silent drop. That is the property the `CommandBlock` destructuring
+            // above already buys for command types, applied to the outer match.
+            //
+            // CDC blocks are real, decodable data elsewhere in this crate
+            // (`LogBlock::is_data_block()` counts them, and `log_file/scanner.rs`
+            // decodes their content), so the old `_ => {}` dropped rows with `Ok`.
+            // Java does not classify them either -- CDC_DATA_BLOCK is absent from
+            // its switch, so it falls to
+            // `default: throw new UnsupportedOperationException("Block type not yet supported.")`
+            // (`AbstractHoodieLogRecordScanner.java:543`). Supporting them is a
+            // separate change needing its own Java comparison; what it must not be
+            // is a silent `Ok`.
+            BlockType::CdcData => {
+                return Err(CoreError::LogBlockError(format!(
+                    "[Pass1] log block #{total_log_blocks} (instant={instant_time}) is a CDC \
+                     data block, which this scan does not classify. Java throws \
+                     UnsupportedOperationException(\"Block type not yet supported.\") for it \
+                     (AbstractHoodieLogRecordScanner.java:543)."
+                )));
+            }
+            // Gate 1 above `continue`s on every corrupt block, so this arm cannot
+            // be reached. Named rather than left to a wildcard so the match stays
+            // exhaustive by enumeration.
+            BlockType::Corrupted => {
+                unreachable!("corrupt blocks are skipped by Gate 1 before classification")
+            }
         }
     }
 
@@ -1329,6 +1356,19 @@ mod tests {
             LogFormatVersion::V1,
             BlockType::Corrupted,
             HashMap::new(),
+            LogBlockContent::Empty,
+            HashMap::new(),
+        )
+    }
+
+    /// Create a CDC data block with given instant time.
+    fn make_cdc_block(instant_time: &str) -> LogBlock {
+        let mut header = HashMap::new();
+        header.insert(BlockMetadataKey::InstantTime, instant_time.to_string());
+        LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::CdcData,
+            header,
             LogBlockContent::Empty,
             HashMap::new(),
         )
@@ -2568,6 +2608,31 @@ mod tests {
             None,
         )
         .expect_err("an unparsable command block type must not be ignored");
+    }
+
+    /// A CDC data block was the one type the classify match's `_ => {}` arm still
+    /// swallowed. `is_data_block()` counts it as data and `log_file/scanner.rs`
+    /// decodes it as record content, so it is real, decodable data that pass 1
+    /// alone dropped with `Ok` -- MISSING rows, no trace. Java's `default:` arm
+    /// throws `UnsupportedOperationException("Block type not yet supported.")`
+    /// (`AbstractHoodieLogRecordScanner.java:543`), because CDC_DATA_BLOCK is not
+    /// in its switch either.
+    #[test]
+    fn test_pass1_errs_on_a_cdc_data_block() {
+        let err = forward_scan_pass1(
+            vec![make_data_block("20250101"), make_cdc_block("20250102")],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect_err("a CDC data block must not be silently dropped");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CDC") || msg.contains("CdcData"),
+            "the error must name the block type, got: {msg}"
+        );
     }
 
     /// The one sanctioned skip stays a skip: an explicit corrupt block is still

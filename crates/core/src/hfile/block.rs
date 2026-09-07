@@ -225,8 +225,10 @@ impl DataBlock {
     /// `content_end`, which only the block knows. So `parse` stays infallible and
     /// clamping, and this is the layer that refuses to call it out of bounds.
     pub fn read_key_value(&self, offset: usize) -> Result<KeyValue> {
-        // Room for the 4-byte key length and 4-byte value length.
-        if offset + KEY_VALUE_HEADER_SIZE > self.content_end {
+        // Room for the 4-byte key length and 4-byte value length. `saturating_add`
+        // to match the arithmetic below rather than for a reachable overflow --
+        // one function should not mix the two forms.
+        if offset.saturating_add(KEY_VALUE_HEADER_SIZE) > self.content_end {
             return Err(HFileError::InvalidFormat(format!(
                 "truncated HFile data block: {} byte(s) left at offset {offset}, too few for a \
                  {KEY_VALUE_HEADER_SIZE}-byte key/value header",
