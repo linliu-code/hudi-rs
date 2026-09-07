@@ -1261,7 +1261,7 @@ impl HFileReader {
             let mut last_kv = self.cursor.cached_kv.clone();
 
             while block.is_valid_offset(offset) {
-                let kv = block.read_key_value(offset);
+                let kv = block.read_key_value(offset)?;
                 let cmp = compare_keys(kv.key(), lookup_key);
 
                 match cmp {
@@ -1367,7 +1367,7 @@ impl HFileReader {
         let kv = if let Some(cached) = &self.cursor.cached_kv {
             cached.clone()
         } else {
-            block.read_key_value(current_offset)
+            block.read_key_value(current_offset)?
         };
 
         let next_offset = current_offset + kv.record_size();
@@ -1431,7 +1431,7 @@ impl HFileReader {
         let block_start = self.current_block_entry.as_ref().unwrap().offset as usize;
         let offset = self.cursor.offset - block_start - BLOCK_HEADER_SIZE;
 
-        let kv = block.read_key_value(offset);
+        let kv = block.read_key_value(offset)?;
         self.cursor.cached_kv = Some(kv.clone());
 
         Ok(Some(kv))

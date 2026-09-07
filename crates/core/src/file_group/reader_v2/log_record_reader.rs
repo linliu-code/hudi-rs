@@ -42,7 +42,7 @@
 
 use crate::Result;
 use crate::error::CoreError;
-use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType, LogBlock};
+use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType, CommandBlock, LogBlock};
 use crate::file_group::log_file::reader::LogFileReader;
 use crate::file_group::reader_v2::buffer::HoodieFileGroupRecordBuffer;
 use crate::file_group::reader_v2::profiling::{profile_add, profile_once};
@@ -191,8 +191,11 @@ pub fn forward_scan_pass1(
         // Every other unreadable header below returns `Err` rather than skipping.
         //
         // At `warn`, not `debug`: a skipped block changes the row count, and a
-        // CI run under `-Pwarn-log` must carry a trace of it. (Java logs this at
-        // debug; the level is the only place hudi-rs deliberately diverges.)
+        // CI run under `-Pwarn-log` must carry a trace of it. Java logs this at
+        // `debug`, so the LEVEL is a deliberate, reviewed divergence from the gold
+        // (sanctioned in R1 as concern 2) -- the behaviour is identical, and a
+        // row-count-changing skip that leaves no trace at `warn` is exactly the
+        // silent degradation D-8 exists to catch.
         if block.block_type == BlockType::Corrupted {
             log::warn!(
                 "[Pass1] Gate1: corrupt block #{total_log_blocks} skipped (the one block type \
@@ -278,7 +281,26 @@ pub fn forward_scan_pass1(
                 }
                 blocks_list.push(block);
             }
-            BlockType::Command if block.is_rollback_block() => {
+            // Every command block is classified, and one that cannot be is an
+            // error. `is_rollback_block()` reports `false` both for a genuine
+            // non-rollback command AND for a block whose COMMAND_BLOCK_TYPE header
+            // is missing or unparsable (`log_block.rs`, `matches!(…, Ok(Rollback))`),
+            // so a guard on it alone would let an unreadable header fall through to
+            // the catch-all arm and silently ignore what may have been a rollback --
+            // wrong EXTRA rows. Java throws
+            // `UnsupportedOperationException("Command type not yet supported.")` for
+            // both shapes (`AbstractHoodieLogRecordScanner.java:540`).
+            BlockType::Command => {
+                let command = block.command_block_type().map_err(|e| {
+                    CoreError::LogBlockError(format!(
+                        "[Pass1] command block #{total_log_blocks} (instant={instant_time}) has \
+                         no readable command block type: {e}. Ignoring it would silently drop a \
+                         rollback and leave the rolled-back instant merged in."
+                    ))
+                })?;
+                // Exhaustive on purpose: a command type added later must be
+                // classified here rather than falling into a catch-all.
+                let CommandBlock::Rollback = command;
                 total_rollbacks += 1;
                 // Same rule, and the more damaging direction: ignoring a rollback
                 // block whose TARGET_INSTANT_TIME cannot be read leaves the
@@ -1027,7 +1049,7 @@ impl BaseHoodieLogRecordReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_group::log_file::log_block::{CommandBlock, LogBlockContent};
+    use crate::file_group::log_file::log_block::LogBlockContent;
     use crate::file_group::log_file::log_format::LogFormatVersion;
     use crate::file_group::reader_v2::MAX_INSTANT_TIME;
 
@@ -2497,6 +2519,55 @@ mod tests {
             msg.contains("target instant") || msg.contains("Target instant"),
             "the error must name what could not be read, got: {msg}"
         );
+    }
+
+    /// A command block whose COMMAND_BLOCK_TYPE header is missing cannot be
+    /// classified, and `is_rollback_block()` reports `false` for it exactly as it
+    /// does for a genuine non-rollback command. Falling through to the catch-all
+    /// arm would silently ignore a block that may well have been a rollback --
+    /// wrong EXTRA rows. Java throws `UnsupportedOperationException("Command type
+    /// not yet supported.")` at `AbstractHoodieLogRecordScanner.java:540` for both
+    /// shapes, so hudi-rs errors for both too.
+    #[test]
+    fn test_pass1_errs_on_a_command_block_with_no_command_block_type() {
+        let mut command = make_rollback_block("20250102", "20250101");
+        command.header.remove(&BlockMetadataKey::CommandBlockType);
+
+        let err = forward_scan_pass1(
+            vec![make_data_block("20250101"), command],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect_err("a command block that cannot be classified must not be ignored");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("command block type"),
+            "the error must name the missing header, got: {msg}"
+        );
+    }
+
+    /// Same rule for a header that is present but does not parse: `CommandBlock`
+    /// has exactly one variant, so any other value is a block this reader cannot
+    /// act on, and Java's `default:` arm throws.
+    #[test]
+    fn test_pass1_errs_on_a_command_block_with_an_unparsable_command_block_type() {
+        let mut command = make_rollback_block("20250102", "20250101");
+        command.header.insert(
+            BlockMetadataKey::CommandBlockType,
+            "not-a-number".to_string(),
+        );
+
+        forward_scan_pass1(
+            vec![make_data_block("20250101"), command],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect_err("an unparsable command block type must not be ignored");
     }
 
     /// The one sanctioned skip stays a skip: an explicit corrupt block is still
