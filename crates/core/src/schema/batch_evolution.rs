@@ -294,7 +294,9 @@ fn fill_absent_field(target_field: &FieldRef, len: usize, what: &str) -> Result<
 /// nested type is refused rather than guessed at: Avro spells those as JSON
 /// objects/arrays whose mapping onto an Arrow child layout is not one line, and
 /// nothing in the corpus has one — an untested builder would be worse than a
-/// clear error.
+/// clear error. A few scalar Arrow types have no arm at all and so still fall to
+/// the catch-all below: `Decimal256`, `Time32(Second)`, `Time64(Nanosecond)` and
+/// `Timestamp(Second | Nanosecond, _)`.
 fn constant_array_from_avro_default(
     target_field: &FieldRef,
     value: &serde_json::Value,
@@ -406,6 +408,14 @@ fn constant_array_from_avro_default(
                     })?,
             )
         }
+        // Not handled specially: an Avro `uuid` logical type also maps to
+        // `FixedSizeBinary(16)`, but `arrow-avro` parses its default as a plain
+        // (36-char, hyphenated) string, not a code-point-encoded byte string. A
+        // 36-char default therefore fails loudly below on the width check (36 !=
+        // 16); a 16-char default would NOT fail the width check and would be
+        // mis-decoded as 16 raw bytes rather than a UUID. Refusing uuid defaults
+        // explicitly (e.g. by field name/metadata) is left for when the corpus
+        // actually has one.
         DataType::FixedSizeBinary(width) => {
             let bytes = avro_byte_string(value, &bad)?;
             if bytes.len() != usize::try_from(*width).unwrap_or(usize::MAX) {
@@ -2127,6 +2137,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("4-byte string"), "got: {err}");
+    }
+
+    #[test]
+    fn test_project_a_36_char_uuid_default_on_fixed_size_binary_16_errs_with_the_width_message() {
+        // An Avro `uuid` logical type also maps to FixedSizeBinary(16), but
+        // `arrow-avro` parses its default as a plain hyphenated string (36
+        // chars), not a code-point-encoded byte string. That default must fail
+        // loudly on the width check, not be silently mis-decoded.
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new("uid", DataType::FixedSizeBinary(16), false),
+                serde_json::to_string(&"550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            ),
+        ]));
+        let err = project_batch_to_schema(&b, &target)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("16-byte string"), "got: {err}");
     }
 
     #[test]
