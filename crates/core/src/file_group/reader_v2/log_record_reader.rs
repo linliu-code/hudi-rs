@@ -453,7 +453,21 @@ pub struct Pass2Result {
 ///
 /// **Invariant 4**: `current_instant_log_blocks` is ordered latest-first (reverse chronological).
 /// Drain via `pop_back` produces oldest-first processing order.
-pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
+///
+/// ## Why this returns `Result`
+///
+/// Every one of the three block lookups below is guaranteed to hit for a
+/// [`Pass1Result`] that [`forward_scan_pass1`] actually built (see the comment at
+/// each site). But `Pass1Result` is a `pub` struct with `pub` fields and this is a
+/// `pub` function, so the guarantee is a property of one caller, not of the type —
+/// and the failure it guards is not a crash but a **silent wrong row count**: the
+/// old code `continue`d or `unwrap_or_default()`ed, returned `Ok`, and handed back
+/// a scan with an instant's rows missing, or with the instant recorded in
+/// `instant_times_included`/`valid_block_instants` and **no** blocks enqueued —
+/// breaking Invariant 2 above. That is exactly the shape the R1 fail-loud wave
+/// removed from Pass 1, so it is made loud here rather than left to a
+/// `debug_assert!` that vanishes in the release build the JNI library ships.
+pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Result<Pass2Result> {
     log::debug!(
         "[Pass2] reverse_scan: {} instants to process (newest→oldest)",
         pass1.ordered_instants_list.len(),
@@ -466,9 +480,31 @@ pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
 
     for i in (0..pass1.ordered_instants_list.len()).rev() {
         let instant_time = &pass1.ordered_instants_list[i];
+        // Pass 1 pushes an instant onto `ordered_instants_list` only inside the
+        // data/delete arm, at the moment its (freshly `or_default()`ed) block list
+        // is about to receive its first block, and its rollback arm drops the
+        // target from the list and the map in the same two statements. So for a
+        // `Pass1Result` that `forward_scan_pass1` built, neither miss below can
+        // happen -- but `Pass1Result` is `pub` with `pub` fields and this is a
+        // `pub` fn, so the guarantee is not enforceable at the type level. A miss
+        // is therefore reported, not skipped: the old `_ => continue` returned
+        // `Ok` with that instant's rows silently absent.
         let instants_blocks = match pass1.instant_to_blocks_map.get(instant_time) {
             Some(blocks) if !blocks.is_empty() => blocks,
-            _ => continue,
+            Some(_) => {
+                return Err(CoreError::LogBlockError(format!(
+                    "[Pass2] instant {instant_time} is in ordered_instants_list but its entry in \
+                     instant_to_blocks_map is empty. Skipping it would drop that instant's rows \
+                     and return Ok (Invariant 2)."
+                )));
+            }
+            None => {
+                return Err(CoreError::LogBlockError(format!(
+                    "[Pass2] instant {instant_time} is in ordered_instants_list but absent from \
+                     instant_to_blocks_map. Skipping it would drop that instant's rows and \
+                     return Ok (Invariant 2)."
+                )));
+            }
         };
 
         let first_block = &instants_blocks[0];
@@ -495,24 +531,47 @@ pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
                 if instant_times_included.contains(&final_instant) {
                     continue;
                 }
-                if let Some(blocks) = pass1.instant_to_blocks_map.get(&final_instant) {
-                    let mut reversed = blocks.clone();
-                    reversed.reverse();
-                    for block in reversed {
-                        current_instant_log_blocks.push_back(block);
-                    }
+                // The value side of `block_time_to_compaction_block_time_map` is
+                // always an instant that the guard above already admitted: every
+                // insert takes `final_instant` either from the instant being
+                // visited (admitted this iteration) or from an existing value of
+                // the same map (admitted inductively), and nothing in this loop
+                // mutates `instant_to_blocks_map`. So this lookup cannot miss --
+                // but the old `if let` with no `else` fell through to the two
+                // pushes below, recording the instant in
+                // `instant_times_included`/`valid_block_instants` with **zero**
+                // blocks enqueued: Invariant 2 broken, `Ok` returned, rows gone.
+                let Some(blocks) = pass1.instant_to_blocks_map.get(&final_instant) else {
+                    return Err(CoreError::LogBlockError(format!(
+                        "[Pass2] instant {instant_time} resolves through compaction to \
+                         {final_instant}, which is absent from instant_to_blocks_map. Recording \
+                         it with no blocks would break Invariant 2 and return Ok."
+                    )));
+                };
+                let mut reversed = blocks.clone();
+                reversed.reverse();
+                for block in reversed {
+                    current_instant_log_blocks.push_back(block);
                 }
                 instant_times_included.insert(final_instant.clone());
                 valid_block_instants.push(final_instant);
             } else {
                 // Not compacted — add blocks directly
                 // Java: Collections.reverse(logBlocks) then forEach(addLast)
-                let blocks = pass1
-                    .instant_to_blocks_map
-                    .get(instant_time)
-                    .cloned()
-                    .unwrap_or_default();
-                let mut reversed = blocks;
+                //
+                // Same key as the guard at the top of this iteration, which already
+                // admitted it as present and non-empty; the lookup is repeated only
+                // because that borrow had to be released. `unwrap_or_default()` here
+                // would silently enqueue nothing for an instant it then records --
+                // the same Invariant 2 break as above.
+                let Some(blocks) = pass1.instant_to_blocks_map.get(instant_time) else {
+                    return Err(CoreError::LogBlockError(format!(
+                        "[Pass2] instant {instant_time} passed the block-list guard but is now \
+                         absent from instant_to_blocks_map. Enqueuing nothing for it would break \
+                         Invariant 2 and return Ok."
+                    )));
+                };
+                let mut reversed = blocks.clone();
                 reversed.reverse();
                 for block in reversed {
                     current_instant_log_blocks.push_back(block);
@@ -529,11 +588,11 @@ pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
         valid_block_instants,
     );
 
-    Pass2Result {
+    Ok(Pass2Result {
         current_instant_log_blocks,
         instant_times_included,
         valid_block_instants,
-    }
+    })
 }
 
 // =========================================================================
@@ -684,7 +743,7 @@ impl BaseHoodieLogRecordReader {
         self.total_rollbacks = pass1.total_rollbacks;
 
         // Pass 2: Reverse iteration with compaction resolution
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 = reverse_scan_pass2(&mut pass1)?;
 
         self.valid_block_instants = pass2.valid_block_instants;
 
@@ -1836,7 +1895,8 @@ mod tests {
             make_data_block("t3"),
         ];
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
-        let pass2 = reverse_scan_pass2(&mut pass1);
+        let pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         let included: HashSet<&String> = pass2.instant_times_included.iter().collect();
         let valid: HashSet<&String> = pass2.valid_block_instants.iter().collect();
@@ -1857,7 +1917,8 @@ mod tests {
             make_data_block("t3"),
         ];
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
-        let pass2 = reverse_scan_pass2(&mut pass1);
+        let pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // All blocks in deque belong to valid instants
         for block in &pass2.current_instant_log_blocks {
@@ -1894,7 +1955,8 @@ mod tests {
             make_compacted_block("i3", "i1,i2"),
         ];
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
-        let pass2 = reverse_scan_pass2(&mut pass1);
+        let pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // Only i3 (compacted) should be in valid_block_instants
         assert_eq!(pass2.valid_block_instants, vec!["i3"]);
@@ -1921,7 +1983,8 @@ mod tests {
             make_data_block("t3"),
         ];
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // pop_back drains tail-first = oldest first
         let first = pass2.current_instant_log_blocks.pop_back().unwrap();
@@ -1963,7 +2026,8 @@ mod tests {
         // Verify pass1 accumulated correctly
         assert_eq!(pass1.instant_to_blocks_map["t2"].len(), 2);
 
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // Drain via pop_back: should be t1's blocks, then t2's in original order
         let b1 = pass2.current_instant_log_blocks.pop_back().unwrap();
@@ -2001,7 +2065,8 @@ mod tests {
         assert_eq!(pass1.ordered_instants_list, vec!["20250101", "20250103"]);
         assert!(!pass1.instant_to_blocks_map.contains_key("20250102"));
 
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // pop_back: B1(20250101) first, then B4(20250103)
         let first = pass2.current_instant_log_blocks.pop_back().unwrap();
@@ -2035,7 +2100,8 @@ mod tests {
         assert_eq!(pass1.instant_to_blocks_map["t2"].len(), 1);
         assert_eq!(pass1.instant_to_blocks_map["t3"].len(), 2);
 
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // Deque has 5 blocks. pop_back should produce: A,B,C,D,E
         assert_eq!(pass2.current_instant_log_blocks.len(), 5);
@@ -2173,7 +2239,8 @@ mod tests {
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
         assert_eq!(pass1.ordered_instants_list, vec!["t1", "t2", "t3"]);
 
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // Verify deque ordering: pop_back gives t1, t2, t3 (oldest first)
         let mut buffer = make_test_buffer();
@@ -2240,7 +2307,8 @@ mod tests {
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
         assert_eq!(pass1.instant_to_blocks_map["t1"].len(), 2);
 
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         let mut buffer = make_test_buffer();
         let mut order_instants = Vec::new();
@@ -2332,7 +2400,8 @@ mod tests {
         ];
 
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         let mut buffer = make_test_buffer();
         while let Some(mut block) = pass2.current_instant_log_blocks.pop_back() {
@@ -2381,7 +2450,8 @@ mod tests {
         ];
 
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         let mut buffer = make_test_buffer();
         while let Some(mut block) = pass2.current_instant_log_blocks.pop_back() {
@@ -2441,7 +2511,8 @@ mod tests {
         assert_eq!(pass1.ordered_instants_list, vec!["20250103"]);
         assert!(!pass1.instant_to_blocks_map.contains_key("20250102"));
 
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
         let mut buffer = make_test_buffer();
         while let Some(mut block) = pass2.current_instant_log_blocks.pop_back() {
             buffer.process_data_block(&mut block).unwrap();
@@ -2723,5 +2794,91 @@ mod tests {
             !result.instant_to_blocks_map.contains_key("20250101"),
             "the rolled-back instant's blocks must be dropped"
         );
+    }
+
+    /// Invariant 2 of `reverse_scan_pass2` says every instant in
+    /// `instant_times_included`/`valid_block_instants` has its blocks in
+    /// `current_instant_log_blocks`. An instant that is in `ordered_instants_list`
+    /// but has no blocks in `instant_to_blocks_map` is the input that breaks it,
+    /// and the old `_ => continue` swallowed it: `Ok`, one instant fewer, no error
+    /// and nothing at `warn` -- the exact silent-wrong-row-count shape the R1 wave
+    /// removed one function up.
+    #[test]
+    fn test_pass2_errs_when_an_ordered_instant_has_no_blocks() {
+        let mut pass1 = forward_scan_pass1(
+            vec![make_data_block("20250101")],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect("pass 1 accepts a lone data block");
+        pass1.ordered_instants_list.push("20250102".to_string());
+
+        let err = reverse_scan_pass2(&mut pass1)
+            .expect_err("an ordered instant with no blocks must not be skipped in silence");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("20250102"),
+            "the error must name the instant, got: {msg}"
+        );
+        assert!(
+            msg.contains("Invariant 2"),
+            "the error must name the invariant it protects, got: {msg}"
+        );
+    }
+
+    /// The other half of the same guard: present in the map, but with an empty
+    /// block list. Pass 1 never produces one (`entry(..).or_default()` is followed
+    /// immediately by a `push`), and it is just as wrong to drop in silence.
+    #[test]
+    fn test_pass2_errs_when_an_ordered_instant_has_an_empty_block_list() {
+        let mut pass1 = forward_scan_pass1(
+            vec![make_data_block("20250101")],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect("pass 1 accepts a lone data block");
+        pass1.ordered_instants_list.push("20250102".to_string());
+        pass1
+            .instant_to_blocks_map
+            .insert("20250102".to_string(), Vec::new());
+
+        let err = reverse_scan_pass2(&mut pass1)
+            .expect_err("an empty block list must not be skipped in silence");
+
+        assert!(
+            err.to_string().contains("20250102"),
+            "the error must name the instant, got: {err}"
+        );
+    }
+
+    /// The well-formed path is unchanged: every instant Pass 1 ordered still gets
+    /// its blocks enqueued, newest-first, and Pass 2 still returns `Ok`.
+    #[test]
+    fn test_pass2_still_ok_for_a_well_formed_pass1_result() {
+        let mut pass1 = forward_scan_pass1(
+            vec![
+                make_data_block("20250101"),
+                make_data_block("20250102"),
+                make_delete_block("20250103"),
+            ],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect("pass 1");
+
+        let pass2 = reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is always well formed");
+
+        assert_eq!(
+            pass2.valid_block_instants,
+            vec!["20250103", "20250102", "20250101"]
+        );
+        assert_eq!(pass2.current_instant_log_blocks.len(), 3);
     }
 }
