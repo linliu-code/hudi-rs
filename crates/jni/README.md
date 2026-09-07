@@ -54,12 +54,16 @@ library ahead of the jar; ship jar and library together.**
 
 ## Where the carrier is served from
 
-The Maven coordinates (`io.onehouse.hudi-rs:hudi-jni-native:<version>:<os>-<arch>`) are the same
-regardless of where the jar comes from — only the repository it resolves from changes:
+The Maven coordinates are the same regardless of where the jar comes from — only the repository
+it resolves from (and whether a classifier is present) changes:
 
-- **CodeArtifact**, via `make jni-deploy` (needs a fresh `codeartifact` token in
-  `~/.m2/settings.xml`).
-- **This machine's local Maven repository**, via `make jni-install`.
+- **CodeArtifact**, via CI (`jni-native.yml`, see "Building the carrier" below — a single
+  classifier-less `io.onehouse.hudi-rs:hudi-jni-native:<version>` jar carrying BOTH Linux
+  arches, D-26) or, for a single-arch jar, `make jni-deploy`
+  (`io.onehouse.hudi-rs:hudi-jni-native:<version>:<os>-<arch>`, needs a fresh `codeartifact`
+  token in `~/.m2/settings.xml`).
+- **This machine's local Maven repository**, via `make jni-install` (single-arch,
+  classifier) or `make jni-install JNI_MULTI=1` (multi-arch, no classifier).
 - **A pre-release asset on `onehouseinc/hudi-internal`**:
   ```
   gh release create hudi-jni-native/<version> \
@@ -68,24 +72,106 @@ regardless of where the jar comes from — only the repository it resolves from 
   ```
   hudi-internal's `bot.yml` installs this asset into the runner's local repository before its
   Maven build when the coordinate does not resolve from CodeArtifact (D-18 in the effort
-  workspace).
+  workspace). This is the fallback route if CI's OIDC assume fails (see below).
+
+## Building the carrier
+
+### CI (`.github/workflows/jni-native.yml`)
+
+Triggers:
+- Push a tag `jni-native/<version>` (e.g. `jni-native/0.5.0-dev.abc1234`) at the commit to
+  build.
+- `workflow_dispatch` (kept for when this file reaches the default branch, AS-16) with an
+  optional `version` input; defaults to the tag's suffix, else `0.5.0-dev.<short sha>`.
+
+A `build` job matrix runs BOTH Linux arches in parallel — `x86_64` on `ubuntu-24.04`,
+`aarch64` on `ubuntu-24.04-arm` — each leg: `make jni-lib JNI_ARCH=<arch>`, an assertion that
+the `.so` exports exactly 2 `Java_...` symbols, and a **JNI load smoke**
+(`.github/jni-smoke/org/apache/hudi/io/nativereader/NativeFileGroupReader.java` — same
+package/class as the real reader, only the `version()` liveness probe) that `System.load`s the
+just-built library and checks its output matches `SMOKE hudi-jni .* abi=3`. Each leg uploads its
+`.so` plus properties as a workflow artifact (`libhudi_jni-linux-<arch>`).
+
+A `package` job (needs both legs) downloads both artifacts, assembles ONE classifier-less jar
+(layout below), uploads it as a workflow artifact (`hudi-jni-native-carrier`), then publishes it
+to the org's CodeArtifact Maven repo (`onehouse-internal`, D-26) via `mvn deploy:deploy-file`
+under the OIDC role `GithubActionsPublishHudi-RepositoryPublisherRole-10H7ABJVFNSQ9` — the same
+role hudi-rs-internal's former `publish-native-lib.yml` assumed — and verifies the publish
+resolves with `dependency:get` against a clean local `~/.m2/repository`. A new coordinate per
+version; never an overwrite. If the OIDC assume fails, the jar still exists as a workflow
+artifact and the orchestrator falls back to the release-asset route above.
+
+### Local fallback (`make jni-jar-multi`)
+
+When CI isn't available (or to rehearse the assembly locally), build this machine's arch and
+merge in another arch's library built elsewhere:
+
+```
+make jni-lib                                          # this machine's arch, into target/jni-native/stage
+make jni-jar-multi JNI_EXTRA_NATIVE_DIR=/path/to/dir  # dir holds native/linux-<other-arch>/libhudi_jni.so
+```
+
+produces `target/jni-native/hudi-jni-native-<version>.jar` with both arches staged, no
+classifier. `JNI_EXTRA_NATIVE_DIR` is required — the target refuses to run without it. `make
+jni-install JNI_MULTI=1` / `make jni-deploy JNI_MULTI=1` (both depend on `jni-jar-multi`, so
+still need `JNI_EXTRA_NATIVE_DIR`) install/deploy that jar under
+`io.onehouse.hudi-rs:hudi-jni-native:<version>` with no classifier.
+
+### Multi-arch jar layout and properties keys
+
+```
+native/linux-x86_64/libhudi_jni.so
+native/linux-aarch64/libhudi_jni.so
+META-INF/hudi-jni-native.properties
+```
+
+```
+hudi-rs.sha=<git rev-parse HEAD>
+abi=<JNI_ABI_VERSION>
+built=<UTC timestamp>
+arch=linux-x86_64,linux-aarch64
+md5.linux-x86_64=<md5 of native/linux-x86_64/libhudi_jni.so>
+md5.linux-aarch64=<md5 of native/linux-aarch64/libhudi_jni.so>
+```
+
+(the single-arch jar's properties file keeps its original shape — see "Make targets" below.)
+
+### Consumer side (hudi-internal)
+
+`hudi-native-reader` resolves the classpath resource `/native/<os>-<arch>/libhudi_jni.so` out of
+whichever jar is on its runtime classpath. The multi-arch jar satisfies that resolution on
+either Linux arch from the SAME coordinate (no classifier), so hudi-internal's dependency
+declaration and its `bot.yml`/publish-consuming workflow no longer need to pick a classifier per
+runner — only the `hudi.jni.native.version` property needs to move in lockstep with
+`JNI_ABI_VERSION` (see "Lockstep rule" below).
 
 ## Make targets
 
 ```
-make jni-lib     # cargo build -p hudi-jni --release; strip the .so; stage it plus
-                  # META-INF/hudi-jni-native.properties under target/jni-native/stage
-make jni-jar     # package the staged tree as
-                  # target/jni-native/hudi-jni-native-<version>-<os>-<arch>.jar
-make jni-deploy  # mvn deploy:deploy-file the jar to CodeArtifact
-                  # (server id `codeartifact` in ~/.m2/settings.xml)
-make jni-install # mvn install:install-file the jar into the local Maven
-                  # repository (~/.m2) for builds on this machine
+make jni-lib        # cargo build -p hudi-jni --release; strip the .so; stage it plus
+                     # META-INF/hudi-jni-native.properties under target/jni-native/stage
+                     # (rm -rf's the stage dir first; refuses a dirty tree unless
+                     # JNI_ALLOW_DIRTY=1)
+make jni-jar        # package the staged tree as
+                     # target/jni-native/hudi-jni-native-<version>-<os>-<arch>.jar;
+                     # JNI_MULTI=1 drops the classifier (same name jni-jar-multi
+                     # produces, but packaging only THIS arch's library — a naming
+                     # sanity check, not a substitute for jni-jar-multi)
+make jni-jar-multi  # merge in JNI_EXTRA_NATIVE_DIR (another arch's native/<os>-<arch>/
+                     # libhudi_jni.so) and package ONE classifier-less
+                     # target/jni-native/hudi-jni-native-<version>.jar
+make jni-deploy      # mvn deploy:deploy-file the jar to CodeArtifact
+                     # (server id `codeartifact` in ~/.m2/settings.xml);
+                     # JNI_MULTI=1 deploys the jni-jar-multi jar (no classifier)
+make jni-install     # mvn install:install-file the jar into the local Maven
+                     # repository (~/.m2) for builds on this machine;
+                     # JNI_MULTI=1 installs the jni-jar-multi jar (no classifier)
 ```
 
-`jni-jar` depends on `jni-lib`; `jni-deploy` and `jni-install` depend on `jni-jar`. `jar` must
-come from a JDK on `PATH` (e.g. `export JAVA_HOME=~/.jenv/versions/17;
-export PATH="$JAVA_HOME/bin:$PATH"`).
+`jni-jar` and `jni-jar-multi` depend on `jni-lib`; `jni-deploy` and `jni-install` depend on
+`jni-jar` (or, with `JNI_MULTI=1`, on `jni-jar-multi` — which then also needs
+`JNI_EXTRA_NATIVE_DIR`). `jar` must come from a JDK on `PATH` (e.g. `export
+JAVA_HOME=~/.jenv/versions/17; export PATH="$JAVA_HOME/bin:$PATH"`).
 
 The staged properties file (`META-INF/hudi-jni-native.properties`) records the hudi-rs commit,
 the JNI ABI, the build timestamp, and the `.so`'s md5:

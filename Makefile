@@ -147,12 +147,30 @@ JNI_ARCH ?= $(shell uname -m | sed 's/arm64/aarch64/;s/amd64/x86_64/')
 JNI_OS ?= linux
 JNI_OUT ?= target/jni-native
 JNI_STAGE := $(JNI_OUT)/stage
-JNI_JAR := $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION)-$(JNI_OS)-$(JNI_ARCH).jar
+# internal-only default; override for other hosts
 CODEARTIFACT_URL ?= https://onehouse-194159489498.d.codeartifact.us-west-2.amazonaws.com/maven/onehouse-internal/
 
+# JNI_MULTI=1 switches jni-jar/jni-install/jni-deploy onto the classifier-less multi-arch jar
+# name (the same one jni-jar-multi produces) instead of the single-arch classifier jar; it does
+# NOT by itself merge in another arch's library — that's jni-jar-multi's JNI_EXTRA_NATIVE_DIR job,
+# which jni-install/jni-deploy pull in as their prerequisite under JNI_MULTI=1.
+ifeq ($(JNI_MULTI),1)
+JNI_JAR := $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar
+JNI_DEPLOY_PREREQ := jni-jar-multi
+JNI_CLASSIFIER_ARG :=
+JNI_DEPLOY_COORD := io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION)
+else
+JNI_JAR := $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION)-$(JNI_OS)-$(JNI_ARCH).jar
+JNI_DEPLOY_PREREQ := jni-jar
+JNI_CLASSIFIER_ARG := -Dclassifier=$(JNI_OS)-$(JNI_ARCH)
+JNI_DEPLOY_COORD := io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH)
+endif
+
 .PHONY: jni-lib
-jni-lib: ## Build libhudi_jni.so (release) and stage a stripped copy under target/jni-native
+jni-lib: ## Build libhudi_jni.so (release) and stage a stripped copy under target/jni-native (refuses a dirty tree; JNI_ALLOW_DIRTY=1 overrides)
 	$(info --- Build hudi-jni (release) ---)
+	test -z "$$(git status --porcelain)" || { echo "dirty tree; set JNI_ALLOW_DIRTY=1 to override"; test -n "$(JNI_ALLOW_DIRTY)"; }
+	rm -rf $(JNI_STAGE)
 	./build-wrapper.sh cargo build -p hudi-jni --release
 	mkdir -p $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH) $(JNI_STAGE)/META-INF
 	strip -o $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so target/release/libhudi_jni.so
@@ -165,23 +183,33 @@ jni-lib: ## Build libhudi_jni.so (release) and stage a stripped copy under targe
 	cat $(JNI_STAGE)/META-INF/hudi-jni-native.properties
 
 .PHONY: jni-jar
-jni-jar: jni-lib ## Package the staged library as hudi-jni-native-<version>-<os>-<arch>.jar
+jni-jar: jni-lib ## Package the staged library as hudi-jni-native-<version>-<os>-<arch>.jar (JNI_MULTI=1 drops the classifier, matching jni-jar-multi's name)
 	$(info --- Package $(JNI_JAR) ---)
 	rm -f $(JNI_JAR) && jar cf $(JNI_JAR) -C $(JNI_STAGE) .
 	unzip -l $(JNI_JAR)
 
+.PHONY: jni-jar-multi
+jni-jar-multi: jni-lib ## Package this arch's library plus JNI_EXTRA_NATIVE_DIR (native/<os>-<arch>/libhudi_jni.so from other legs) as ONE jar
+	test -n "$(JNI_EXTRA_NATIVE_DIR)" || { echo "JNI_EXTRA_NATIVE_DIR is required"; exit 2; }
+	cp -r $(JNI_EXTRA_NATIVE_DIR)/native/. $(JNI_STAGE)/native/
+	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\narch=%s\n' "$$(git rev-parse HEAD)" \
+	  "$$(grep -o 'JNI_ABI_VERSION: u32 = [0-9]*' crates/jni/src/lib.rs | grep -o '[0-9]*$$')" \
+	  "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$(ls $(JNI_STAGE)/native | paste -sd,)" > $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+	for d in $(JNI_STAGE)/native/*; do printf 'md5.%s=%s\n' "$$(basename $$d)" "$$(md5sum $$d/libhudi_jni.so | cut -d' ' -f1)" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties; done
+	rm -f $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar && jar cf $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar -C $(JNI_STAGE) . && unzip -l $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar
+
 .PHONY: jni-deploy
-jni-deploy: jni-jar ## Deploy the carrier jar to CodeArtifact (server id `codeartifact` in ~/.m2/settings.xml)
-	$(info --- Deploy $(JNI_JAR) as io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH) ---)
+jni-deploy: $(JNI_DEPLOY_PREREQ) ## Deploy the carrier jar to CodeArtifact (server id `codeartifact` in ~/.m2/settings.xml); JNI_MULTI=1 deploys the classifier-less multi-arch jar (needs JNI_EXTRA_NATIVE_DIR)
+	$(info --- Deploy $(JNI_JAR) as $(JNI_DEPLOY_COORD) ---)
 	mvn -B -ntp deploy:deploy-file -Dfile=$(JNI_JAR) -DgroupId=io.onehouse.hudi-rs -DartifactId=hudi-jni-native \
-	  -Dversion=$(JNI_VERSION) -Dclassifier=$(JNI_OS)-$(JNI_ARCH) -Dpackaging=jar -DgeneratePom=true \
+	  -Dversion=$(JNI_VERSION) $(JNI_CLASSIFIER_ARG) -Dpackaging=jar -DgeneratePom=true \
 	  -DrepositoryId=codeartifact -Durl=$(CODEARTIFACT_URL)
 
 .PHONY: jni-install
-jni-install: jni-jar ## Install the carrier jar into the local Maven repository (~/.m2) for builds on this machine
-	$(info --- Install $(JNI_JAR) into the local Maven repository as io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH) ---)
+jni-install: $(JNI_DEPLOY_PREREQ) ## Install the carrier jar into the local Maven repository (~/.m2) for builds on this machine; JNI_MULTI=1 installs the classifier-less multi-arch jar (needs JNI_EXTRA_NATIVE_DIR)
+	$(info --- Install $(JNI_JAR) into the local Maven repository as $(JNI_DEPLOY_COORD) ---)
 	mvn -B -ntp install:install-file -Dfile=$(JNI_JAR) -DgroupId=io.onehouse.hudi-rs -DartifactId=hudi-jni-native \
-	  -Dversion=$(JNI_VERSION) -Dclassifier=$(JNI_OS)-$(JNI_ARCH) -Dpackaging=jar -DgeneratePom=true
+	  -Dversion=$(JNI_VERSION) $(JNI_CLASSIFIER_ARG) -Dpackaging=jar -DgeneratePom=true
 
 .PHONY: coverage
 coverage: coverage-rust ## Generate coverage report (alias for coverage-rust)
