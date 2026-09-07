@@ -58,6 +58,9 @@ use jni::sys::{jboolean, jlong, jstring};
 ///     means match-nothing (was: whole slice, D-12) and an empty `latestInstant` is refused
 ///     (was: read everything, D-13). Bumped so a jar that still expects the old meanings
 ///     refuses this library rather than mis-reading a lookup.
+///     (`638ce3b`: evaluated under rule 2 and declined — no bump, D-21. It changed what the
+///     native side does with `dataSchemaJson` but only turns an error into a correct result,
+///     byte-identical for every previously-succeeding input. See the README's worked example.)
 pub const JNI_ABI_VERSION: u32 = 3;
 
 const EXCEPTION_CLASS: &str = "org/apache/hudi/io/nativereader/NativeReaderException";
@@ -163,7 +166,8 @@ fn throw(env: &mut JNIEnv, message: String) {
 /// `lookupKeysArePrefixes` is set. `validInstants` is the set of valid instant
 /// timestamps; a null array means no instant filter.
 ///
-/// Changing this parameter list requires bumping [`JNI_ABI_VERSION`].
+/// Changing this parameter list requires bumping [`JNI_ABI_VERSION`] — that is clause 1
+/// of the rule, not all of it; see `crates/jni/README.md`, "When to bump it", for the full one.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReader_readFileGroupInto<
     'local,
