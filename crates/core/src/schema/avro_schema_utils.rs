@@ -81,13 +81,18 @@ fn types_equivalent(a: &DataType, b: &DataType) -> bool {
 /// Whether two Avro schema JSONs describe the same schema, for the purpose of
 /// deciding that resolving one against the other would be a no-op.
 ///
-/// Needed because the two JSONs that meet at that decision are never the same
-/// string even when they are the same schema. The reader side is
-/// [`append_mandatory_fields_avro_json`]'s output, i.e. `serde_json::to_string`
-/// of a parsed `Value` — and `serde_json` is built here without `preserve_order`,
-/// so its objects are `BTreeMap`s and it re-emits keys **alphabetically**. The
-/// writer side is whatever Java Avro's `Schema.toString()` wrote into the file,
-/// which is not key-sorted. A `!=` on the two strings is therefore always true.
+/// Needed because comparing the two JSONs as strings is unsound in both
+/// directions. The reader side is [`append_mandatory_fields_avro_json`]'s
+/// output, i.e. `serde_json::to_string` of a parsed `Value`; the writer side is
+/// whatever Java Avro's `Schema.toString()` wrote into the file. `serde_json` is
+/// built here **with** `preserve_order` (see the workspace `Cargo.toml`), so that
+/// round trip keeps the key order it parsed and the two strings *can* coincide —
+/// on an unevolved read of a Java-written table they often do. They still differ
+/// whenever the producer spells the same schema differently: another
+/// indentation, a namespace materialised into an explicit attribute, a different
+/// field order, or a schema the reader genuinely evolved. Equal strings would
+/// license skipping resolution, unequal strings license nothing, so the
+/// comparison stays structural either way.
 ///
 /// The comparison is structural (`serde_json::Value` equality, which is
 /// key-order and whitespace insensitive) with `"doc"` stripped, and deliberately

@@ -119,10 +119,13 @@ impl HFileBaseFileReader {
         // Resolution the file does not need is resolution nobody should pay for:
         // a table written by the reader's own release hands back its own schema.
         // Compared as SCHEMAS, not as strings — the reader JSON arrives from
-        // `append_mandatory_fields_avro_json`, whose `serde_json` re-serialization
-        // sorts keys, while `json` here is whatever Java Avro's `Schema.toString()`
-        // wrote into the file. The two are never the same string, so a `!=` would
-        // leave every unevolved read paying for a resolving decoder.
+        // `append_mandatory_fields_avro_json`, a `serde_json` round trip, while
+        // `json` here is whatever Java Avro's `Schema.toString()` wrote into the
+        // file. `serde_json` is built with `preserve_order`, so the two strings
+        // may well be equal for a Java-written table, but nothing guarantees it:
+        // a different producer, indentation, field order or an explicitly spelled
+        // namespace puts one schema in two strings, and a `!=` would then leave an
+        // unevolved read paying for a resolving decoder it does not need.
         let mut reader_schema_json: Option<String> = reader_schema_json.map(str::to_string);
         if let Some(candidate) = reader_schema_json.as_deref()
             && crate::schema::avro_schema_utils::avro_schema_json_equivalent(candidate, &json)
