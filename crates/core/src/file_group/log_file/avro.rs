@@ -484,6 +484,34 @@ mod multi_batch_tests {
 #[cfg(test)]
 mod tests {
     use super::AvroBlockDecoder;
+    use super::RegisteredWriterSchema;
+
+    /// Building a decoder from an already-registered writer schema does not
+    /// re-canonicalise the reader schema it has already seen.
+    ///
+    /// The two callers that matter build one decoder per HFile WINDOW
+    /// (`base_file::hfile`'s `decode_window`) and one per log BLOCK
+    /// (`log_file::content`'s `avro_decoder_for`), always with the same reader
+    /// schema string; canonicalising it there is a full parse and re-emit of a
+    /// schema that is 8 KB on the metadata table, which is more than the rest of
+    /// either loop. The writer half has been registered once per schema since it
+    /// was written — this pins the same property for the reader half.
+    #[test]
+    fn the_reader_schema_is_canonicalised_once_however_many_decoders_are_built() {
+        let writer = r#"{"type":"record","name":"r","namespace":"org.example","fields":[{"name":"num","type":"int"}]}"#;
+        let reader = r#"{"type":"record","name":"r","namespace":"org.example","fields":[{"name":"num","type":"long"}]}"#;
+
+        let registered = RegisteredWriterSchema::new(writer).unwrap();
+        let before = crate::schema::avro_names::canonicalizations_run();
+        for _ in 0..16 {
+            AvroBlockDecoder::try_new_with_registered(&registered, Some(reader), 1024).unwrap();
+        }
+        assert_eq!(
+            crate::schema::avro_names::canonicalizations_run() - before,
+            1,
+            "16 decoders over one reader schema must canonicalise it once"
+        );
+    }
 
     /// A block written before a column was promoted still reads at the promoted
     /// type. Avro defines int → long as a promotion, so the decoder resolves it

@@ -115,11 +115,77 @@ fn qualify_reference(reference: &str, enclosing: Option<&str>) -> String {
 /// rewrite and not `apache_avro`'s canonical form (that drops all of them).
 /// The pass is idempotent and is the identity on Java-form input.
 ///
+/// The result is memoised per distinct input string, because the callers run
+/// this on the schema-sized path they otherwise optimise to the microsecond: the
+/// reader schema is canonicalised once per HFile WINDOW and once per log BLOCK,
+/// and re-parsing plus re-emitting the metadata table's 8 KB record schema each
+/// time costs more than everything else those loops do. The writer side has had
+/// the equivalent cache since it was written (`log_file::content`'s
+/// `registered_for`); this gives the reader side one too, without moving the
+/// canonicalisation out of the one place that guarantees both sides get it.
+///
 /// # Errors
 ///
 /// The input is not JSON, is not an Avro schema (a schema position holding a
 /// number, say), or a named type has no string `name`.
 pub fn canonicalize_avro_schema_json(json: &str) -> Result<String> {
+    if let Some(hit) = MEMO.with_borrow_mut(|memo| {
+        let found = memo.iter().position(|(input, _)| input == json)?;
+        // Most-recently-used first, so the two live spellings of one read stay
+        // resident whichever order the callers ask for them in.
+        memo[..=found].rotate_right(1);
+        Some(memo[0].1.clone())
+    }) {
+        return Ok(hit);
+    }
+    let canonical = canonicalize_uncached(json)?;
+    MEMO.with_borrow_mut(|memo| {
+        memo.truncate(MEMO_ENTRIES - 1);
+        memo.insert(0, (json.to_string(), canonical.clone()));
+    });
+    #[cfg(test)]
+    MEMO_MISSES.with(|misses| misses.set(misses.get() + 1));
+    Ok(canonical)
+}
+
+/// How many distinct schema strings the memo holds. Two, because one read has
+/// two live spellings — the file's writer schema and the caller's reader schema
+/// — and they alternate; a third would only buy something for a caller that
+/// interleaves reads of differently-shaped files on one thread.
+const MEMO_ENTRIES: usize = 2;
+
+thread_local! {
+    /// `(input, canonical)`, most-recently-used first.
+    ///
+    /// Thread-local rather than shared: the pass is a pure function of its
+    /// input, so a per-thread copy needs no lock on a path that is otherwise
+    /// lock-free, and a thread that never canonicalises pays nothing. The cost
+    /// is that a thread retains at most `MEMO_ENTRIES` schema strings and their
+    /// canonical forms for its lifetime — tens of kilobytes for the metadata
+    /// table's schema.
+    static MEMO: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static MEMO_MISSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many canonicalisations have actually run on the current thread, i.e. memo
+/// misses. Per-thread like the memo itself, so a test reads only its own work
+/// even though the suite runs in parallel; callers compare a delta, never an
+/// absolute.
+#[cfg(test)]
+pub(crate) fn canonicalizations_run() -> u64 {
+    MEMO_MISSES.with(std::cell::Cell::get)
+}
+
+/// [`canonicalize_avro_schema_json`] without the memo. Also what the tests that
+/// assert the pass itself call, so a cache hit can never stand in for the
+/// algorithm — an idempotence check whose second input is the first's output
+/// would otherwise be answered from the memo.
+fn canonicalize_uncached(json: &str) -> Result<String> {
     let value: Value = serde_json::from_str(json)
         .map_err(|e| CoreError::Schema(format!("Avro schema JSON is not parseable: {e}")))?;
     let canonical = rewrite_schema(&value, None)?;
@@ -301,7 +367,7 @@ mod tests {
                     checked_semantically += 1;
                 }
                 assert_eq!(
-                    canonicalize_avro_schema_json(&canonical).unwrap(),
+                    canonicalize_uncached(&canonical).unwrap(),
                     canonical,
                     "{} is not idempotent",
                     path.display()
@@ -416,8 +482,10 @@ mod tests {
             r#"{"type":"record","name":"org.example.Outer","fields":[{"name":"inner","type":{"type":"record","name":"Inner","namespace":"org.example","fields":[{"name":"v","type":["null","org.example.Inner"],"default":null}]}}]}"#,
             r#"{"type":"record","name":"Outer","fields":[{"name":"v","type":"int"}]}"#,
         ] {
-            let once = canonicalize_avro_schema_json(schema).unwrap();
-            let twice = canonicalize_avro_schema_json(&once).unwrap();
+            // Uncached on purpose: `once` is often `schema` itself, and a memo
+            // hit would answer the second call without running the pass.
+            let once = canonicalize_uncached(schema).unwrap();
+            let twice = canonicalize_uncached(&once).unwrap();
             assert_eq!(once, twice, "not idempotent for {schema}");
         }
     }
@@ -430,6 +498,41 @@ mod tests {
         assert_eq!(
             canonicalize_avro_schema_json(explicit).unwrap(),
             r#"["null",{"type":"record","name":"R","namespace":"org.example","fields":[]}]"#
+        );
+    }
+
+    /// The pass runs once per distinct input, however many times it is asked.
+    ///
+    /// This is what keeps the reader side off the schema-sized path: the reader
+    /// schema is canonicalised once per HFile window and once per log block, and
+    /// both loops hand over the same string every time.
+    #[test]
+    fn the_memo_runs_the_pass_once_per_distinct_schema() {
+        let one = r#"{"type":"record","name":"A","namespace":"org.example","fields":[]}"#;
+        let two = r#"{"type":"record","name":"B","namespace":"org.example","fields":[]}"#;
+
+        let before = canonicalizations_run();
+        let expected = canonicalize_avro_schema_json(one).unwrap();
+        for _ in 0..32 {
+            assert_eq!(canonicalize_avro_schema_json(one).unwrap(), expected);
+        }
+        assert_eq!(
+            canonicalizations_run() - before,
+            1,
+            "32 calls with one schema must run the pass once"
+        );
+
+        // Both spellings of one read stay resident: alternating between them
+        // must not evict either.
+        let before = canonicalizations_run();
+        for _ in 0..32 {
+            canonicalize_avro_schema_json(one).unwrap();
+            canonicalize_avro_schema_json(two).unwrap();
+        }
+        assert_eq!(
+            canonicalizations_run() - before,
+            1,
+            "only the second schema is new; alternating must not thrash the memo"
         );
     }
 
