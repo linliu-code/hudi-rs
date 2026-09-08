@@ -146,7 +146,10 @@ JNI_VERSION ?= 0.5.0-dev.$(shell git rev-parse --short HEAD)
 JNI_ARCH ?= $(shell uname -m | sed 's/arm64/aarch64/;s/amd64/x86_64/')
 JNI_OS ?= linux
 JNI_OUT ?= target/jni-native
-JNI_STAGE := $(JNI_OUT)/stage
+# F-2: the stage directory jni-jar-multi packages. Derived from JNI_OUT (so JNI_OUT=... moves
+# both the stage and the jar), but overridable on its own to package a stage some other target
+# produced -- see jni-jar-multi-portable and JNI_JAR_MULTI_PREREQ below.
+JNI_STAGE ?= $(JNI_OUT)/stage
 # Where cargo actually writes the release build; overridden by jni-lib-portable so a container
 # build never touches this host's normal target/release/libhudi_jni.so (D-27, OI-72).
 JNI_CARGO_TARGET_DIR ?= target
@@ -177,12 +180,18 @@ endif
 .PHONY: jni-lib
 jni-lib: ## Build libhudi_jni.so (release) and stage a stripped copy under target/jni-native (refuses a dirty tree; JNI_ALLOW_DIRTY=1 overrides)
 	$(info --- Build hudi-jni (release) ---)
-	test -z "$$(git status --porcelain)" || { echo "dirty tree; set JNI_ALLOW_DIRTY=1 to override"; test -n "$(JNI_ALLOW_DIRTY)"; }
+	test -z "$$(git status --porcelain)" || { echo "dirty tree; set JNI_ALLOW_DIRTY=1 to override"; test "$(JNI_ALLOW_DIRTY)" = 1; }
 	rm -rf $(JNI_STAGE)
 	CARGO_TARGET_DIR=$(JNI_CARGO_TARGET_DIR) ./build-wrapper.sh cargo build -p hudi-jni --release
 	mkdir -p $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH) $(JNI_STAGE)/META-INF
-	strip -o $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so $(JNI_CARGO_TARGET_DIR)/release/libhudi_jni.so
-	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\nglibc.floor=%s\nmd5=%s\narch=%s-%s\n' \
+	# D-29 (F-7): the staged copy is stripped. Measured on this branch's aarch64 build:
+	# 74,330,712 B -> 55,604,776 B, and byte-identical to the previous unflagged `strip`
+	# (md5 601f7e816ea64a3c0e347e3c1953e679 both ways) -- the flag makes the intent explicit,
+	# it does not change today's bytes. `.dynsym` is what JNI binds against and a strip must
+	# never touch it, so assert the two entry points survived instead of trusting the flag.
+	strip --strip-unneeded -o $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so $(JNI_CARGO_TARGET_DIR)/release/libhudi_jni.so
+	nm -D --defined-only $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so | grep -c ' T Java_' | grep -qx 2
+	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\nglibc.floor=%s\nmd5=%s\narch=%s-%s\nstripped=true\n' \
 	  "$$(git rev-parse HEAD)" \
 	  "$$(grep -o 'JNI_ABI_VERSION: u32 = [0-9]*' crates/jni/src/lib.rs | grep -o '[0-9]*$$')" \
 	  "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -197,18 +206,42 @@ jni-jar: jni-lib ## Package the staged library as hudi-jni-native-<version>-<os>
 	rm -f $(JNI_JAR) && jar cf $(JNI_JAR) -C $(JNI_STAGE) .
 	unzip -l $(JNI_JAR)
 
-.PHONY: jni-jar-multi
-jni-jar-multi: jni-lib ## Package this arch's library plus JNI_EXTRA_NATIVE_DIR (native/<os>-<arch>/libhudi_jni.so from other legs) as ONE jar
+# F-2: jni-jar-multi packages whatever stage it is pointed at, and its build prerequisite is a
+# variable, so a stage some OTHER target produced can be packaged without re-running (and
+# wiping) the host build. Three supported shapes:
+#   make jni-jar-multi JNI_EXTRA_NATIVE_DIR=<dir>            host build, target/jni-native/stage
+#   make jni-jar-multi-portable JNI_EXTRA_NATIVE_DIR=<dir>   container build, target/jni-portable/stage
+#   make jni-jar-multi JNI_JAR_MULTI_PREREQ= JNI_OUT=target/jni-portable JNI_EXTRA_NATIVE_DIR=<dir>
+#                                                            package an EXISTING stage, build nothing
+JNI_JAR_MULTI_PREREQ ?= jni-lib
+
+# The packaging body, shared by jni-jar-multi and jni-jar-multi-portable so the two can never
+# drift. $(JNI_STAGE)/$(JNI_OUT) are resolved per target (jni-jar-multi-portable sets JNI_OUT).
+define jni_package_multi
 	test -n "$(JNI_EXTRA_NATIVE_DIR)" || { echo "JNI_EXTRA_NATIVE_DIR is required"; exit 2; }
+	test -d "$(JNI_STAGE)/native" || { echo "no staged library under $(JNI_STAGE)/native -- run jni-lib or jni-lib-portable first, or point JNI_OUT/JNI_STAGE at an existing stage"; exit 2; }
 	cp -r $(JNI_EXTRA_NATIVE_DIR)/native/. $(JNI_STAGE)/native/
-	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\n' "$$(git rev-parse HEAD)" \
+	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\nstripped=true\n' "$$(git rev-parse HEAD)" \
 	  "$$(grep -o 'JNI_ABI_VERSION: u32 = [0-9]*' crates/jni/src/lib.rs | grep -o '[0-9]*$$')" \
 	  "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" > $(JNI_STAGE)/META-INF/hudi-jni-native.properties
 	archs=""; for a in x86_64 aarch64; do [ -d $(JNI_STAGE)/native/linux-$$a ] && archs="$${archs:+$$archs,}linux-$$a"; done; \
 	  printf 'arch=%s\n' "$$archs" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties
 	for a in x86_64 aarch64; do [ -d $(JNI_STAGE)/native/linux-$$a ] && printf 'md5.linux-%s=%s\n' "$$a" "$$(md5sum $(JNI_STAGE)/native/linux-$$a/libhudi_jni.so | cut -d' ' -f1)" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties; done
 	for a in x86_64 aarch64; do [ -d $(JNI_STAGE)/native/linux-$$a ] && printf 'glibc.floor.linux-%s=%s\n' "$$a" "$$(objdump -T $(JNI_STAGE)/native/linux-$$a/libhudi_jni.so | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties; done
+	cat $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+	# F-8: the same LICENSE/NOTICE/THIRD-PARTY.txt the CI package job stages, from one script.
+	.github/jni-legal/stage-legal.sh $(JNI_STAGE)
 	rm -f $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar && jar cf $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar -C $(JNI_STAGE) . && unzip -l $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar
+endef
+
+.PHONY: jni-jar-multi
+jni-jar-multi: $(JNI_JAR_MULTI_PREREQ) ## Package the staged library (JNI_STAGE, default target/jni-native/stage) plus JNI_EXTRA_NATIVE_DIR (another leg's native/<os>-<arch>/libhudi_jni.so) as ONE classifier-less jar with LICENSE/NOTICE/THIRD-PARTY.txt; JNI_JAR_MULTI_PREREQ= packages an existing stage and builds nothing
+	$(jni_package_multi)
+
+.PHONY: jni-jar-multi-portable
+jni-jar-multi-portable: JNI_OUT := $(JNI_PORTABLE_OUT)
+jni-jar-multi-portable: jni-lib-portable ## F-2/D-27: build this arch in the manylinux_2_28 container and package target/jni-portable/stage (+ JNI_EXTRA_NATIVE_DIR) as the multi-arch jar
+	$(jni_package_multi)
 
 # D-27 (OI-72): jni-lib builds on THIS host, whose glibc floor is whatever this box happens to
 # run (documented, not asserted) — jni-lib-portable instead builds inside a manylinux_2_28
@@ -218,7 +251,7 @@ jni-jar-multi: jni-lib ## Package this arch's library plus JNI_EXTRA_NATIVE_DIR 
 # $(JNI_PORTABLE_OUT), and builds cargo into $(JNI_PORTABLE_OUT)/cargo-target — NEVER
 # target/release or target/jni-native/stage, which other gates on this box depend on.
 .PHONY: jni-lib-portable
-jni-lib-portable: ## D-27: build libhudi_jni.so inside a manylinux_2_28 container (glibc<=2.28 floor, static libstdc++/libgcc/libgcc_eh, -Wl,-z,defs, asserts no undefined unwinder/C++ symbols); stages under target/jni-portable, never touches target/release
+jni-lib-portable: ## D-27: build libhudi_jni.so inside a manylinux_2_28 container (static libstdc++/libgcc/libgcc_eh, -Wl,-z,defs) and assert .github/jni-portable/portability-floor.sh (glibc<=2.28, NEEDED allow-list, no undefined unwinder symbols, 2 Java_ exports); stages under target/jni-portable, never touches target/release
 	mkdir -p $(JNI_PORTABLE_OUT)
 	docker run --rm -v "$$(pwd):/work" -w /work $(DOCKER_MANYLINUX_$(JNI_ARCH)) bash -c '\
 	  set -euo pipefail; \
@@ -237,11 +270,10 @@ jni-lib-portable: ## D-27: build libhudi_jni.so inside a manylinux_2_28 containe
 	  make jni-lib JNI_ARCH=$(JNI_ARCH) JNI_ALLOW_DIRTY=1 JNI_OUT=$(JNI_PORTABLE_OUT) JNI_CARGO_TARGET_DIR=$(JNI_PORTABLE_OUT)/cargo-target; \
 	  chown -R --reference=/work/Makefile /work/$(JNI_PORTABLE_OUT) \
 	'
-	@echo 'nm -D --undefined-only (all _Unwind_/__cxa_/__gxx_ hits, for the record):'
-	@nm -D --undefined-only $(JNI_PORTABLE_OUT)/stage/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so | grep -E '_Unwind_|__cxa_|__gxx_' || true
-	UNDEF=$$(nm -D --undefined-only $(JNI_PORTABLE_OUT)/stage/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so | awk '$$1=="U" && $$2 ~ /_Unwind_|__cxa_|__gxx_/ && $$2 !~ /@GLIB/' | grep -c . || true); \
-	  echo "undefined unwinder/C++ symbols (excluding weak and glibc-versioned @GLIBC_x.y, which libc.so.6 legitimately provides): $$UNDEF"; \
-	  [ "$$UNDEF" -eq 0 ] || { echo "FAIL: $$UNDEF unresolved unwinder/C++ symbols"; exit 1; }
+	# F-5/F-13: assert the SAME portability floor the workflow asserts, from the same script --
+	# glibc ceiling, no versioned GLIBCXX_/CXXABI_ imports, the NEEDED allow-list, no undefined
+	# unwinder/C++ symbols, and (D-29/F-7) the two Java_ exports surviving the strip.
+	.github/jni-portable/portability-floor.sh $(JNI_PORTABLE_OUT)/stage/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so
 
 .PHONY: jni-deploy
 jni-deploy: $(JNI_DEPLOY_PREREQ) ## Deploy the carrier jar to CodeArtifact (server id `codeartifact` in ~/.m2/settings.xml); JNI_MULTI=1 deploys the classifier-less multi-arch jar (needs JNI_EXTRA_NATIVE_DIR)
