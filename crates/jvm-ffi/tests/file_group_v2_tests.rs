@@ -1859,6 +1859,155 @@ fn v6_record_index_hfiles_read_under_the_current_metadata_schema() {
     }
 }
 
+/// The same reader schema in its OTHER legal spelling: every nested named type
+/// carries an explicit `namespace` instead of inheriting the enclosing one.
+///
+/// This is what Avro's own object model produces (`Schema.Parser` materialises
+/// the inherited namespace, `Schema.java:1709-1713`) and what avro-tools writes;
+/// Java's `Schema.toString()` produces the inherited form instead
+/// (`Schema.java:744-753`). The Avro spec calls the two identical.
+fn with_explicit_namespaces(json: &str) -> String {
+    fn walk(value: &mut serde_json::Value, enclosing: Option<String>) {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, enclosing.clone());
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let named = matches!(
+                    map.get("type").and_then(serde_json::Value::as_str),
+                    Some("record" | "error" | "enum" | "fixed")
+                );
+                let mut child = enclosing.clone();
+                if named {
+                    child = map
+                        .get("namespace")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .or(enclosing);
+                    if let Some(ns) = child.clone() {
+                        map.insert("namespace".to_string(), serde_json::Value::String(ns));
+                    }
+                }
+                for (key, nested) in map.iter_mut() {
+                    if matches!(key.as_str(), "fields" | "items" | "values" | "type") {
+                        walk(nested, child.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut value: serde_json::Value =
+        serde_json::from_str(json).expect("the fixture reader schema is JSON");
+    walk(&mut value, None);
+    serde_json::to_string(&value).expect("re-serialise the reader schema")
+}
+
+/// OI-47: the canonicalising pass is the identity on a schema Java actually
+/// wrote.
+///
+/// This is the property that makes it safe to put in front of every schema on
+/// the way to `arrow-avro`: the writer schemas it will meet in production were
+/// all produced by `Schema.toString()`, so the pass must not touch them. The
+/// subject is the real artefact — the writer schema stored in a v6 MDT HFile —
+/// not a checked-in `.avsc`; `HoodieMetadataRecord-with-meta-fields.avsc` was
+/// hand-derived and spells its type references as fullnames where Java writes
+/// them short, so it is not a witness for this.
+#[test]
+fn a_java_written_writer_schema_is_already_canonical() {
+    let (hfiles, _) = v6_record_index_files();
+    let _mdt = v6_mdt_path();
+    for base in &hfiles {
+        let writer = v6_writer_schema_json(base);
+        assert_eq!(
+            hudi::schema::avro_names::canonicalize_avro_schema_json(&writer)
+                .unwrap_or_else(|e| panic!("{base}: canonicalise the writer schema: {e}")),
+            writer,
+            "{base}: a schema written by Java `Schema.toString()` must come back byte for byte"
+        );
+    }
+    // The two properties that make it Java's form rather than ours: one
+    // `namespace` (the root's) and no dotted type reference.
+    let writer = v6_writer_schema_json(V6_FAILING_HFILE);
+    assert_eq!(writer.matches("\"namespace\"").count(), 1, "{writer}");
+    assert_eq!(writer.matches("org.apache.hudi.avro.model.").count(), 0);
+}
+
+/// OI-47: the read must not depend on which of the two legal spellings the
+/// caller hands over.
+///
+/// `arrow-avro` 58 compares a writer named type with a reader named type using
+/// their literal `name`/`namespace` attributes and drops the enclosing namespace
+/// at that one point (`codec.rs:1250`, `full_name_set` ->
+/// `make_full_name(name, ns, None)`), so before the fix an explicit-namespace
+/// reader schema failed against these Java-written writer schemas with
+/// `Record name mismatch writer=HoodieMetadataFileInfo, reader=HoodieMetadataFileInfo`
+/// — two names that print identically. The fixture README's "every nested
+/// `namespace` ... removed" step was the workaround; this test is why it is no
+/// longer needed.
+///
+/// Both halves of the read are covered: the base HFile of every shard, and the
+/// shard whose log file carries an Avro data block.
+#[test]
+fn v6_record_index_reads_the_same_under_an_explicit_namespace_reader_schema() {
+    let (hfiles, _) = v6_record_index_files();
+    let mdt = v6_mdt_path();
+    let java_form = current_metadata_reader_schema_json();
+    let explicit = with_explicit_namespaces(&java_form);
+    assert_ne!(
+        explicit, java_form,
+        "the fixture schema must actually have inherited namespaces, or this test proves nothing"
+    );
+
+    for base in &hfiles {
+        let by_java_form = read_file_group_v2(&v6_request(&mdt, base, &[], &java_form))
+            .unwrap_or_else(|e| panic!("{base} under the Java-form reader schema: {e}"));
+        let batch =
+            read_file_group_v2(&v6_request(&mdt, base, &[], &explicit)).unwrap_or_else(|e| {
+                panic!("{base} under an explicit-namespace reader schema must read the same: {e}")
+            });
+        assert_eq!(
+            batch.schema(),
+            by_java_form.schema(),
+            "{base}: the spelling of the reader schema must not change the output schema"
+        );
+        assert_eq!(
+            record_index_payload(&batch),
+            record_index_payload(&by_java_form),
+            "{base}: the spelling of the reader schema must not change the rows"
+        );
+    }
+
+    // The log-block half: the writer schema of the Avro data block goes through
+    // the same resolution.
+    let by_java_form = read_file_group_v2(&v6_request(
+        &mdt,
+        V6_BASE_WITH_LOG_HFILE,
+        &[V6_LOG_FILE],
+        &java_form,
+    ))
+    .expect("base + log under the Java-form reader schema");
+    let batch = read_file_group_v2(&v6_request(
+        &mdt,
+        V6_BASE_WITH_LOG_HFILE,
+        &[V6_LOG_FILE],
+        &explicit,
+    ))
+    .expect("base + log under an explicit-namespace reader schema must read the same");
+    assert_eq!(
+        record_index_payload(&batch),
+        record_index_payload(&by_java_form),
+        "the log block must resolve under either spelling"
+    );
+    println!(
+        "oi47_explicit_ns base_and_log_rows={} payload={:?}",
+        batch.num_rows(),
+        record_index_payload(&batch)
+    );
+}
+
 /// The path the failing Java test actually takes: `readSliceWithFilter` with a
 /// key set. Two keys the partition holds plus one it does not must return
 /// exactly the two.

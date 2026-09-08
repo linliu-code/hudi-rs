@@ -83,7 +83,11 @@ datafusion-ffi = { version = "54.1" }
 # serde
 percent-encoding = { version = "2" }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1" }
+# `preserve_order` keeps a JSON object's keys in the order they were parsed.
+# `schema::avro_names` re-emits Avro schema JSON and has to give back the input
+# byte for byte when it is already in Java's `Schema.toString()` form; the
+# default `BTreeMap` backing would silently alphabetise every schema instead.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # "stdlib"
 thiserror = { version = "2" }

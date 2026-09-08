@@ -2215,10 +2215,16 @@ mod tests {
     /// the producer: `read_file_group_v2` builds a `FileGroupReaderSchemaHandler`
     /// from the caller's Avro JSON and `HoodieFileGroupReader::build` calls
     /// `prepare_required_schema`, whose `reader_schema_json` is
-    /// `append_mandatory_fields_avro_json`'s `serde_json::to_string` output —
-    /// **key-sorted**, where the file's own schema is Java Avro's
-    /// `Schema.toString()`. A string comparison can never match those two, which
-    /// is what made every unevolved native MDT read build a resolving decoder.
+    /// `append_mandatory_fields_avro_json`'s `serde_json::to_string` output,
+    /// where the file's own schema is Java Avro's `Schema.toString()`. That
+    /// output used to be key-sorted, so a string comparison could never match
+    /// the two — which is what made every unevolved native MDT read build a
+    /// resolving decoder. Since `serde_json` is built with `preserve_order`
+    /// (OI-47) it now round-trips Java's key order, so for this fixture the two
+    /// strings happen to be equal. The gate still must not compare strings: a
+    /// different producer, indentation, or a canonicalised namespace puts two
+    /// equal schemas in different strings, and the v6 half below is exactly
+    /// that case.
     #[test]
     fn the_cost_gate_fires_on_the_reader_schema_the_production_path_produces() {
         use crate::file_group::reader_v2::reader_context::ReaderContext;
@@ -2264,15 +2270,9 @@ mod tests {
                     &merge_mode,
                 )
                 .expect("the FFI path prepares a required schema");
-            let json = handler
+            handler
                 .reader_schema_json
-                .expect("the FFI path computes a reader schema json");
-            assert!(
-                json != schema_json,
-                "the producer must re-serialize, or this test proves nothing about \
-                 the string comparison it exists to rule out"
-            );
-            json
+                .expect("the FFI path computes a reader schema json")
         }
 
         fn writer_schema_json(path: &std::path::Path) -> (HFileReader, String) {
@@ -2311,6 +2311,14 @@ mod tests {
         // it from one shard and use it for all of them, as the real caller does.
         let (_, v8_caller_schema) = writer_schema_json(&v8_shards[0]);
         let v8_reader_json = production_reader_schema_json(&v8_caller_schema, &v8_config);
+        // Documents what the producer does to an already-Java-form schema now
+        // that `serde_json` preserves key order: nothing. Asserted so a future
+        // producer change that reintroduces re-spelling is visible here rather
+        // than only in the gate's hit rate.
+        assert_eq!(
+            v8_reader_json, v8_caller_schema,
+            "the producer must hand Java's own spelling back unchanged"
+        );
         for shard in &v8_shards {
             let (reader, _) = writer_schema_json(shard);
             let (_, _, _, kept) =
@@ -2337,10 +2345,17 @@ mod tests {
             std::fs::read_to_string(fixture_dir.join("HoodieMetadataRecord-with-meta-fields.avsc"))
                 .expect("read the current HoodieMetadataRecord schema");
         let v6_reader_json = production_reader_schema_json(v6_caller_schema.trim(), &v6_config);
-        let (v6_reader, _) = writer_schema_json(
+        let (v6_reader, v6_writer_json) = writer_schema_json(
             &v6_table
                 .join("record_index")
                 .join("record-index-0005-0_4-1636-3849_20260505162917195001.hfile"),
+        );
+        // The half that keeps the test honest: the reader schema really is a
+        // different string from the one in the file, so the gate is being asked a
+        // question about two schemas, not two strings.
+        assert_ne!(
+            v6_reader_json, v6_writer_json,
+            "the v6 file must be evolved away from the reader schema"
         );
         let (resolved, _, _, kept) =
             HFileBaseFileReader::decoded_schema(&v6_reader, "v6", Some(&v6_reader_json)).unwrap();
