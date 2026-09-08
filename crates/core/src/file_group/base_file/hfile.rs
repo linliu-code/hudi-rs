@@ -126,12 +126,33 @@ impl HFileBaseFileReader {
         // a different producer, indentation, field order or an explicitly spelled
         // namespace puts one schema in two strings, and a `!=` would then leave an
         // unevolved read paying for a resolving decoder it does not need.
+        //
+        // Both sides are canonicalised first, for the same reason the decoder
+        // canonicalises them: a reader schema that went through `Schema.Parser`
+        // or avro-tools materialises the namespaces Java's `Schema.toString()`
+        // leaves inherited, so it differs from the file's spelling at every
+        // nested named type while being the identical schema. Comparing the raw
+        // JSON there says "evolved" and hands that caller a resolving decoder on
+        // every file. Canonicalising cannot make the gate more permissive than
+        // its guarantee: the pass rewrites only how a named type spells its
+        // name, namespace and references, so two schemas equal afterwards were
+        // the same schema before. It is also nearly free — the memo in
+        // `canonicalize_avro_schema_json` serves both strings again below.
         let mut reader_schema_json: Option<String> = reader_schema_json.map(str::to_string);
-        if let Some(candidate) = reader_schema_json.as_deref()
-            && crate::schema::avro_schema_utils::avro_schema_json_equivalent(candidate, &json)
-                .map_err(|e| StorageError::Creation(format!("{e}")))?
-        {
-            reader_schema_json = None;
+        if let Some(candidate) = reader_schema_json.as_deref() {
+            let canonical_reader =
+                crate::schema::avro_names::canonicalize_avro_schema_json(candidate)
+                    .map_err(|e| StorageError::Creation(format!("{e}")))?;
+            let canonical_writer = crate::schema::avro_names::canonicalize_avro_schema_json(&json)
+                .map_err(|e| StorageError::Creation(format!("{e}")))?;
+            if crate::schema::avro_schema_utils::avro_schema_json_equivalent(
+                &canonical_reader,
+                &canonical_writer,
+            )
+            .map_err(|e| StorageError::Creation(format!("{e}")))?
+            {
+                reader_schema_json = None;
+            }
         }
         // The schema comes from the decoder, not from converting the Avro JSON:
         // `avro_to_arrow` does not handle named-type references, and the metadata
@@ -2336,6 +2357,94 @@ mod tests {
             "cost gate: fired on all {} v8 shards (reader json {} bytes)",
             v8_shards.len(),
             v8_reader_json.len()
+        );
+
+        // --- v8 again, in the spelling an Avro library hands back. The gate
+        // must still fire. ---
+        // `HoodieBackedTableMetadata.SCHEMA` is a parsed `Schema`, and a caller
+        // that re-emits it through an Avro object model rather than passing on
+        // the bytes Java wrote materialises every namespace Java left inherited.
+        // That is the same schema in a different spelling, and it is the caller
+        // shape the name canonicalisation exists for, so the gate has to see
+        // through it — otherwise that caller builds a resolving decoder on every
+        // file for a resolution that resolves nothing.
+        /// The spelling an Avro object model produces: a schema that went
+        /// through `Schema.Parser` (or avro-tools) carries every namespace
+        /// explicitly, because the model materialises the one Java's
+        /// `Schema.toString()` leaves to be inherited. Same schema, every nested
+        /// named type spelled differently.
+        fn spell_namespaces_explicitly(
+            value: &serde_json::Value,
+            enclosing: Option<&str>,
+        ) -> serde_json::Value {
+            use serde_json::Value;
+            match value {
+                Value::Array(items) => Value::Array(
+                    items
+                        .iter()
+                        .map(|item| spell_namespaces_explicitly(item, enclosing))
+                        .collect(),
+                ),
+                Value::Object(map) => {
+                    let named = matches!(
+                        map.get("type").and_then(Value::as_str),
+                        Some("record" | "error" | "enum" | "fixed")
+                    );
+                    let space = map
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .or(enclosing)
+                        .filter(|s| !s.is_empty());
+                    let inner = if named { space } else { enclosing };
+                    let mut out = serde_json::Map::new();
+                    for (key, value) in map {
+                        match key.as_str() {
+                            "name" if named => {
+                                out.insert(key.clone(), value.clone());
+                                if let Some(space) = space {
+                                    out.insert("namespace".into(), Value::String(space.into()));
+                                }
+                            }
+                            "namespace" if named => {}
+                            "type" if named => {
+                                out.insert(key.clone(), value.clone());
+                            }
+                            "type" | "items" | "values" | "fields" => {
+                                out.insert(key.clone(), spell_namespaces_explicitly(value, inner));
+                            }
+                            _ => {
+                                out.insert(key.clone(), value.clone());
+                            }
+                        }
+                    }
+                    Value::Object(out)
+                }
+                _ => value.clone(),
+            }
+        }
+
+        let respelled = serde_json::to_string(&spell_namespaces_explicitly(
+            &serde_json::from_str(&v8_reader_json).expect("the reader schema is JSON"),
+            None,
+        ))
+        .expect("re-emit the respelled schema");
+        assert_ne!(
+            respelled, v8_reader_json,
+            "the respelling must actually differ, or this proves nothing"
+        );
+        for shard in &v8_shards {
+            let (reader, _) = writer_schema_json(shard);
+            let (_, _, _, kept) =
+                HFileBaseFileReader::decoded_schema(&reader, "v8", Some(&respelled)).unwrap();
+            assert!(
+                kept.is_none(),
+                "v8 shard {shard:?}: an Avro library's spelling of the writer schema is still                  the writer schema, so no resolving decoder must be built"
+            );
+        }
+        println!(
+            "cost gate: fired on all {} v8 shards for the respelled reader schema too ({} bytes)",
+            v8_shards.len(),
+            respelled.len()
         );
 
         // --- v6: genuinely evolved. The gate must NOT fire. ---
