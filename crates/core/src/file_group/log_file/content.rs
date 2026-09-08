@@ -351,6 +351,10 @@ impl Decoder {
         // says so.
         let (reader_schema_json, rewrite_to) = match reader_schema_json {
             Some(required_json) => {
+                // The third place two schemas meet, and the one that needs no
+                // canonicalisation: `apache_avro` materialises inherited
+                // namespaces as it parses, so both sides arrive here in one
+                // spelling however they were written.
                 let writer = apache_avro::Schema::parse_str(writer_schema_json)?;
                 let required = apache_avro::Schema::parse_str(required_json)?;
                 if record_needs_rewrite_for_extended_promotion(&writer, &required)? {

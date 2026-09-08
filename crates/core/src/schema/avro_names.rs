@@ -44,8 +44,20 @@ use crate::Result;
 use crate::error::CoreError;
 use serde_json::{Map, Value};
 
-/// The names `org.apache.avro.Schema.Type` occupies. A reference spelled as one
-/// of these is that type, never a named type, and is left alone.
+/// The names `org.apache.avro.Schema.Type` occupies — exactly
+/// `Schema.Type.values()`, `error` excluded because Java spells that type
+/// `record` on the way out. Used for two different claims:
+///
+/// * In [`qualify_reference`], a named type whose short name collides with one
+///   of these is written as a fullname. That is Java's `shouldWriteFull` and it
+///   holds for all fourteen.
+/// * At a schema position, a bare string that is one of these is taken to BE
+///   that type. Java is narrower: its parser resolves only the eight primitive
+///   names that way and would read a bare `"record"` as a reference to a named
+///   type called `record`. Reachable only from a schema that both defines such a
+///   type and refers to it from inside its own namespace, which no Java writer
+///   emits — `Name.getQualified` writes that reference as a fullname precisely
+///   to avoid the ambiguity.
 const TYPE_NAMES: [&str; 14] = [
     "null", "boolean", "int", "long", "float", "double", "bytes", "string", "record", "enum",
     "array", "map", "union", "fixed",
@@ -72,6 +84,18 @@ fn split_name<'a>(
     match ns_attr {
         Some(attr) => (name, non_empty(attr)),
         None => (name, enclosing),
+    }
+}
+
+/// A JSON value for an error message, truncated. Every other value this module
+/// names in an error is a scalar, but a `namespace` that is not a string can be
+/// an arbitrarily large subtree, and an error is not the place to print one.
+fn brief(value: &Value) -> String {
+    const MAX_CHARS: usize = 60;
+    let rendered = value.to_string();
+    match rendered.char_indices().nth(MAX_CHARS) {
+        Some((cut, _)) => format!("{}...", &rendered[..cut]),
+        None => rendered,
     }
 }
 
@@ -109,6 +133,11 @@ fn qualify_reference(reference: &str, enclosing: Option<&str>) -> String {
 /// Re-emit `json` with every Avro named type spelled as Java's
 /// `Schema.toString()` spells it.
 ///
+/// Public, and supported as such: a foreign caller that hands its own schema
+/// over the FFI has to spell it the way this crate spells the schemas it reads,
+/// and the alternative — hiding it and re-exporting a shim for the cross-crate
+/// test that pins the Java-form identity — would hide it from those callers too.
+///
 /// Everything that is not a named type's `name`/`namespace` or a reference to
 /// one is preserved exactly: field order, key order, `doc`, `default`,
 /// `aliases`, `logicalType` and any other attribute, which is why this is a JSON
@@ -127,7 +156,12 @@ fn qualify_reference(reference: &str, enclosing: Option<&str>) -> String {
 /// # Errors
 ///
 /// The input is not JSON, is not an Avro schema (a schema position holding a
-/// number, say), or a named type has no string `name`.
+/// number, say), a named type has no string `name` or a non-string `namespace`,
+/// or a record's `fields` is not an array of objects. That is the whole list:
+/// this is a renamer, not a validator, and anything else it does not understand
+/// — an object at a schema position with no `type`, a name that is not a legal
+/// Avro identifier, a type defined twice — is copied through for `arrow-avro` to
+/// reject a few microseconds later.
 pub fn canonicalize_avro_schema_json(json: &str) -> Result<String> {
     if let Some(hit) = MEMO.with_borrow_mut(|memo| {
         let found = memo.iter().position(|(input, _)| input == json)?;
@@ -231,7 +265,8 @@ fn rewrite_named(object: &Map<String, Value>, enclosing: Option<&str>) -> Result
         Some(Value::String(space)) => Some(space.as_str()),
         Some(other) => {
             return Err(CoreError::Schema(format!(
-                "Avro `namespace` of `{name}` must be a string, found {other}"
+                "Avro `namespace` of `{name}` must be a string, found {}",
+                brief(other)
             )));
         }
     };
@@ -533,6 +568,60 @@ mod tests {
             canonicalizations_run() - before,
             1,
             "only the second schema is new; alternating must not thrash the memo"
+        );
+    }
+
+    /// Shapes the rest of the suite does not reach: an `error` record (Java's
+    /// exception type, named and referenced like a record), a top-level `array`
+    /// and `map` (legal schemas whose root carries no name), and a `fixed` with
+    /// a logical type, whose extra attributes have to survive the rename.
+    #[test]
+    fn error_records_top_level_containers_and_a_logical_fixed_are_handled() {
+        assert_eq!(
+            canonicalize_uncached(
+                r#"{"type":"error","name":"E","namespace":"org.example","fields":[{"name":"cause","type":["null","org.example.E"],"default":null}]}"#
+            )
+            .unwrap(),
+            r#"{"type":"error","name":"E","namespace":"org.example","fields":[{"name":"cause","type":["null","E"],"default":null}]}"#
+        );
+        assert_eq!(
+            canonicalize_uncached(
+                r#"{"type":"array","items":{"type":"record","name":"org.example.R","fields":[]}}"#
+            )
+            .unwrap(),
+            r#"{"type":"array","items":{"type":"record","name":"R","namespace":"org.example","fields":[]}}"#
+        );
+        assert_eq!(
+            canonicalize_uncached(
+                r#"{"type":"map","values":{"type":"enum","name":"org.example.Color","symbols":["RED"]}}"#
+            )
+            .unwrap(),
+            r#"{"type":"map","values":{"type":"enum","name":"Color","namespace":"org.example","symbols":["RED"]}}"#
+        );
+        assert_eq!(
+            canonicalize_uncached(
+                r#"{"type":"record","name":"R","namespace":"org.example","fields":[{"name":"amount","type":{"type":"fixed","name":"Decimal","namespace":"org.example","size":16,"logicalType":"decimal","precision":38,"scale":10}}]}"#
+            )
+            .unwrap(),
+            r#"{"type":"record","name":"R","namespace":"org.example","fields":[{"name":"amount","type":{"type":"fixed","name":"Decimal","size":16,"logicalType":"decimal","precision":38,"scale":10}}]}"#
+        );
+    }
+
+    /// A `namespace` that is a whole subtree is named in the error, not printed
+    /// into it.
+    #[test]
+    fn an_oversized_namespace_value_is_truncated_in_the_error() {
+        let namespace = format!(r#"{{"a":"{}"}}"#, "x".repeat(4096));
+        let err = canonicalize_uncached(&format!(
+            r#"{{"type":"record","name":"R","namespace":{namespace},"fields":[]}}"#
+        ))
+        .expect_err("a non-string namespace is an error");
+        let message = err.to_string();
+        assert!(message.contains("must be a string"), "{message}");
+        assert!(
+            message.len() < 200,
+            "the error must not carry the whole subtree: {} chars",
+            message.len()
         );
     }
 

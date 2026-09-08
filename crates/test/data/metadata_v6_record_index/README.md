@@ -69,19 +69,31 @@ The reader schema, i.e. what `HoodieBackedTableMetadata.SCHEMA` is:
 * the five `_hoodie_*` meta fields prepended exactly as
   `HoodieAvroUtils.addMetadataFields` prepends them
   (`["null","string"]`, `doc: ""`, `default: null`),
-* every nested `namespace` that equals its enclosing one **removed**, because
-  that is what Java Avro's `Schema.toString()` emits — and `SCHEMA.toString()` is
-  the string `NativeIndexSliceReader` actually hands the native reader. All three
-  real MDT writer schemas in this repo (v6, v8, and the v9
+* every nested `namespace` that equals its enclosing one **removed**, which is
+  what Java Avro's `Schema.toString()` does with them — and `SCHEMA.toString()`
+  is the string `NativeIndexSliceReader` actually hands the native reader. All
+  three real MDT writer schemas in this repo (v6, v8, and the v9
   `metadata_multi_block_hfile`) are in that form, since they were written by
-  Java. It is not cosmetic: `arrow-avro` 58.4.0 matches named types on their
-  DECLARED name (`codec.rs` `names_match` → `full_name_set`) without applying
-  Avro's enclosing-namespace inheritance, so a reader schema that spells
-  `org.apache.hudi.avro.model.HoodieValueTypeInfo` explicitly cannot resolve
-  against a writer that inherits it — it fails loudly with
+  Java. It used to be load-bearing: `arrow-avro` 58.4.0 matches named types on
+  their DECLARED name (`codec.rs` `names_match` → `full_name_set`) without
+  applying Avro's enclosing-namespace inheritance, so a reader schema that spells
+  `org.apache.hudi.avro.model.HoodieValueTypeInfo` explicitly could not resolve
+  against a writer that inherits it — it failed loudly with
   `Record name mismatch writer=HoodieValueTypeInfo, reader=HoodieValueTypeInfo`.
+  The reader now respells both sides itself (`hudi-core`'s
+  `schema::avro_names`), so the step is no longer needed for the read to work.
 * minified.
 
-Refresh it the same way if `HoodieMetadata.avsc` gains a field — including the
-namespace step; the test asserts against what is in this file, not against a
-hard-coded field list.
+The result is close to Java's output but is **not** it: the namespaces were
+stripped by hand, and the file's type REFERENCES are still dotted fullnames
+where Java writes them short. (Measured: this file carries 25 dotted
+references, where the writer schema inside a real Java-written MDT HFile carries
+none — both carry the same single `"namespace"`.) That makes this fixture a genuine second spelling of the
+same schema, which is what
+`v6_record_index_hfiles_read_under_the_current_metadata_schema` reads it as.
+
+Refresh it the same way if `HoodieMetadata.avsc` gains a field. The namespace
+step is now optional — keeping it holds this file where it is, and skipping it
+only widens what the read has to survive — but do it consistently and say here
+which you did, since the tests assert against what is in this file rather than
+against a hard-coded field list.
