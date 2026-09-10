@@ -932,16 +932,16 @@ impl HoodieFileGroupReader {
         // it would have pushed the very filter the gate just decided to withdraw.
         // Upstream has no closure here and calls `base_read_options` directly at
         // both sites; this keeps 145's de-duplication with upstream's semantics.
-        let read_options = |row_filter: Option<RowFilterBuilder>,
-                            row_group_selector: Option<RowGroupSelector>| {
-            base_read_options(
-                row_filter,
-                row_group_selector,
-                key_predicate.clone(),
-                self.schema_handler.reader_schema_json.clone(),
-                use_position,
-            )
-        };
+        let read_options =
+            |row_filter: Option<RowFilterBuilder>, row_group_selector: Option<RowGroupSelector>| {
+                base_read_options(
+                    row_filter,
+                    row_group_selector,
+                    key_predicate.clone(),
+                    self.schema_handler.reader_schema_json.clone(),
+                    use_position,
+                )
+            };
         let file_schema = self
             .base_file_reader()?
             .read_schema(
