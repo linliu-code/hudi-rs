@@ -2008,6 +2008,44 @@ mod tests {
     /// primary-key-safe. Pruning would drop base rows before the merge could
     /// update them into a match, so the gate refuses it -- and counts the
     /// refusal, because a suppressed selector otherwise reads as "no caller ever
+    /// The third state of `row_group_selector_calls`: never installed.
+    ///
+    /// The counter exists to separate "ran and pruned nothing" from "never ran",
+    /// and a gate-refused selector is a third case that also reads zero — which
+    /// is why `row_group_selector_suppressed` was added beside it. Both of those
+    /// are asserted below. This pins the BASELINE they are read against: with no
+    /// selector at all, calls AND suppressions are both zero. Without it, a
+    /// regression that incremented `calls` unconditionally would still satisfy
+    /// every other selector test, and the counter would stop answering the
+    /// question it was added for.
+    #[tokio::test]
+    async fn no_selector_installed_counts_neither_a_call_nor_a_suppression() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (tmp, base_name, schema) = three_row_groups();
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), &base_name, schema).await;
+        let volume = reader.storage.read_volume();
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(out.num_rows(), 3);
+        assert_eq!(
+            volume.row_group_selector_calls.load(Relaxed),
+            0,
+            "no selector was installed, so nothing can have called one"
+        );
+        assert_eq!(
+            volume.row_group_selector_suppressed.load(Relaxed),
+            0,
+            "and nothing was suppressed — there was nothing to suppress"
+        );
+        assert_eq!(
+            volume.row_groups_read.load(Relaxed),
+            3,
+            "every row group is read when no selector prunes"
+        );
+    }
+
     /// installed one": both are zero calls.
     #[tokio::test]
     async fn a_selector_the_gate_refuses_is_counted_not_silently_dropped() {

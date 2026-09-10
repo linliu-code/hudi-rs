@@ -1793,4 +1793,49 @@ mod tests {
         );
         Ok(())
     }
+
+    /// A file whose SOLE block is a truncated write: a magic, a length running
+    /// past the end, and nothing else. One `Corrupted` block spanning to EOF,
+    /// then a clean end — no error, no read past the file.
+    ///
+    /// Distinct from `a_corrupt_tail_with_no_following_magic_spans_to_eof`, which
+    /// has a good block in front: there the walk reaches the damage having
+    /// already parsed something, and `scan_for_next_block_offset` starts from a
+    /// nonzero position. Here the very first block is the bad one, which is what
+    /// a writer killed mid-first-append actually leaves behind.
+    /// `test_corrupt_block_detected_when_length_runs_past_eof` calls the
+    /// predicate directly on an intact fixture and never walks a file at all.
+    #[tokio::test]
+    async fn a_file_whose_only_block_is_truncated_walks_to_eof_without_erroring() -> Result<()> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&500_000u64.to_be_bytes()); // claims 500 kB; the file is tiny
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]); // a few real-looking bytes
+        let total_len = bytes.len() as u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file_name = "truncated-only.log.1_0-0-0".to_string();
+        std::fs::write(tmp.path().join(&file_name), &bytes).unwrap();
+
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+        let mut reader = LogFileReader::new(hudi_configs, storage, &file_name).await?;
+        let range = InstantRange::up_to("99991231235959999", "utc");
+
+        let only = reader
+            .read_next_block(&range)
+            .await?
+            .expect("the truncated block must surface as a block, not as an error");
+        assert_eq!(only.block_type, BlockType::Corrupted);
+        assert!(
+            reader.read_next_block(&range).await?.is_none(),
+            "and the walk must then report EOF"
+        );
+        assert_eq!(
+            reader.reader.position(),
+            total_len,
+            "the corrupt span must end exactly at EOF"
+        );
+        Ok(())
+    }
 }
