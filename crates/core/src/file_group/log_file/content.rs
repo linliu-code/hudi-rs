@@ -1311,6 +1311,64 @@ mod tests {
         Ok(())
     }
 
+    /// A partial-update PARQUET log block must stay narrow through decode.
+    ///
+    /// Ported from internal `778a7f8`
+    /// (`test_decode_parquet_partial_update_block_keeps_narrow_schema`), rewritten
+    /// against 145's `decode_parquet_record_content`, which takes a reader and
+    /// does not consult the block header (a parquet block carries its own
+    /// schema). 145 already has the AVRO twin
+    /// (`test_decode_avro_partial_update_block_keeps_narrow_schema`); this is the
+    /// parquet side of the same property, and it was the missing one.
+    ///
+    /// What it guards: the decoder must not widen or null-pad a partial block up
+    /// to the table schema. Widening here would turn "this block updates `id`"
+    /// into "this block sets `id` and nulls everything else", which the merge
+    /// would then apply as a destructive overwrite of columns the writer never
+    /// touched.
+    #[test]
+    fn test_decode_parquet_partial_update_block_keeps_narrow_schema() -> Result<()> {
+        // The table has id + name; this block carries only id.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![7])) as ArrayRef],
+        )?;
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, None)?;
+            writer.write(&batch)?;
+            writer.close()?;
+        }
+
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
+        let bytes = Bytes::from(buf);
+        let mut reader = BufReader::with_capacity(bytes.len(), Cursor::new(bytes));
+        let batches = decoder.decode_parquet_record_content(&mut reader)?;
+
+        assert_eq!(batches.num_data_rows(), 1);
+        let out = &batches.data_batches[0];
+        assert_eq!(out.num_columns(), 1, "stays narrow");
+        assert_eq!(out.schema().field(0).name(), "id");
+        Ok(())
+    }
+
+    /// An empty delete list decodes to NO delete batches, not to one empty batch.
+    ///
+    /// Ported from internal `778a7f8` (`test_decode_delete_block_empty_list`),
+    /// rewritten against 145's `decode_delete_block` helper. This pins the
+    /// decoder's early return: a block that names no keys must contribute
+    /// nothing to the merge. An empty-but-present batch would be a delete batch
+    /// with zero rows, which downstream counters and the merge iterator would
+    /// have to special-case.
+    #[test]
+    fn test_decode_delete_block_empty_list() -> Result<()> {
+        let batches = decode_delete_block(vec![])?;
+        assert_eq!(batches.num_delete_batches(), 0);
+        Ok(())
+    }
+
     /// Union positions in `HoodieDeleteRecordList.avsc`: 0 = null,
     /// 3 = `LongWrapper`, 12 = `ArrayWrapper`.
     fn delete_record_with_ordering(key: &str, ordering: AvroValue) -> AvroValue {
