@@ -1975,7 +1975,7 @@ mod tests {
     // Ported from internal main by the test-differential pass (INT-MAIN 778a7f8),
     // adapted to this branch's `Decoder::new(HudiConfigs)` + builder API. These
     // cover log-block DECODE behaviours nothing else on the branch pins.
-    /// Avro zigzag-encode a 32-bit int into its variable-length body bytes.
+    /// Zigzag-encode an Avro int/long (both share the varint form) into its body bytes.
     fn enc_int(v: i64) -> Vec<u8> {
         let mut n = ((v << 1) ^ (v >> 63)) as u64;
         let mut out = Vec::new();
@@ -1998,7 +1998,7 @@ mod tests {
 
     /// Frame avro record bodies into Hudi block content:
     /// [4B version=3][4B record count][per record: 4B length + body].
-    fn build_avro_block_content(_writer_json: &str, records: &[Vec<u8>]) -> Bytes {
+    fn build_avro_block_content(records: &[Vec<u8>]) -> Bytes {
         let mut buf = Vec::new();
         buf.extend_from_slice(&3u32.to_be_bytes());
         buf.extend_from_slice(&(records.len() as u32).to_be_bytes());
@@ -2070,7 +2070,7 @@ mod tests {
 
         let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
             .with_reader_schema(Some(required_json.to_string()));
-        let content = build_avro_block_content(writer_json, &[avro_record_body(&[enc_int(7)])]);
+        let content = build_avro_block_content(&[avro_record_body(&[enc_int(7)])]);
         let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
 
         let batches = decoder
@@ -2101,10 +2101,8 @@ mod tests {
         let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
             .with_reader_schema(Some(required_json.to_string()));
         // avro float = 4-byte IEEE-754 little-endian: 0.1f32 = [0xCD, 0xCC, 0xCC, 0x3D]
-        let content = build_avro_block_content(
-            writer_json,
-            &[avro_record_body(&[vec![0xCD, 0xCC, 0xCC, 0x3D]])],
-        );
+        let content =
+            build_avro_block_content(&[avro_record_body(&[vec![0xCD, 0xCC, 0xCC, 0x3D]])]);
         let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
         let batches = decoder
             .decode_avro_record_content(content.as_ref(), &header)
@@ -2137,8 +2135,7 @@ mod tests {
 
         let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
             .with_reader_schema(Some(required_json.to_string()));
-        let content =
-            build_avro_block_content(writer_json, &[avro_record_body(&[enc_int(7), enc_int(3)])]);
+        let content = build_avro_block_content(&[avro_record_body(&[enc_int(7), enc_int(3)])]);
         let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
 
         let batches = decoder
@@ -2180,8 +2177,7 @@ mod tests {
 
         let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
             .with_reader_schema(Some(required_json.to_string()));
-        let content =
-            build_avro_block_content(writer_json, &[avro_record_body(&[enc_int(MICROS)])]);
+        let content = build_avro_block_content(&[avro_record_body(&[enc_int(MICROS)])]);
         let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
 
         let batches = decoder
@@ -2238,8 +2234,7 @@ mod tests {
 
         let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
             .with_reader_schema(Some(required_json.to_string()));
-        let content =
-            build_avro_block_content(writer_json, &[avro_record_body(&[enc_int(STORED_MS)])]);
+        let content = build_avro_block_content(&[avro_record_body(&[enc_int(STORED_MS)])]);
         let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
 
         let batches = decoder
@@ -2305,7 +2300,7 @@ mod tests {
     /// writer-only path. The payload here uses IntWrapper ordering values (non-null) to
     /// also exercise the non-null wrapper branch.
     #[test]
-    fn test_decode_delete_block_soft_and_hard_deletes() {
+    fn test_decode_delete_block_decodes_multiple_record_keys_in_order() {
         let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
         let content = build_delete_block_content(vec![
             delete_record_value("k1", "p1", Some(1)),

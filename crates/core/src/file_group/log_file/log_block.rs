@@ -1082,7 +1082,7 @@ mod tests {
     /// A per-token test cannot notice the one that was never listed.
     #[test]
     fn test_block_type_from_str_as_ref_round_trip() {
-        for bt in [
+        let all = [
             BlockType::Command,
             BlockType::Delete,
             BlockType::Corrupted,
@@ -1090,7 +1090,23 @@ mod tests {
             BlockType::HfileData,
             BlockType::ParquetData,
             BlockType::CdcData,
-        ] {
+        ];
+        // An eighth variant must not slip past this loop silently — "a variant
+        // nobody listed" is the exact bug the test exists for, and a hard-coded
+        // array reproduces it one level up. The match is exhaustive, so adding a
+        // variant fails to compile here until it is added to `all` too.
+        for bt in &all {
+            match bt {
+                BlockType::Command
+                | BlockType::Delete
+                | BlockType::Corrupted
+                | BlockType::AvroData
+                | BlockType::HfileData
+                | BlockType::ParquetData
+                | BlockType::CdcData => {}
+            }
+        }
+        for bt in all {
             let token = bt.as_ref();
             assert_eq!(
                 BlockType::from_str(token).unwrap(),
