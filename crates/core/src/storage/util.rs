@@ -30,6 +30,32 @@ pub fn parse_uri(uri: &str) -> Result<Url> {
         Err(e) => Url::from_directory_path(uri).map_err(|_| UrlParseError(e))?,
     };
 
+    // Collapse redundant slashes in the path (e.g. "a//b" -> "a/b"). Hadoop and
+    // the JVM Hudi reader tolerate empty path segments, but the object_store
+    // `Path` parser rejects them ("contained empty path segment"), so normalize
+    // them away at ingestion rather than letting a "//" base path fail later.
+    //
+    // Collapse the runs of `/` directly in the ALREADY-percent-encoded path
+    // string and write it back with `set_path`. The previous approach round-
+    // tripped through `path_segments()` (which yields decoded-view segments) and
+    // `path_segments_mut().extend()` (which percent-encodes its input), so an
+    // already-encoded segment got encoded a second time — e.g. a space `%20`
+    // became `%2520`, pointing the reader at a nonexistent path. `set_path`
+    // leaves existing `%xx` escapes intact, and `/` never appears inside an
+    // escape, so the pure-string collapse is encoding-safe.
+    if url.path().contains("//") {
+        let mut collapsed = String::with_capacity(url.path().len());
+        let mut prev_slash = false;
+        for ch in url.path().chars() {
+            let is_slash = ch == '/';
+            if !(is_slash && prev_slash) {
+                collapsed.push(ch);
+            }
+            prev_slash = is_slash;
+        }
+        url.set_path(&collapsed);
+    }
+
     if url.path().ends_with('/') {
         let err = InvalidPath(format!("Url {url:?} cannot be a base"));
         url.path_segments_mut().map_err(|_| err)?.pop();
@@ -87,6 +113,36 @@ mod tests {
         ];
         assert_eq!(urls.iter().map(|u| u.scheme()).collect::<Vec<_>>(), schemes);
         assert_eq!(urls.iter().map(|u| u.path()).collect::<Vec<_>>(), paths);
+    }
+
+    #[test]
+    fn parse_uri_collapses_redundant_slashes() {
+        // A base path with a doubled slash (common from naive string concat, and
+        // tolerated by Hadoop/JVM Hudi) must normalize to a single slash so the
+        // object_store Path parser doesn't reject the empty segment later.
+        assert_eq!(
+            parse_uri("/tmp/junit-123//mor-with-logs").unwrap().path(),
+            "/tmp/junit-123/mor-with-logs"
+        );
+        assert_eq!(parse_uri("file:///a//b///c/").unwrap().path(), "/a/b/c");
+        assert_eq!(parse_uri("s3://bucket/a//b").unwrap().path(), "/a/b");
+        // Three-or-more consecutive slashes collapse to one.
+        assert_eq!(parse_uri("s3://bucket/a////b").unwrap().path(), "/a/b");
+        // The resulting path must be usable as an object_store Path.
+        let url = parse_uri("/tmp/x//y").unwrap();
+        object_store::path::Path::from_url_path(url.path())
+            .expect("normalized path is a valid object_store Path");
+
+        // A percent-encoded segment (e.g. a space) combined with a doubled slash
+        // must NOT be double-encoded by the collapse: `%20` stays `%20`, not
+        // `%2520`. (Regression: the old path_segments()/extend() round-trip
+        // re-encoded the already-encoded segment.)
+        let url = parse_uri("s3://bucket/my dir//tbl").unwrap();
+        assert_eq!(url.path(), "/my%20dir/tbl");
+        assert!(
+            !url.path().contains("%2520"),
+            "segment must not be double-encoded"
+        );
     }
 
     #[test]
