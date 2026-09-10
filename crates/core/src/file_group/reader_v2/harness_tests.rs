@@ -2146,6 +2146,59 @@ fg_case_test!(
     }
 );
 
+/// The evo_add_col table schema with the record renamed to what DeltaStreamer's
+/// row-based path stamps (`RowBasedSchemaProvider`: `hoodie.source.hoodie_source`,
+/// hardcoded and table-independent). Fields byte-identical to
+/// [`EVO_ADD_COL_AVRO_JSON`] — only name+namespace differ.
+const EVO_ADD_COL_PRODUCER_NAMED_AVRO_JSON: &str = r#"{"type":"record","name":"hoodie_source","namespace":"hoodie.source","fields":[{"name":"_hoodie_commit_time","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_commit_seqno","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_record_key","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_partition_path","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_file_name","type":["null","string"],"doc":"","default":null},{"name":"key","type":["null","string"],"default":null},{"name":"ts","type":["null","long"],"default":null},{"name":"val","type":["null","string"],"default":null},{"name":"extra","type":["null","string"],"default":null}]}"#;
+
+/// Same, with an UNQUALIFIED producer name (a Kafka / Schema-Registry source name,
+/// e.g. `automation_dataset` — one of the two names actually observed in the field).
+/// This is the case an ALIAS cannot express: an unqualified alias is re-qualified
+/// with the READER's namespace, so it would still not match. Adopting the writer's
+/// identity handles it; this test is what keeps that distinction from regressing.
+const EVO_ADD_COL_UNQUALIFIED_PRODUCER_AVRO_JSON: &str = r#"{"type":"record","name":"automation_dataset","fields":[{"name":"_hoodie_commit_time","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_commit_seqno","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_record_key","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_partition_path","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_file_name","type":["null","string"],"doc":"","default":null},{"name":"key","type":["null","string"],"default":null},{"name":"ts","type":["null","long"],"default":null},{"name":"val","type":["null","string"],"default":null},{"name":"extra","type":["null","string"],"default":null}]}"#;
+
+// ENG-46300 coverage, ported from internal `06b2a31` (#114). 145 carries the
+// BEHAVIOUR (a9627c0 adopts the writer's record identity) but shipped none of
+// its FFI-shaped coverage. These are the only `SchemaSpec::ExplicitJson` cases
+// where the producer's record name differs from the table's — i.e. the shape
+// Gluten actually passes over FFI — so without them the fix is unguarded on
+// the one path that motivated it.
+fg_case_test!(
+    harness_record_name_mismatch_qualified_producer,
+    FgReaderCase {
+        name: "record_name_mismatch_qualified_producer",
+        fixture: QuickstartTripsTable::MorEvoAddCol,
+        partition: "",
+        base_file: EVO_ADD_COL_BASE,
+        log_files: EVO_ADD_COL_LOGS,
+        schema: SchemaSpec::ExplicitJson {
+            data_json: EVO_ADD_COL_PRODUCER_NAMED_AVRO_JSON,
+            requested_json: EVO_ADD_COL_PRODUCER_NAMED_AVRO_JSON,
+        },
+        expected: Expected::GoldParquet,
+        ..Default::default()
+    }
+);
+
+fg_case_test!(
+    harness_record_name_mismatch_unqualified_producer,
+    FgReaderCase {
+        name: "record_name_mismatch_unqualified_producer",
+        fixture: QuickstartTripsTable::MorEvoAddCol,
+        partition: "",
+        base_file: EVO_ADD_COL_BASE,
+        log_files: EVO_ADD_COL_LOGS,
+        schema: SchemaSpec::ExplicitJson {
+            data_json: EVO_ADD_COL_UNQUALIFIED_PRODUCER_AVRO_JSON,
+            requested_json: EVO_ADD_COL_UNQUALIFIED_PRODUCER_AVRO_JSON,
+        },
+        expected: Expected::GoldParquet,
+        ..Default::default()
+    }
+);
+
 // Added column + projection: requested = [key, val, extra]. Proves the
 // required-schema JSON path prunes correctly while still resolving the
 // old-writer-schema log block (k1's update has no `extra` → NULL).
