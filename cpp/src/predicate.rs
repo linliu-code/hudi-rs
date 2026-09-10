@@ -208,9 +208,26 @@ impl PushedFilter {
         }))
     }
 
-    /// Column names referenced by the pushed filter (for logging / sanity).
+    /// The whole base schema, in substrait field-index order — NOT the subset the
+    /// expression references. Gluten serialises the scan's base schema into the
+    /// blob, so a predicate on one column arrives with every column named here.
+    /// Use [`Self::referenced_columns`] for anything scoped to the predicate.
     pub fn columns(&self) -> &[String] {
         &self.column_names
+    }
+
+    /// The columns the pushed expression actually references, deduped and in
+    /// field-index order. Any decision about what the predicate can misread must
+    /// key on this; [`Self::columns`] would widen it to the whole scan.
+    ///
+    /// An unresolvable field index is skipped — a wider result is the conservative
+    /// direction for the callers of this, and
+    /// [`Self::references_only_primary_keys`] rejects malformed plans outright.
+    pub fn referenced_columns(&self) -> Vec<String> {
+        self.referenced_field_indices()
+            .into_iter()
+            .filter_map(|idx| self.column_names.get(idx).cloned())
+            .collect()
     }
 
     /// Returns true iff every column this filter references is either in
@@ -3298,6 +3315,79 @@ mod tests {
         let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
         let refs = pf.referenced_field_indices();
         assert_eq!(refs.iter().copied().collect::<Vec<_>>(), vec![0_usize]);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // referenced_columns — the predicate-scoped counterpart to columns()
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn referenced_columns_is_a_strict_subset_of_the_base_schema() {
+        // Gluten serialises the whole base schema into the blob, so `columns()`
+        // names `b` even though the expression never reads it.
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["a", "b"],
+            scalar_fn(1, vec![col_ref(0), i64_literal(5)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        assert_eq!(pf.columns(), ["a", "b"], "base schema, verbatim");
+        assert_eq!(
+            pf.referenced_columns(),
+            vec!["a".to_string()],
+            "only the column the expression reads"
+        );
+    }
+
+    #[test]
+    fn referenced_columns_returns_every_referenced_column_deduped() {
+        // (a > 1) AND (b < 10) AND (a < 100): both columns, `a` once.
+        let bytes = extended(
+            &[
+                (1, "gt:any_any"),
+                (2, "lt:any_any"),
+                (3, "and:bool_bool"),
+                (4, "lt:any_any"),
+            ],
+            &["a", "b", "c"],
+            scalar_fn(
+                3,
+                vec![
+                    scalar_fn(1, vec![col_ref(0), i64_literal(1)]),
+                    scalar_fn(
+                        3,
+                        vec![
+                            scalar_fn(2, vec![col_ref(1), i64_literal(10)]),
+                            scalar_fn(4, vec![col_ref(0), i64_literal(100)]),
+                        ],
+                    ),
+                ],
+            ),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        assert_eq!(
+            pf.referenced_columns(),
+            vec!["a".to_string(), "b".to_string()],
+            "deduped, in field-index order, and `c` is never referenced"
+        );
+    }
+
+    #[test]
+    fn referenced_columns_skips_an_index_out_of_range_of_the_base_schema() {
+        // A malformed plan referencing field 5 of a 1-column base schema. Skipping
+        // suits the repair pre-screen this feeds; the PK gate must not guess, and
+        // rejects the same shape outright.
+        let bytes = extended(
+            &[(1, "equal:any_any")],
+            &["a"],
+            scalar_fn(1, vec![col_ref(5), i64_literal(5)]),
+        );
+        let pf = PushedFilter::decode(&bytes).unwrap().unwrap();
+        assert!(pf.referenced_columns().is_empty());
+        assert!(
+            !pf.references_only_primary_keys(&["a".to_string()]),
+            "the PK gate still refuses a plan it cannot resolve"
+        );
     }
 
     #[test]
