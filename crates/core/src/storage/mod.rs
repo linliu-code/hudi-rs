@@ -543,7 +543,6 @@ mod tests {
     use std::fs::canonicalize;
     use std::path::Path;
 
-
     // ── ENG-40156 — with_region_fallback ──────────────────────────────
     //
     // These tests cover the env-driven region injection. Tests that touch
