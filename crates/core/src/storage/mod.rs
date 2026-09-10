@@ -21,7 +21,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use once_cell::sync::Lazy;
 
 use async_recursion::async_recursion;
 use bytes::Bytes;
@@ -217,6 +220,40 @@ impl ReadVolume {
     }
 }
 
+/// ENG-42276 — process-wide cache of built `ObjectStore`s.
+///
+/// `parse_url_opts` builds a fresh client per call, and for S3 that means a new
+/// credential chain and a new TLS connection pool. Embedders construct a
+/// `Storage` PER FILE GROUP (see `cpp/src/lib.rs`), so on a scan of N splits the
+/// uncached path pays that N times and shares no connections between them.
+///
+/// Keyed by scheme+host plus the full option set, so two stores that differ in
+/// endpoint or credentials never share an entry — see [`object_store_cache_key`].
+///
+/// Caveat, recorded deliberately: this map is unbounded and lives for the
+/// process. That is bounded in practice by the number of DISTINCT
+/// (host, options) pairs a process sees, which is small — but a caller that
+/// mints per-request credentials would grow it without limit. Nothing here
+/// evicts, matching internal main; if that ever becomes a problem the fix is an
+/// entry-bounded cache, not a per-split rebuild.
+static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Identity of a built store: scheme+host, plus the option set in a stable
+/// order. The option set is load-bearing — the same `s3://bucket/path` resolves
+/// to different physical stores under different endpoints or credentials, so a
+/// URL-only key would hand one endpoint's client to another's read.
+fn object_store_cache_key(base_url: &Url, options: &HashMap<String, String>) -> String {
+    let host_part = format!(
+        "{}://{}",
+        base_url.scheme(),
+        base_url.host_str().unwrap_or("")
+    );
+    let mut opts: Vec<(&String, &String)> = options.iter().collect();
+    opts.sort();
+    format!("{host_part}|{opts:?}")
+}
+
 impl Storage {
     pub const CLOUD_STORAGE_PREFIXES: [&'static str; 3] = ["AWS_", "AZURE_", "GOOGLE_"];
 
@@ -239,16 +276,39 @@ impl Storage {
 
         let options = Self::with_region_fallback(&base_url, options);
 
-        match parse_url_opts(&base_url, options.as_ref()) {
-            Ok((object_store, _)) => Ok(Arc::new(Storage {
-                base_url: Arc::new(base_url),
-                object_store: Arc::new(object_store),
-                options,
-                hudi_configs,
-                read_volume: Arc::new(ReadVolume::default()),
-            })),
-            Err(e) => Err(Creation(format!("Failed to create storage: {e}"))),
-        }
+        // ENG-42276 — consult the process-level store cache before building a
+        // new client. See OBJECT_STORE_CACHE.
+        let key = object_store_cache_key(&base_url, options.as_ref());
+        let object_store: Arc<dyn ObjectStore> = {
+            let mut cache = OBJECT_STORE_CACHE
+                .lock()
+                .expect("OBJECT_STORE_CACHE mutex poisoned");
+            if let Some(existing) = cache.get(&key) {
+                existing.clone()
+            } else {
+                // Bind hyper's dispatch task to the process-lifetime runtime
+                // rather than the caller's per-task one: a cached store whose
+                // dispatcher died with a transient runtime fails every later
+                // read with `DispatchGone`.
+                let _guard = crate::ffi_support::OBJECT_STORE_RUNTIME.enter();
+                match parse_url_opts(&base_url, options.as_ref()) {
+                    Ok((new_store, _)) => {
+                        let arc: Arc<dyn ObjectStore> = Arc::new(new_store);
+                        cache.insert(key, arc.clone());
+                        arc
+                    }
+                    Err(e) => return Err(Creation(format!("Failed to create storage: {e}"))),
+                }
+            }
+        };
+
+        Ok(Arc::new(Storage {
+            base_url: Arc::new(base_url),
+            object_store,
+            options,
+            hudi_configs,
+            read_volume: Arc::new(ReadVolume::default()),
+        }))
     }
 
     /// Clone of this `Storage`'s read-volume counters, for a consumer that
@@ -654,6 +714,66 @@ mod tests {
         unsafe {
             std::env::remove_var("AWS_REGION");
         }
+    }
+
+    // ── ENG-42276 — OBJECT_STORE_CACHE ────────────────────────────────
+    //
+    // Internal main ships this cache with no test at all. These are written
+    // here rather than ported, because "the same store is reused" is exactly
+    // the property the change exists for and nothing else pins it.
+
+    #[test]
+    fn test_object_store_cache_key_separates_distinct_option_sets() {
+        let url = Url::parse("s3://example-bucket/path/").unwrap();
+        let a = HashMap::from([("region".to_string(), "us-west-2".to_string())]);
+        let b = HashMap::from([("region".to_string(), "eu-west-1".to_string())]);
+        assert_ne!(
+            object_store_cache_key(&url, &a),
+            object_store_cache_key(&url, &b),
+            "the same bucket under a different region is a different store"
+        );
+    }
+
+    #[test]
+    fn test_object_store_cache_key_is_order_independent() {
+        // HashMap iteration order is arbitrary, so a key built from it must be
+        // sorted or two identical option sets would miss each other's entry.
+        let url = Url::parse("s3://example-bucket/path/").unwrap();
+        let a = HashMap::from([
+            ("region".to_string(), "us-west-2".to_string()),
+            ("endpoint".to_string(), "http://x".to_string()),
+        ]);
+        let b = HashMap::from([
+            ("endpoint".to_string(), "http://x".to_string()),
+            ("region".to_string(), "us-west-2".to_string()),
+        ]);
+        assert_eq!(
+            object_store_cache_key(&url, &a),
+            object_store_cache_key(&url, &b)
+        );
+    }
+
+    #[test]
+    fn test_storage_new_reuses_one_object_store_per_identity() {
+        // The point of the cache: an embedder builds a Storage PER FILE GROUP,
+        // and every one of those must share a client rather than mint a new
+        // credential chain and TLS pool.
+        let base = canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap();
+        let url = Url::from_directory_path(&base).unwrap();
+        let mut opts = HashMap::new();
+        opts.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            url.as_str().to_string(),
+        );
+        let configs = Arc::new(HudiConfigs::new(opts));
+
+        let first = Storage::new(Arc::new(HashMap::new()), configs.clone()).unwrap();
+        let second = Storage::new(Arc::new(HashMap::new()), configs).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first.object_store, &second.object_store),
+            "two Storages over the same (host, options) must share one ObjectStore"
+        );
     }
 
     #[test]
