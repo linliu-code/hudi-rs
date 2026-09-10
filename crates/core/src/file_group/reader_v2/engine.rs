@@ -924,10 +924,19 @@ impl HoodieFileGroupReader {
         // HFile reader answers with the RESOLVED schema, which is what its
         // batches will carry, so the intersection is taken against that and not
         // against a writer schema the read never produces.
-        let read_options = || {
+        // ENG-48206 / OSS #748 — `row_filter` and `row_group_selector` are WITHDRAWN
+        // below, once this file's footer schema shows a value-reinterpreting repair.
+        // They are therefore passed per call instead of captured: a closure that
+        // captured them would borrow across that assignment (E0506) and, worse,
+        // would have pinned the pre-withdrawal values for the stream read — i.e.
+        // it would have pushed the very filter the gate just decided to withdraw.
+        // Upstream has no closure here and calls `base_read_options` directly at
+        // both sites; this keeps 145's de-duplication with upstream's semantics.
+        let read_options = |row_filter: Option<RowFilterBuilder>,
+                            row_group_selector: Option<RowGroupSelector>| {
             base_read_options(
-                row_filter.clone(),
-                row_group_selector.clone(),
+                row_filter,
+                row_group_selector,
                 key_predicate.clone(),
                 self.schema_handler.reader_schema_json.clone(),
                 use_position,
@@ -935,7 +944,10 @@ impl HoodieFileGroupReader {
         };
         let file_schema = self
             .base_file_reader()?
-            .read_schema(&path, read_options())
+            .read_schema(
+                &path,
+                read_options(row_filter.clone(), row_group_selector.clone()),
+            )
             .await
             .map_err(|e| {
                 CoreError::ReadFileSliceError(format!(
@@ -1053,7 +1065,8 @@ impl HoodieFileGroupReader {
             .base_file_reader()?
             .read_stream(
                 &path,
-                read_options().with_projection(intersection.fields().iter().map(|f| f.name())),
+                read_options(row_filter.clone(), row_group_selector.clone())
+                    .with_projection(intersection.fields().iter().map(|f| f.name())),
             )
             .await
             .map_err(|e| {
