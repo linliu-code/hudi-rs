@@ -53,7 +53,6 @@ use crate::file_group::reader_v2::buffered_record::{
 use crate::file_group::reader_v2::merge_iterator::DEFAULT_BATCH_SIZE;
 // `CoreError` / `RecordPayload` are used only by the test-only compaction
 // primitive and the unit tests (production compaction lives on the spillable map).
-#[cfg(test)]
 use crate::error::CoreError;
 #[cfg(test)]
 use crate::file_group::reader_v2::buffered_record::RecordPayload;
@@ -63,6 +62,7 @@ use crate::file_group::reader_v2::record_merger::{
     BufferedRecordMergerFactory, should_keep_newer_record,
 };
 use crate::file_group::reader_v2::update_processor::{UpdateStats, create_update_processor};
+use crate::schema::batch_evolution::is_name_reconcilable;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, LargeBinaryArray,
     LargeStringArray, RecordBatch, StringArray,
@@ -1113,11 +1113,25 @@ fn reconcile_defaults_from_prior(
             && let Ok(pidx) = prior_schema.index_of(field.name())
         {
             let prior_col = prior_row.column(pidx);
-            // Only substitute when the prior carries the same-typed column;
-            // otherwise leave the (default) log value rather than risk a
-            // type-mismatched batch.
+            // Substitute when the prior carries the same-typed column, or one that
+            // differs ONLY by nested child-field NAME — `prior` is routinely a BASE
+            // row (parquet, list child `element`) while the winner came from an avro
+            // log block (child `item`), so that difference is the common case here,
+            // not an exotic one. Declining it used to push the log's DEFAULT value
+            // through silently, returning a null for a column that has a value.
+            // See ISSUES I-7 (this is the silent-wrong-value member of that family).
+            //
+            // Reconciled to `field` — the LOG schema's field — because the rebuilt
+            // batch below is constructed with `log_schema`.
+            //
+            // Anything beyond a name difference (Int64 vs Int32, List vs LargeList)
+            // is still declined and the log value kept, exactly as before.
             if prior_col.data_type() == field.data_type() {
                 cols.push(prior_col.clone());
+                changed = true;
+                continue;
+            } else if is_name_reconcilable(prior_col.data_type(), field.data_type()) {
+                cols.push(reconcile_one_column(&prior_row, pidx, field)?);
                 changed = true;
                 continue;
             }
@@ -1328,37 +1342,9 @@ fn overlay_partial_over_prior(
     })
 }
 
-/// True iff `source` can be reconciled to `target` by name-metadata ALONE — i.e.
-/// they are structurally identical apart from nested child-FIELD names (arrow-avro
-/// "item"/"entries" vs Parquet "element"/"key_value") or field metadata, so the
-/// underlying buffers are byte-compatible. A primitive or layout difference
-/// (e.g. Int64 vs Int32, List vs LargeList) is NOT reconcilable — reconciling it
-/// would reinterpret or drop bytes — so it returns false and the caller treats it
-/// as a genuine mismatch. Conservative by construction: anything unrecognized is
-/// false.
-fn is_name_reconcilable(source: &arrow_schema::DataType, target: &arrow_schema::DataType) -> bool {
-    use arrow_schema::DataType::{LargeList, List, Map, Struct};
-    if source == target {
-        return true;
-    }
-    match (source, target) {
-        // List/LargeList/Map wrapper field NAME (+ metadata) may differ; recurse
-        // into the element/entries type. Map also requires the sorted flag to match.
-        (List(a), List(b)) | (LargeList(a), LargeList(b)) => {
-            is_name_reconcilable(a.data_type(), b.data_type())
-        }
-        (Map(a, sa), Map(b, sb)) => sa == sb && is_name_reconcilable(a.data_type(), b.data_type()),
-        // Struct field NAMES are user data (must match); recurse into each field's
-        // type in order.
-        (Struct(fa), Struct(fb)) => {
-            fa.len() == fb.len()
-                && fa.iter().zip(fb.iter()).all(|(x, y)| {
-                    x.name() == y.name() && is_name_reconcilable(x.data_type(), y.data_type())
-                })
-        }
-        _ => false,
-    }
-}
+// `is_name_reconcilable` moved to `crate::schema::batch_evolution` (see the import
+// above): output projection needs the same predicate, and a private copy here would
+// have let the two paths drift. See ISSUES I-7.
 
 /// Name-reconcile a single source column (`src.column(src_idx)`) to
 /// `target_field`'s type — nested child-field-name differences only (the same
@@ -1394,10 +1380,19 @@ fn pad_partial_to_target(partial: &RecordBatch, target_schema: &SchemaRef) -> Re
     for field in target_schema.fields() {
         match partial_schema.index_of(field.name()) {
             // Present column → take it; a type mismatch is a loud error (a present
-            // value must never be silently dropped to null).
+            // value must never be silently dropped to null). A nested child-FIELD-NAME
+            // difference (arrow-avro `item`/`entries` vs Parquet `element`/`key_value`)
+            // is NOT such a mismatch — same buffers, different schema metadata — and is
+            // name-reconciled here exactly as the overlay path above does it. Without
+            // this, a log-only partial insert whose list child is named `item` fails a
+            // read that the overlay path would have completed. See ISSUES I-7.
             Ok(pidx) => {
                 let col = partial.column(pidx);
-                if col.data_type() != field.data_type() {
+                if col.data_type() == field.data_type() {
+                    cols.push(col.clone());
+                } else if is_name_reconcilable(col.data_type(), field.data_type()) {
+                    cols.push(reconcile_one_column(partial, pidx, field)?);
+                } else {
                     return Err(crate::error::CoreError::Unsupported(format!(
                         "partial-update column '{}' has type {:?} but the table schema expects {:?}",
                         field.name(),
@@ -1405,7 +1400,6 @@ fn pad_partial_to_target(partial: &RecordBatch, target_schema: &SchemaRef) -> Re
                         field.data_type()
                     )));
                 }
-                cols.push(col.clone());
             }
             // Absent column → typed null (no prior value for a log-only insert).
             Err(_) => cols.push(arrow_array::new_null_array(field.data_type(), 1)),
@@ -7004,6 +6998,135 @@ mod tests {
         assert!(
             pad_partial_to_target(&bad, &target).is_err(),
             "pad must also reject it"
+        );
+    }
+
+    /// ISSUES I-7, FOURTH path — and the worst of the four, because it fails
+    /// SILENTLY rather than loudly.
+    ///
+    /// `reconcile_defaults_from_prior` fills a winner's default-valued column from
+    /// the loser row. Its doc states `prior` may be a BASE row while `log_rec` is a
+    /// log record — i.e. Parquet (list child `element`) meeting arrow-avro (list
+    /// child `item`). On a name-only difference the old exact-equality check simply
+    /// declined to substitute and pushed the log value through, so a NULL list
+    /// survived instead of the prior's real value. No error, no warning: wrong data.
+    #[test]
+    fn reconcile_defaults_reconciles_a_list_child_field_name() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        let list_ty =
+            |child: &str| DataType::List(Arc::new(Field::new(child, DataType::Int64, true)));
+
+        // Winner (from an avro log block): `tags` is NULL, child named `item`.
+        let log_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("tags", list_ty("item"), true),
+        ]));
+        let mut nb = ListBuilder::new(Int64Builder::new()).with_field(Arc::new(Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        )));
+        nb.append(false); // one NULL list row
+        let log_batch = RecordBatch::try_new(
+            log_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["k1"])) as ArrayRef,
+                Arc::new(nb.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let winner = BufferedRecord::new_data("k1".to_string(), log_batch, None);
+
+        // Loser (a base row from parquet): real value, child named `element`.
+        let prior_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("tags", list_ty("element"), true),
+        ]));
+        let mut pb = ListBuilder::new(Int64Builder::new()).with_field(Arc::new(Field::new(
+            "element",
+            DataType::Int64,
+            true,
+        )));
+        pb.values().append_value(42);
+        pb.append(true);
+        let prior = RecordBatch::try_new(
+            prior_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["k1"])) as ArrayRef,
+                Arc::new(pb.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let (out, changed) = reconcile_defaults_from_prior(
+            winner,
+            &prior,
+            0,
+            &HashMap::new(), // absent field -> DefaultRetain::OnNull
+            &["key".to_string()],
+        )
+        .expect("name-reconcilable prior must be usable");
+
+        assert!(
+            changed,
+            "the prior's value must be adopted; declining to substitute on a \
+             child-field-NAME difference silently returns a NULL for a column that \
+             HAS a value"
+        );
+        let batch = out.get_record().expect("data record");
+        let tags = batch.column(1);
+        assert!(!tags.is_null(0), "tags must no longer be null");
+    }
+
+    /// ISSUES I-7, third path. A log-only partial insert whose list child field is
+    /// named `item` (arrow-avro) against a table schema naming it `element`
+    /// (Parquet) is the SAME physical layout — so `pad_partial_to_target` must
+    /// reconcile it, not fail the read.
+    ///
+    /// This is the sibling of the overlay path directly above: before the fix, the
+    /// same record succeeded when it had a prior to overlay onto and FAILED when it
+    /// did not, which is the asymmetry that made this bug hard to see.
+    #[test]
+    fn pad_partial_reconciles_a_list_child_field_name() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        let list_ty =
+            |child: &str| DataType::List(Arc::new(Field::new(child, DataType::Int64, true)));
+        let mut b = ListBuilder::new(Int64Builder::new()).with_field(Arc::new(Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        )));
+        b.values().append_value(7);
+        b.append(true);
+        let avro_named: ArrayRef = Arc::new(b.finish());
+
+        let partial = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("tags", list_ty("item"), true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["k1"])) as ArrayRef,
+                avro_named,
+            ],
+        )
+        .unwrap();
+
+        // Table schema names the child `element` and also has a column the partial
+        // lacks, which must still pad to a typed null.
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("tags", list_ty("element"), true),
+            Field::new("absent", DataType::Int32, true),
+        ]));
+
+        let out = pad_partial_to_target(&partial, &target)
+            .expect("a child-field-NAME difference must reconcile, not fail the pad");
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(out.schema().field(1).data_type(), &list_ty("element"));
+        assert!(
+            out.column(2).is_null(0),
+            "the absent column still pads to null"
         );
     }
 

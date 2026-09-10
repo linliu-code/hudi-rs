@@ -521,6 +521,41 @@ fn avro_byte_string(value: &serde_json::Value, bad: &dyn Fn(&str) -> CoreError) 
         .collect()
 }
 
+/// True iff `source` can be reconciled to `target` by name-metadata ALONE — i.e.
+/// they are structurally identical apart from nested child-FIELD names (arrow-avro
+/// "item"/"entries" vs Parquet "element"/"key_value") or field metadata, so the
+/// underlying buffers are byte-compatible. A primitive or layout difference
+/// (e.g. Int64 vs Int32, List vs LargeList) is NOT reconcilable — reconciling it
+/// would reinterpret or drop bytes — so it returns false and the caller treats it
+/// as a genuine mismatch. Conservative by construction: anything unrecognized is
+/// false.
+pub(crate) fn is_name_reconcilable(
+    source: &arrow_schema::DataType,
+    target: &arrow_schema::DataType,
+) -> bool {
+    use arrow_schema::DataType::{LargeList, List, Map, Struct};
+    if source == target {
+        return true;
+    }
+    match (source, target) {
+        // List/LargeList/Map wrapper field NAME (+ metadata) may differ; recurse
+        // into the element/entries type. Map also requires the sorted flag to match.
+        (List(a), List(b)) | (LargeList(a), LargeList(b)) => {
+            is_name_reconcilable(a.data_type(), b.data_type())
+        }
+        (Map(a, sa), Map(b, sb)) => sa == sb && is_name_reconcilable(a.data_type(), b.data_type()),
+        // Struct field NAMES are user data (must match); recurse into each field's
+        // type in order.
+        (Struct(fa), Struct(fb)) => {
+            fa.len() == fb.len()
+                && fa.iter().zip(fb.iter()).all(|(x, y)| {
+                    x.name() == y.name() && is_name_reconcilable(x.data_type(), y.data_type())
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Whether `from` -> `to` is a type change Hudi permits as schema evolution, and
 /// so one [`evolve_array`] should convert.
 ///

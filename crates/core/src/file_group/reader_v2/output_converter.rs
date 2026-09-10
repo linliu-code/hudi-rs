@@ -26,6 +26,8 @@
 
 use crate::Result;
 use crate::error::CoreError;
+use crate::file_group::reader_v2::buffer::row_extraction::reconcile_batch_to_schema;
+use crate::schema::batch_evolution::is_name_reconcilable;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, StructArray};
 use arrow_schema::{DataType, Field, SchemaRef};
@@ -80,6 +82,9 @@ impl ProjectionConverter {
 /// Narrow a single source array to match `target_field`'s type.
 ///
 /// - Identical types → cheap clone of the Arc.
+/// - Structurally identical apart from nested child-FIELD names (arrow-avro
+///   `item`/`entries` vs Parquet `element`/`key_value`) → name-reconciled, because
+///   the buffers are byte-compatible and only the schema metadata differs.
 /// - Both `Struct` → recursively narrow each requested subfield by name.
 ///   Subfield order follows `target_field`'s order (so reordering also works).
 /// - Anything else → `Err`.  Arrow's `RecordBatch::try_new` would catch a
@@ -92,6 +97,39 @@ fn narrow_array_to_field(
 ) -> Result<ArrayRef> {
     if source_field.data_type() == target_field.data_type() {
         return Ok(Arc::clone(source));
+    }
+
+    // A nested child-FIELD-NAME-only difference (arrow-avro `item`/`entries` vs
+    // Parquet `element`/`key_value`) is the SAME physical layout with different
+    // schema metadata, so it reconciles by rebuilding the array against the target
+    // field. This is the same predicate and the same rebuild the merge drain uses
+    // for the identical situation (`buffer/key_based.rs`), which is why the
+    // predicate now lives in `schema::batch_evolution` rather than being private to
+    // one of the two callers -- a private copy is how the two paths drifted in the
+    // first place. See ISSUES I-7.
+    //
+    // Deliberately BEFORE the struct arm: a struct containing such a list is then
+    // handled whole, while a struct that needs genuine NARROWING is not
+    // name-reconcilable (its field counts differ) and still falls through to it.
+    //
+    // Gated, and the gate is load-bearing: `is_name_reconcilable` is false for any
+    // primitive or layout difference (Int64 vs Int32, List vs LargeList), so a real
+    // physical mismatch still reaches the loud error below instead of having its
+    // buffers reinterpreted.
+    if is_name_reconcilable(source_field.data_type(), target_field.data_type()) {
+        let one = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![source_field.clone()])),
+            vec![Arc::clone(source)],
+        )
+        .map_err(|e| {
+            CoreError::ReadFileSliceError(format!(
+                "Output projection: reconcile setup for column '{}': {e}",
+                source_field.name()
+            ))
+        })?;
+        let target_one: SchemaRef = Arc::new(arrow_schema::Schema::new(vec![target_field.clone()]));
+        let recon = reconcile_batch_to_schema(&one, &target_one)?;
+        return Ok(recon.column(0).clone());
     }
 
     match (source_field.data_type(), target_field.data_type()) {
@@ -444,6 +482,156 @@ mod tests {
         assert!(
             msg.contains("missing_subfield"),
             "error should name the missing subfield, got: {msg}"
+        );
+    }
+
+    // ── list child-field-NAME reconcile in output projection ────────────────
+    //
+    // arrow-avro names a list's child field `item`; parquet/the Hudi spec name it
+    // `element`. Same physical layout, same buffers — only the child field's NAME
+    // differs. The merge/overlay path already reconciles this
+    // (`is_name_reconcilable` + `reconcile_batch_to_schema` in buffer/key_based.rs);
+    // output projection did not, and failed the whole batch instead.
+
+    fn list_of_i64(child_name: &str, nullable_child: bool) -> DataType {
+        DataType::List(Arc::new(Field::new(
+            child_name,
+            DataType::Int64,
+            nullable_child,
+        )))
+    }
+
+    /// Build a ListArray of i64 whose CHILD FIELD is named `child_name`.
+    fn list_array(child_name: &str, rows: &[&[i64]]) -> ArrayRef {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        let mut b = ListBuilder::new(Int64Builder::new()).with_field(Arc::new(Field::new(
+            child_name,
+            DataType::Int64,
+            true,
+        )));
+        for row in rows {
+            for v in row.iter() {
+                b.values().append_value(*v);
+            }
+            b.append(true);
+        }
+        Arc::new(b.finish()) as ArrayRef
+    }
+
+    /// The shape the production sweep hit: source list child is `item`, target
+    /// list child is `element`. Must project, not error.
+    #[test]
+    fn test_output_converter_reconciles_list_child_field_name() {
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("tags", list_of_i64("item", true), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                list_array("item", &[&[10, 11], &[20]]),
+            ],
+        )
+        .unwrap();
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            list_of_i64("element", true),
+            true,
+        )]));
+        let out = ProjectionConverter::new(&target_schema)
+            .apply(batch)
+            .expect("a child-field-NAME difference must reconcile, not fail the batch");
+
+        assert_eq!(out.num_rows(), 2);
+        assert_eq!(
+            out.schema().field(0).data_type(),
+            &list_of_i64("element", true)
+        );
+        let got = out.column(0).as_list::<i32>();
+        assert_eq!(
+            got.value(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .values(),
+            &[10, 11]
+        );
+        assert_eq!(
+            got.value(1)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .values(),
+            &[20]
+        );
+    }
+
+    /// The negative case, and the reason the reconcile must stay gated: a genuine
+    /// element-TYPE difference inside a list is a physical mismatch and must still
+    /// fail loudly rather than reinterpret buffers.
+    #[test]
+    fn test_output_converter_still_errors_on_list_element_type_mismatch() {
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            list_of_i64("item", true),
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(source_schema, vec![list_array("item", &[&[10]])]).unwrap();
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("element", DataType::Int32, true))),
+            true,
+        )]));
+        let err = ProjectionConverter::new(&target_schema)
+            .apply(batch)
+            .expect_err("Int64 vs Int32 inside a list is a PHYSICAL mismatch and must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("incompatible types for column") && msg.contains("tags"),
+            "the error must still name the column, got: {msg}"
+        );
+    }
+
+    /// A list needing the name reconcile, nested inside a struct that is itself
+    /// being narrowed — the reconcile branch sits before the struct branch, so the
+    /// recursion has to reach it.
+    #[test]
+    fn test_output_converter_reconciles_list_child_name_nested_in_struct() {
+        let inner_src = Fields::from(vec![
+            Field::new("keep", list_of_i64("item", true), true),
+            Field::new("drop", DataType::Int64, true),
+        ]);
+        let struct_src = StructArray::new(
+            inner_src.clone(),
+            vec![
+                list_array("item", &[&[7, 8]]),
+                Arc::new(Int64Array::from(vec![99])) as ArrayRef,
+            ],
+            None,
+        );
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(inner_src),
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(struct_src) as ArrayRef]).unwrap();
+
+        // Target keeps only `keep`, and names the list child `element`.
+        let inner_tgt = Fields::from(vec![Field::new("keep", list_of_i64("element", true), true)]);
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(inner_tgt.clone()),
+            true,
+        )]));
+        let out = ProjectionConverter::new(&target_schema)
+            .apply(batch)
+            .expect("narrowing a struct must also reconcile a list child name inside it");
+
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(
+            out.schema().field(0).data_type(),
+            &DataType::Struct(inner_tgt)
         );
     }
 }
