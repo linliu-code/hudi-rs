@@ -608,6 +608,51 @@ pub(crate) fn counting_row_filter_builder(
     })
 }
 
+/// ENG-48206 — which of a pushed predicate's columns the apache/hudi#18132 repair
+/// could make it misread, decided before any file is opened.
+///
+/// Parquet evaluates a pushed predicate against a file's PHYSICAL values, and the
+/// repair relabels a mislabelled tz-aware column rather than rescaling it — so a
+/// millis-semantics literal reads those values as 1970 and the scan drops rows
+/// that match. The repair arm fires only when the TABLE side is tz-aware millis,
+/// which makes the candidate set decidable here. The result arms the per-file
+/// footer check in `HoodieFileGroupReader::make_base_file_source`; empty means no
+/// base read does any per-file work, which is every table Spark wrote with micros.
+///
+/// Scoped to [`PushedFilter::referenced_columns`], not `columns()`: the latter is
+/// the whole base schema, so keying on it would cost a predicate its pushdown over
+/// a mislabelled column it never reads.
+///
+/// Fails closed when `table_schema` is absent: the row filter is installed off
+/// `pushed_filter` alone and would still be pushed, so the referenced columns pass
+/// through as candidates and each file's footer decides.
+///
+/// Standalone rather than inline in `new_file_group_reader_with_context` so the
+/// production activation path is reachable from a test — reader-level tests inject
+/// `ReaderContext::repair_risk_columns` by hand and cannot see a regression here.
+pub(crate) fn repair_risk_columns_for(
+    pushed_filter: Option<&PushedFilter>,
+    table_schema: Option<&arrow_schema::SchemaRef>,
+) -> Vec<String> {
+    let Some(pf) = pushed_filter else {
+        return Vec::new();
+    };
+    let referenced = pf.referenced_columns();
+    match table_schema {
+        Some(table_schema) => {
+            hudi_dep::schema::batch_evolution::repair_risk_columns(table_schema, &referenced)
+        }
+        None => {
+            log::warn!(
+                "[ENG-48206] no table schema available, so predicate columns \
+                 {referenced:?} cannot be pre-screened; treating all of them as \
+                 at risk and letting each file's footer decide"
+            );
+            referenced
+        }
+    }
+}
+
 /// Creates a `HoodieFileGroupReader` from a full `FfiReaderContext`.
 pub fn new_file_group_reader_with_context(
     ctx: ffi::FfiReaderContext,
@@ -929,6 +974,19 @@ pub fn new_file_group_reader_with_context(
         );
     }
 
+    // ── 7a-bis. ENG-48206 — which predicate columns the #18132 repair can reach ──
+    // Decided here, beside `mor_pk_safe`, and for the same reason: the base read
+    // and the injected provider must see one decision.
+    let repair_risk_columns =
+        repair_risk_columns_for(pushed_filter.as_ref(), schema_handler.table_schema.as_ref());
+    if !repair_risk_columns.is_empty() {
+        log::debug!(
+            "[ENG-48206] predicate columns {repair_risk_columns:?} may carry the \
+             #18132 mislabel; base reads will check each file's footer and decline \
+             pushdown on the ones that mislabel them"
+        );
+    }
+
     // Build the RowFilterBuilder closure once. It's installed onto the
     // reader_context only if there is a pushed filter; the actual
     // installation at scan time is then gated by
@@ -995,6 +1053,7 @@ pub fn new_file_group_reader_with_context(
         row_group_selector,
         mor_pk_safe,
         key_predicate: None,
+        repair_risk_columns,
         completion_gate_inputs,
     });
 
@@ -1848,6 +1907,110 @@ mod tests {
         let mut buf = Vec::new();
         ext.encode(&mut buf).unwrap();
         buf
+    }
+
+    // ── ENG-48206 gate 1 — the production activation path ───────────────────
+    //
+    // Reader-level tests in hudi-core inject `ReaderContext::repair_risk_columns`
+    // by hand, so only these can see a regression here. Replacing the function
+    // body with `Vec::new()` must fail them.
+
+    /// An arrow schema whose `millis_tz` columns are tz-aware millis (the #18132
+    /// shape) and whose `plain` columns are not.
+    fn repair_table_schema(millis_tz: &[&str], plain: &[&str]) -> arrow_schema::SchemaRef {
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        let mut fields: Vec<Field> = millis_tz
+            .iter()
+            .map(|n| {
+                Field::new(
+                    *n,
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                    true,
+                )
+            })
+            .collect();
+        fields.extend(plain.iter().map(|n| Field::new(*n, DataType::Int64, true)));
+        Arc::new(Schema::new(fields))
+    }
+
+    fn decode_gt_filter(names: &[&str]) -> PushedFilter {
+        PushedFilter::decode(&pushdown_gt_filter_bytes(names))
+            .expect("well-formed ExtendedExpression")
+            .expect("gt is a known function, so it must decode")
+    }
+
+    #[test]
+    fn gate_one_arms_on_a_tz_aware_millis_predicate_column() {
+        // `pushdown_gt_filter_bytes` references field 0 only, so this is `ts > 100`.
+        let pf = decode_gt_filter(&["ts", "other"]);
+        let table_schema = repair_table_schema(&["ts"], &["other"]);
+
+        assert_eq!(
+            repair_risk_columns_for(Some(&pf), Some(&table_schema)),
+            vec!["ts".to_string()],
+            "a predicate over a tz-aware millis column must arm the per-file check"
+        );
+    }
+
+    #[test]
+    fn gate_one_stays_disarmed_when_no_predicate_column_is_tz_aware_millis() {
+        // Spark writes `TimestampType` as micros, so this is the common scan and
+        // the guard must cost it nothing.
+        let pf = decode_gt_filter(&["ts", "other"]);
+        let table_schema = repair_table_schema(&[], &["ts", "other"]);
+
+        assert!(
+            repair_risk_columns_for(Some(&pf), Some(&table_schema)).is_empty(),
+            "no predicate column is a repair target, so no file should be checked"
+        );
+    }
+
+    #[test]
+    fn gate_one_ignores_a_tz_aware_millis_column_the_predicate_never_reads() {
+        // `columns()` holds both names while the expression references field 0
+        // only, so keying gate 1 on it would cost this predicate its pushdown over
+        // a column it never touches.
+        let pf = decode_gt_filter(&["read_by_predicate", "at_risk_but_unread"]);
+        assert_eq!(
+            pf.columns(),
+            ["read_by_predicate", "at_risk_but_unread"],
+            "the pushed filter carries the whole base schema, not the referenced subset"
+        );
+        assert_eq!(
+            pf.referenced_columns(),
+            vec!["read_by_predicate".to_string()],
+            "the expression references field 0 only"
+        );
+
+        let table_schema = repair_table_schema(&["at_risk_but_unread"], &["read_by_predicate"]);
+
+        assert!(
+            repair_risk_columns_for(Some(&pf), Some(&table_schema)).is_empty(),
+            "only the columns the predicate actually reads can make it wrong"
+        );
+    }
+
+    #[test]
+    fn gate_one_fails_closed_when_the_table_schema_is_missing() {
+        // The row filter is installed off `pushed_filter` alone, so an absent table
+        // schema must not silently disable the guard.
+        let pf = decode_gt_filter(&["ts", "other"]);
+
+        assert_eq!(
+            repair_risk_columns_for(Some(&pf), None),
+            vec!["ts".to_string()],
+            "no table schema means no pre-screen, so every referenced column is a candidate"
+        );
+    }
+
+    #[test]
+    fn gate_one_is_empty_without_a_pushed_filter() {
+        let table_schema = repair_table_schema(&["ts"], &[]);
+        assert!(
+            repair_risk_columns_for(None, Some(&table_schema)).is_empty(),
+            "no predicate means nothing can be misread, whatever the table schema says"
+        );
+        assert!(repair_risk_columns_for(None, None).is_empty());
     }
 
     #[test]

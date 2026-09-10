@@ -115,6 +115,7 @@ fn build_reader_context(
         row_group_selector: None,
         mor_pk_safe: false,
         key_predicate: None,
+        repair_risk_columns: Vec::new(),
         completion_gate_inputs: None,
     })
 }
@@ -606,6 +607,7 @@ fn test_read_record_batch_column_projection() {
         row_group_selector: None,
         mor_pk_safe: false,
         key_predicate: None,
+        repair_risk_columns: Vec::new(),
         completion_gate_inputs: None,
     });
 
