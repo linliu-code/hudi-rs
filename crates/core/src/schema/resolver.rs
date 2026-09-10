@@ -195,6 +195,88 @@ pub(crate) fn sanitize_avro_schema_str(avro_schema_str: &str) -> String {
     avro_schema_str.trim().replace("\\:", ":")
 }
 
+/// Give `reader_schema_str`'s top-level record the identity `writer_fullname`, so Avro resolution
+/// accepts a writer whose record name differs from the reader's.
+///
+/// Needed because Hudi names the reader schema after the *table* (`hoodie.<t>.<t>_record`) while a
+/// log block carries the producer's own name (`hoodie_source` for DeltaStreamer's
+/// `RowBasedSchemaProvider`, or a Kafka / Schema-Registry source's own name). arrow-avro compares
+/// fully-qualified names, so the mismatch fails the decode outright, before any row is produced,
+/// and the failure is not retriable. Only Spark-authored tables agree, because the Spark writer
+/// derives the name from the same upstream helper the reader does.
+///
+/// Adopting name+namespace rather than adding an alias: an alias is qualified with the *reader's*
+/// namespace, so a namespace-less writer (`automation_dataset`) can never be expressed as an alias
+/// on a namespaced reader — `hoodie.t.automation_dataset` still differs from `automation_dataset`.
+/// Adopting the identity handles both forms. Safe here because the reader schema derives from a
+/// Spark `StructType`, which cannot express a recursive record, so there is no by-name
+/// self-reference for a rename to dangle.
+///
+/// Only the record's identity changes — the field set is untouched, so an incompatible schema still
+/// fails resolution. Nested records are left alone; a nested name that also disagrees would still
+/// be rejected. Returns the input **verbatim** if it is unparseable or not a top-level record.
+/// Callers skip this when the names already agree, so the common path does no JSON work.
+///
+/// Ported from hudi-rs-internal #114 (ENG-46300), which fixed this on internal `main`. This branch
+/// forks from apache/hudi-rs `main`, so it never carried that commit; the port keeps the OSS-core
+/// reader from regressing a case internal `main` already handles.
+pub(crate) fn adopt_writer_record_identity(
+    reader_schema_str: &str,
+    writer_fullname: &str,
+) -> String {
+    let Ok(mut reader) = serde_json::from_str::<Value>(reader_schema_str) else {
+        return reader_schema_str.to_string();
+    };
+
+    // Only a top-level record has an identity to adopt. Unions/primitives are returned untouched.
+    if reader.get("type").and_then(|t| t.as_str()) != Some("record") {
+        return reader_schema_str.to_string();
+    }
+
+    let Some(obj) = reader.as_object_mut() else {
+        return reader_schema_str.to_string();
+    };
+
+    // `writer_fullname` comes from `Name::fullname`, so any namespace is a dotted prefix.
+    match writer_fullname.rsplit_once('.') {
+        Some((namespace, name)) => {
+            obj.insert("name".to_string(), Value::String(name.to_string()));
+            obj.insert(
+                "namespace".to_string(),
+                Value::String(namespace.to_string()),
+            );
+        }
+        // Unqualified writer: the reader's namespace must go, or the full names still differ.
+        None => {
+            obj.insert(
+                "name".to_string(),
+                Value::String(writer_fullname.to_string()),
+            );
+            obj.remove("namespace");
+        }
+    }
+
+    serde_json::to_string(&reader).unwrap_or_else(|_| reader_schema_str.to_string())
+}
+
+/// The reader schema JSON to hand arrow-avro for a given writer.
+///
+/// Returns `reader_schema_str` **untouched** when the two records already share a fully-qualified
+/// name — every Spark-authored table, i.e. the entire currently-working population — so the common
+/// path does no JSON work at all. Otherwise the reader adopts the writer's identity via
+/// [`adopt_writer_record_identity`].
+pub(crate) fn reader_schema_for_writer(
+    reader_schema_str: &str,
+    reader_fullname: &str,
+    writer_fullname: &str,
+) -> String {
+    if reader_fullname == writer_fullname {
+        reader_schema_str.to_string()
+    } else {
+        adopt_writer_record_identity(reader_schema_str, writer_fullname)
+    }
+}
+
 fn arrow_schema_from_avro_schema_str(avro_schema_str: &str) -> Result<Schema> {
     let s = sanitize_avro_schema_str(avro_schema_str);
     let avro_schema = AvroSchema::parse_str(&s)
@@ -356,5 +438,91 @@ mod tests {
 
         let schema = extract_avro_schema_from_commit_metadata(&metadata);
         assert_eq!(schema, None);
+    }
+
+    /// The reader arrives named after the Hudi table; the log block carries the producer's name.
+    /// Adopting the writer's identity is what lets Avro resolution proceed.
+    #[test]
+    fn test_adopt_writer_identity_qualified() {
+        let reader = r#"{"type":"record","name":"t_record","namespace":"hoodie.t",
+            "fields":[{"name":"id","type":"long"}]}"#;
+
+        let out = adopt_writer_record_identity(reader, "hoodie.source.hoodie_source");
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(v["name"], "hoodie_source");
+        assert_eq!(v["namespace"], "hoodie.source");
+        // Identity only -- the projected field set must not be widened to the writer's.
+        assert_eq!(v["fields"].as_array().unwrap().len(), 1);
+        assert_eq!(v["fields"][0]["name"], "id");
+    }
+
+    #[test]
+    fn test_adopt_writer_identity_unqualified_drops_namespace() {
+        // A Kafka source schema may have no namespace (`automation_dataset`). Leaving the reader's
+        // namespace in place would keep the full names unequal.
+        let reader = r#"{"type":"record","name":"t_record","namespace":"hoodie.t","fields":[]}"#;
+        let out = adopt_writer_record_identity(reader, "automation_dataset");
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(v["name"], "automation_dataset");
+        assert!(v.get("namespace").is_none(), "namespace must be dropped");
+    }
+
+    #[test]
+    fn test_adopt_writer_identity_leaves_nested_records_untouched() {
+        // Documents the stated limitation: only the top-level record is changed.
+        let reader = r#"{"type":"record","name":"t_record","namespace":"hoodie.t","fields":[
+            {"name":"addr","type":{"type":"record","name":"Address","fields":[
+                {"name":"city","type":"string"}]}}]}"#;
+
+        let out = adopt_writer_record_identity(reader, "hoodie.source.hoodie_source");
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(v["name"], "hoodie_source");
+        let nested = &v["fields"][0]["type"];
+        assert_eq!(nested["name"], "Address");
+        assert!(
+            nested.get("namespace").is_none(),
+            "nested records must not be modified"
+        );
+    }
+
+    #[test]
+    fn test_adopt_writer_identity_fails_safe() {
+        assert_eq!(
+            adopt_writer_record_identity("not json", "w.w_record"),
+            "not json"
+        );
+        // Non-record top level -> untouched; there is no identity to adopt.
+        let union = r#"["null",{"type":"record","name":"t_record","fields":[]}]"#;
+        assert_eq!(adopt_writer_record_identity(union, "w.w_record"), union);
+        let primitive = r#"{"type":"string"}"#;
+        assert_eq!(
+            adopt_writer_record_identity(primitive, "w.w_record"),
+            primitive
+        );
+    }
+
+    /// The short circuit: equal full names must return the reader JSON byte-for-byte, so the
+    /// common path (every Spark-authored table) does no JSON work. Inverting the comparison in
+    /// `reader_schema_for_writer` fails this.
+    #[test]
+    fn test_reader_schema_for_writer_passes_through_when_names_agree() {
+        let reader = r#"{"type":"record","name":"t_record","namespace":"hoodie.t",
+            "fields":[{"name":"id","type":"long"}]}"#;
+        let out = reader_schema_for_writer(reader, "hoodie.t.t_record", "hoodie.t.t_record");
+        assert_eq!(out, reader, "an agreeing pair must not be rewritten at all");
+    }
+
+    #[test]
+    fn test_reader_schema_for_writer_adopts_when_names_differ() {
+        let reader = r#"{"type":"record","name":"t_record","namespace":"hoodie.t",
+            "fields":[{"name":"id","type":"long"}]}"#;
+        let out =
+            reader_schema_for_writer(reader, "hoodie.t.t_record", "hoodie.source.hoodie_source");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["name"], "hoodie_source");
+        assert_eq!(v["namespace"], "hoodie.source");
     }
 }

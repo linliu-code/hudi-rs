@@ -357,6 +357,29 @@ impl Decoder {
                 // spelling however they were written.
                 let writer = apache_avro::Schema::parse_str(writer_schema_json)?;
                 let required = apache_avro::Schema::parse_str(required_json)?;
+                // ENG-46300 (ported from hudi-rs-internal #114, which fixed this on internal
+                // `main`; this branch forks from apache/hudi-rs `main` and never carried it).
+                // The reader schema is named after the TABLE (`hoodie.<t>.<t>_record`) while the
+                // block header carries the PRODUCER's name (`hoodie_source`, or a Kafka source's
+                // registry name). arrow-avro compares fully-qualified names and refuses to build
+                // a reader when they differ, so the read fails before any row is produced. Have
+                // the reader's top-level record adopt the writer's identity.
+                //
+                // `writer`/`required` are already parsed here, so the name comparison costs
+                // nothing and short-circuits to the reader JSON untouched for every
+                // Spark-authored table — the entire currently-working population.
+                let adopted_json = match (&writer, &required) {
+                    (
+                        apache_avro::Schema::Record(writer_rec),
+                        apache_avro::Schema::Record(required_rec),
+                    ) => crate::schema::resolver::reader_schema_for_writer(
+                        required_json,
+                        &required_rec.name.fullname(None),
+                        &writer_rec.name.fullname(None),
+                    ),
+                    // Non-record top level: nothing to adopt, leave resolution as it was.
+                    _ => required_json.to_string(),
+                };
                 if record_needs_rewrite_for_extended_promotion(&writer, &required)? {
                     log::warn!(
                         "log block rewritten rather than resolved: its schema differs from the \
@@ -409,11 +432,12 @@ impl Decoder {
                         )?);
                     (None, Some((defaults_carrier, required_arrow)))
                 } else {
-                    (Some(required_json), None)
+                    (Some(adopted_json), None)
                 }
             }
             None => (None, None),
         };
+        let reader_schema_json = reader_schema_json.as_deref();
 
         let registered = self.registered_for(writer_schema_json)?;
         let mut decoder = AvroBlockDecoder::try_new_with_registered(
@@ -815,6 +839,81 @@ mod tests {
     /// extended-promotion path this read fails outright with "Illegal
     /// promotion Int to String". The
     /// block decodes at its own schema and is converted afterwards.
+    /// ENG-46300 (ported with hudi-rs-internal #114) — a real Avro block whose header schema is
+    /// named by the PRODUCER (`hoodie.source.hoodie_source`, as DeltaStreamer's
+    /// `RowBasedSchemaProvider` writes it) decoded against Hudi's table-derived reader schema
+    /// (`hoodie.t.t_record`). Without the identity adoption arrow-avro rejects this pair outright
+    /// with `Record name mismatch`, non-retriably, before any row is produced — which is exactly
+    /// how hudi-internal's `TestNativeReaderRecordNameMismatch` fails through the gluten bundle.
+    #[test]
+    fn test_decode_avro_block_when_writer_record_name_differs() -> Result<()> {
+        let writer_json = r#"{"type":"record","name":"hoodie_source","namespace":"hoodie.source","fields":[{"name":"id","type":"long"}]}"#;
+        let required_json = r#"{"type":"record","name":"t_record","namespace":"hoodie.t","fields":[{"name":"id","type":"long"}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(writer_json)?;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put("id", 7i64);
+        let body = to_avro_datum(&writer_schema, record)?;
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(required_json.to_string()));
+        let batches = decoder
+            .decode_avro_record_content(buf.as_slice(), &header)
+            .expect("a producer-named writer schema must decode against a table-named reader");
+
+        let col = batches.data_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("id stays a long");
+        assert_eq!(
+            col.value(0),
+            7,
+            "the row must survive the name reconciliation"
+        );
+        Ok(())
+    }
+
+    /// Same, for a producer schema with NO namespace (`automation_dataset`, a Kafka /
+    /// Schema-Registry source name). This is the case an alias cannot express, because an
+    /// unqualified alias is re-qualified with the READER's namespace.
+    #[test]
+    fn test_decode_avro_block_when_writer_record_name_is_unqualified() -> Result<()> {
+        let writer_json = r#"{"type":"record","name":"automation_dataset","fields":[{"name":"id","type":"long"}]}"#;
+        let required_json = r#"{"type":"record","name":"t_record","namespace":"hoodie.t","fields":[{"name":"id","type":"long"}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(writer_json)?;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put("id", 11i64);
+        let body = to_avro_datum(&writer_schema, record)?;
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(required_json.to_string()));
+        let batches = decoder
+            .decode_avro_record_content(buf.as_slice(), &header)
+            .expect("an unqualified producer record name must decode too");
+
+        let col = batches.data_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("id stays a long");
+        assert_eq!(col.value(0), 11);
+        Ok(())
+    }
+
     #[test]
     fn test_extended_promotion_int_to_string_rewrites() -> Result<()> {
         let writer_json =
