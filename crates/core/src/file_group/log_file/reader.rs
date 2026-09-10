@@ -1684,4 +1684,113 @@ mod tests {
         );
         Ok(())
     }
+
+    /// A minimal, self-consistent V1 COMMAND block.
+    ///
+    /// Handwritten rather than taken from a fixture because the corrupt-tail
+    /// cases below need a KNOWN-good block to precede the damage: a fixture's
+    /// block would also have to be located before the tail could be appended.
+    ///
+    /// `block_length` spans version..=trailing pointer, excluding the magic and
+    /// the length field itself; the trailing reverse pointer counts the magic on
+    /// top, which is what `is_block_corrupted` checks against.
+    fn a_valid_command_block(instant: &str) -> Vec<u8> {
+        let instant_bytes = instant.as_bytes();
+        let header_len = 4 + 4 + 4 + instant_bytes.len();
+        let block_length = 4 + 4 + header_len + 8 + 4 + 8;
+        let trailing = (block_length + MAGIC.len()) as u64;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&(block_length as u64).to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes()); // format version V1
+        buf.extend_from_slice(&0u32.to_be_bytes()); // block type Command
+        buf.extend_from_slice(&1u32.to_be_bytes()); // one header entry
+        buf.extend_from_slice(&0u32.to_be_bytes()); // key ordinal: InstantTime
+        buf.extend_from_slice(&(instant_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(instant_bytes);
+        buf.extend_from_slice(&0u64.to_be_bytes()); // empty content
+        buf.extend_from_slice(&0u32.to_be_bytes()); // empty footer
+        buf.extend_from_slice(&trailing.to_be_bytes());
+        buf
+    }
+
+    /// One good block, then a corrupt tail: a MAGIC, a length no file could
+    /// hold, and a few bytes of garbage with NO further MAGIC anywhere.
+    fn good_block_then_corrupt_tail() -> (tempfile::TempDir, String, u64) {
+        let mut bytes = a_valid_command_block("20250101000000000");
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&1_000_000u64.to_be_bytes());
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+        let total_len = bytes.len() as u64;
+        let tmp = tempfile::tempdir().unwrap();
+        let file_name = "corrupt-tail.log.1_0-0-0".to_string();
+        std::fs::write(tmp.path().join(&file_name), &bytes).unwrap();
+        (tmp, file_name, total_len)
+    }
+
+    /// A corrupt tail with nothing after it must end the walk cleanly: one
+    /// Corrupted block spanning to end-of-file, then EOF — not an error, and not
+    /// a read that runs past the file.
+    ///
+    /// Recovery from a corrupt block scans forward for the next MAGIC; the case
+    /// where there ISN'T one is the branch of that scan nothing else pins.
+    /// `test_scan_for_next_block_offset_stays_within_file_bounds` runs on a
+    /// valid multi-block fixture and so always finds a marker — it asserts the
+    /// offset stays in bounds, never what the walk does when the answer is EOF.
+    /// Getting that branch wrong is silent: the reader either errors on a file
+    /// a truncated write is expected to produce, or seeks past the end.
+    #[tokio::test]
+    async fn a_corrupt_tail_with_no_following_magic_spans_to_eof() -> Result<()> {
+        let (tmp, file_name, total_len) = good_block_then_corrupt_tail();
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+        let mut reader = LogFileReader::new_streaming(hudi_configs, storage, &file_name).await?;
+
+        let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
+        let types: Vec<BlockType> = blocks.iter().map(|b| b.block_type.clone()).collect();
+        assert_eq!(
+            types,
+            vec![BlockType::Command, BlockType::Corrupted],
+            "the good block must be walked, and the tail must surface as one \
+             corrupt span rather than as an error"
+        );
+        assert_eq!(
+            reader.reader.position(),
+            total_len,
+            "the corrupt span must end exactly at EOF: a recovery scan that \
+             answers past the end leaves the walk seeked outside the file"
+        );
+        Ok(())
+    }
+
+    /// The eager walk takes a different function to the same decision, so it is
+    /// asserted separately: a tail the metadata sweep survives must not fail the
+    /// eager read.
+    #[tokio::test]
+    async fn the_eager_walk_ends_on_the_same_corrupt_tail() -> Result<()> {
+        let (tmp, file_name, total_len) = good_block_then_corrupt_tail();
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+        let mut reader = LogFileReader::new(hudi_configs, storage, &file_name).await?;
+        let range = InstantRange::up_to("99991231235959999", "utc");
+
+        let first = reader.read_next_block(&range).await?.expect("good block");
+        assert_eq!(first.block_type, BlockType::Command);
+        let second = reader
+            .read_next_block(&range)
+            .await?
+            .expect("corrupt tail as a block");
+        assert_eq!(second.block_type, BlockType::Corrupted);
+        assert!(
+            reader.read_next_block(&range).await?.is_none(),
+            "the eager walk must reach EOF cleanly too"
+        );
+        assert_eq!(
+            reader.reader.position(),
+            total_len,
+            "and must land exactly on EOF, like the metadata sweep"
+        );
+        Ok(())
+    }
 }
