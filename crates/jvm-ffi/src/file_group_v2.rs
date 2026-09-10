@@ -176,6 +176,16 @@ fn build_reader_context(
         row_group_selector: None,
         mor_pk_safe: false,
         key_predicate,
+        // ENG-48206 / OSS #748 — empty is CORRECT here, not a disabled guard.
+        // The gate exists to withdraw a pushed parquet predicate when a file's
+        // logical-type repair would make it misread physical values. This path
+        // installs no predicate at all (`row_filter_builder: None`,
+        // `row_group_selector: None` directly above), so there is nothing a
+        // repair could make wrong and nothing to withdraw. Should this
+        // constructor ever start pushing a filter, it must populate this from
+        // the predicate's referenced columns — see `repair_risk_columns_for`
+        // in `cpp/src/lib.rs`, which is the analogous production path.
+        repair_risk_columns: Vec::new(),
         completion_gate_inputs: None,
     }
 }
