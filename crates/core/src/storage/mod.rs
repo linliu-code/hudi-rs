@@ -237,6 +237,8 @@ impl Storage {
             }
         };
 
+        let options = Self::with_region_fallback(&base_url, options);
+
         match parse_url_opts(&base_url, options.as_ref()) {
             Ok((object_store, _)) => Ok(Arc::new(Storage {
                 base_url: Arc::new(base_url),
@@ -253,6 +255,47 @@ impl Storage {
     /// outlives the read and reports them once the stream has drained.
     pub fn read_volume(&self) -> Arc<ReadVolume> {
         self.read_volume.clone()
+    }
+
+    /// ENG-40156 — fall back to `AWS_REGION` / `AWS_DEFAULT_REGION` for S3 URLs
+    /// when the caller passed no region.
+    ///
+    /// Without this, `object_store::parse_url_opts` builds an `AmazonS3` client
+    /// against the default us-east-1 endpoint, and a HEAD to a bucket in any
+    /// other region fails with `BareRedirect`. Spark/EKS expose the region via
+    /// `AWS_REGION` (set by IRSA, or by `spark.executorEnv.AWS_REGION`), so
+    /// honouring it here means callers need not thread a region through the FFI
+    /// props map.
+    ///
+    /// Returns the SAME `Arc` when nothing applies, so the common path neither
+    /// copies the map nor touches the environment.
+    fn with_region_fallback(
+        base_url: &Url,
+        options: Arc<HashMap<String, String>>,
+    ) -> Arc<HashMap<String, String>> {
+        let scheme = base_url.scheme();
+        if scheme != "s3" && scheme != "s3a" {
+            return options;
+        }
+        if options.contains_key("region") || options.contains_key("aws_region") {
+            return options;
+        }
+        let region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .ok();
+        let Some(region) = region else { return options };
+        if region.is_empty() {
+            return options;
+        }
+        // debug!, not info!: embedders construct a Storage per file group, so on
+        // an s3 table whose region arrives only from the environment this fires
+        // once per split rather than once per process.
+        log::debug!(
+            "[ENG-40156] hudi-rs Storage: injecting region={region} from env for {scheme} url"
+        );
+        let mut merged: HashMap<String, String> = (*options).clone();
+        merged.insert("region".to_string(), region);
+        Arc::new(merged)
     }
 
     /// Build storage over a caller-supplied object store.
@@ -435,9 +478,183 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::Path;
+
+
+    // ── ENG-40156 — with_region_fallback ──────────────────────────────
+    //
+    // These tests cover the env-driven region injection. Tests that touch
+    // process env are marked `#[serial(env_vars)]` so concurrent execution
+    // doesn't clobber state. The env-var manipulations are inside `unsafe`
+    // blocks per the 2024-edition std::env safety rules.
+    //
+    // The fallback semantics under test:
+    //   - non-S3 schemes  → options returned unchanged.
+    //   - already-set `region`/`aws_region` → never overridden.
+    //   - S3 URL + AWS_REGION env set → `region` injected.
+    //   - S3 URL + only AWS_DEFAULT_REGION set → `region` injected.
+    //   - S3 URL + no env / empty env value → options returned unchanged.
+
+    fn s3_url() -> Url {
+        Url::parse("s3://example-bucket/path/").unwrap()
+    }
+
+    fn s3a_url() -> Url {
+        Url::parse("s3a://example-bucket/path/").unwrap()
+    }
+
+    #[test]
+    fn test_region_fallback_non_s3_scheme_is_passthrough() {
+        let in_opts = Arc::new(HashMap::from([(
+            "some_key".to_string(),
+            "some_val".to_string(),
+        )]));
+        let url = Url::parse("file:///tmp/path/").unwrap();
+        let out = Storage::with_region_fallback(&url, in_opts.clone());
+
+        // Same Arc — no copy, no mutation.
+        assert!(Arc::ptr_eq(&in_opts, &out));
+        assert!(!out.contains_key("region"));
+    }
+
+    #[test]
+    fn test_region_fallback_preserves_explicit_region() {
+        let in_opts = Arc::new(HashMap::from([(
+            "region".to_string(),
+            "ap-south-1".to_string(),
+        )]));
+        let out = Storage::with_region_fallback(&s3_url(), in_opts.clone());
+
+        // Caller-supplied region wins; we don't even peek at env.
+        assert!(Arc::ptr_eq(&in_opts, &out));
+        assert_eq!(out.get("region"), Some(&"ap-south-1".to_string()));
+    }
+
+    #[test]
+    fn test_region_fallback_preserves_explicit_aws_region_alias() {
+        let in_opts = Arc::new(HashMap::from([(
+            "aws_region".to_string(),
+            "eu-central-1".to_string(),
+        )]));
+        let out = Storage::with_region_fallback(&s3_url(), in_opts.clone());
+
+        // `aws_region` is the alias object_store accepts — also respected.
+        assert!(Arc::ptr_eq(&in_opts, &out));
+        assert!(!out.contains_key("region"));
+        assert_eq!(out.get("aws_region"), Some(&"eu-central-1".to_string()));
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_injects_from_aws_region_env() {
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::set_var("AWS_REGION", "us-west-2");
+        }
+        let in_opts = Arc::new(HashMap::new());
+        let out = Storage::with_region_fallback(&s3_url(), in_opts.clone());
+
+        assert_eq!(out.get("region"), Some(&"us-west-2".to_string()));
+        // A new Arc was returned — not the same pointer as input.
+        assert!(!Arc::ptr_eq(&in_opts, &out));
+
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+        }
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_injects_from_aws_default_region_env() {
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::set_var("AWS_DEFAULT_REGION", "us-west-2");
+        }
+        let out = Storage::with_region_fallback(&s3_url(), Arc::new(HashMap::new()));
+
+        // AWS_REGION takes priority when both set; here only DEFAULT is set.
+        assert_eq!(out.get("region"), Some(&"us-west-2".to_string()));
+
+        unsafe {
+            std::env::remove_var("AWS_DEFAULT_REGION");
+        }
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_aws_region_wins_over_default_region() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-west-2");
+            std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+        }
+        let out = Storage::with_region_fallback(&s3_url(), Arc::new(HashMap::new()));
+
+        assert_eq!(out.get("region"), Some(&"us-west-2".to_string()));
+
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+        }
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_no_env_is_passthrough() {
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+        }
+        let in_opts = Arc::new(HashMap::new());
+        let out = Storage::with_region_fallback(&s3_url(), in_opts.clone());
+
+        // No env, no mutation, no region inserted.
+        assert!(Arc::ptr_eq(&in_opts, &out));
+        assert!(!out.contains_key("region"));
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_empty_env_value_is_passthrough() {
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::set_var("AWS_REGION", "");
+        }
+        let in_opts = Arc::new(HashMap::new());
+        let out = Storage::with_region_fallback(&s3_url(), in_opts.clone());
+
+        // Empty string in env shouldn't be propagated as a "region" key —
+        // object_store would build an invalid endpoint URL otherwise.
+        assert!(Arc::ptr_eq(&in_opts, &out));
+        assert!(!out.contains_key("region"));
+
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+        }
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_s3a_scheme_also_works() {
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::set_var("AWS_REGION", "us-west-2");
+        }
+        let out = Storage::with_region_fallback(&s3a_url(), Arc::new(HashMap::new()));
+
+        // Hadoop-style `s3a://` URLs hit the same injection path.
+        assert_eq!(out.get("region"), Some(&"us-west-2".to_string()));
+
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+        }
+    }
 
     #[test]
     fn test_storage_new_error_no_base_path() {
