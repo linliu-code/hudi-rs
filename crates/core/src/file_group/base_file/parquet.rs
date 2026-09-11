@@ -851,8 +851,25 @@ mod tests {
         use std::collections::HashMap;
         crate::storage::parquet_schema_cache::clear();
 
-        let base_url =
-            Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
+        // The fixture is COPIED into a private tempdir rather than read from
+        // `tests/data`. The cache is process-global and keyed on
+        // `{file_url}|hash(storage options)`; both `test_storage()` and
+        // `new_with_object_store` carry an empty options map, so reading
+        // `tests/data/a.parquet` here would share a key with every other test that
+        // reads the same file. Today only `#[serial]` tests do, and they all
+        // `clear()` first — but the engine's own `read_schema` runs from dozens of
+        // non-serial tests, and the day one of them points at `a.parquet` this
+        // assertion starts failing intermittently. A unique URL makes the key
+        // unique by construction instead of by convention.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            canonicalize(Path::new("tests/data"))
+                .unwrap()
+                .join("a.parquet"),
+            tmp.path().join("a.parquet"),
+        )
+        .expect("copy the fixture into a private dir");
+        let base_url = Url::from_directory_path(canonicalize(tmp.path()).unwrap()).unwrap();
         let (store, counts) =
             CountingObjectStore::new(Arc::new(object_store::local::LocalFileSystem::new()));
         let mut hudi_options = HashMap::new();

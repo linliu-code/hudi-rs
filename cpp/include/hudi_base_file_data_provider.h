@@ -133,6 +133,14 @@ typedef struct HudiBaseFileDataResult {
  * provider), so it does not depend on the order in which the C++ caller frees
  * the reader handle and the stream.
  *
+ * The other side of that guarantee: destroy is NOT ordered against the free of
+ * the reader handle, and may NOT run on the thread that performs it. When a
+ * served stream outlives the handle, the last reference is held by a hudi-rs
+ * background thread and destroy runs there. destroy must therefore be
+ * thread-agnostic and self-sufficient — no reliance on a caller thread-local,
+ * and a JNI-backed ctx must attach to the JVM itself rather than assume an
+ * attached thread.
+ *
  * Error contract: any internal failure must be reported by returning
  * HUDI_PROVIDER_OUTCOME_NOT_SERVED, never by a mechanism that could fail the
  * read.

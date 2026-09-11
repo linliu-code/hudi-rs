@@ -322,10 +322,6 @@ fn served_batch_stream(
 ) -> BaseBatchStream {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
     tokio::task::spawn_blocking(move || {
-        // `provider` is moved in and never called: it is here to OUTLIVE the
-        // reader it handed back. See this function's doc for why that is a
-        // lifetime requirement rather than a stray clone.
-        let _provider_kept_alive = provider;
         for item in reader {
             let projected = match item {
                 Ok(batch) => {
@@ -348,9 +344,20 @@ fn served_batch_stream(
             // `Err` here means the consumer dropped the stream: stop pulling the
             // provider for a read nobody is reading.
             if tx.blocking_send(projected).is_err() || was_err {
-                return;
+                break;
             }
         }
+        // `provider` is moved in and never called: it is here to OUTLIVE the
+        // reader it handed back. See this function's doc for why that is a
+        // lifetime requirement rather than a stray clone.
+        //
+        // Bound AFTER the loop on purpose. Closure captures are dropped in
+        // capture order, and the loop's `for item in reader` is what makes
+        // `reader` the first capture — so the served stream is released before
+        // `destroy(ctx)`, on every path including one where the task is queued
+        // and then discarded without ever running. Binding it first inverted
+        // that, on a path no test can reach.
+        let _provider_kept_alive = provider;
     });
     futures::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
@@ -1162,11 +1169,18 @@ impl HoodieFileGroupReader {
                 Vec::new()
             };
 
-        // ONE verdict, THREE consumers. This SHADOWS the merge-safety gate bound
-        // above: the row filter, the row-group selector and the injected
-        // provider's `can_push_predicate` all read the narrowed value from here
-        // down, so a consumer cannot be left behind by a later edit. That is the
-        // same property the merge gate is bound once for, one layer in.
+        // ONE verdict, THREE consumers — but reaching them by two mechanisms, and
+        // the difference matters to anyone editing this.
+        //
+        // The injected provider's `can_push_predicate` reads this rebinding
+        // DIRECTLY, so it is narrowed by construction. The row filter and the
+        // row-group selector were bound from the un-narrowed value above and are
+        // cleared imperatively by the block below — which cannot simply key on
+        // `!pushdown_is_safe`, because that is also false when the MERGE gate
+        // refused, and those two were already withdrawn at their binding. The
+        // three verdicts agree; only one of them is structurally unable to be
+        // left behind. A fourth consumer added later should read the binding,
+        // not the block.
         //
         // The provider is the consumer that would otherwise be left behind, and
         // nothing would have said so: it arrived on a branch that forked BEFORE
@@ -3797,6 +3811,62 @@ mod tests {
             !seen.can_push_predicate,
             "a file needing a value-reinterpreting repair must withdraw PROVIDER \
              pushdown too, not only the in-process row filter"
+        );
+    }
+
+    /// THE MERGE-GATE HALF. A merging split with a non-PK predicate must withdraw
+    /// the provider's pushdown too, with no repair conflict anywhere in sight.
+    ///
+    /// `can_push_predicate` is a CONJUNCTION and each conjunct needs its own
+    /// mutation to kill it. Dropping the repair conjunct is caught by
+    /// [`repair_conflict_also_withdraws_provider_pushdown`]; dropping the MERGE
+    /// conjunct — `let pushdown_is_safe = repair_conflict.is_empty();` — is caught
+    /// only here, and would otherwise pass the whole file, because every other
+    /// provider fixture builds a split with no log files and so clears the merge
+    /// gate unconditionally. That mutation tells a provider it may push on exactly
+    /// the MOR split whose log records the predicate has not seen yet, which is
+    /// the same over-drop the repair narrowing exists to stop.
+    ///
+    /// Nothing here arms `repair_risk_columns`, so the repair conjunct is
+    /// vacuously true and the merge gate is the only thing that can produce the
+    /// `false`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merging_split_withdraws_provider_pushdown_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::not_serving();
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema, provider.clone()).await;
+        // A log file on the split and no PK-safety claim: the merge gate refuses.
+        reader.input_split = InputSplit::new(
+            Some(base_name.to_string()),
+            Some("20240101120000000".to_string()),
+            vec![".f1-0_20240101130000000.log.1_0-1-1".to_string()],
+            String::new(),
+        );
+        assert!(
+            !reader.base_read_pushdown_is_safe(),
+            "fixture check: the merge gate must REFUSE here, or this test pins \
+             nothing"
+        );
+        assert!(
+            reader.reader_context.repair_risk_columns.is_empty(),
+            "fixture check: the repair guard must be DISARMED here, or the \
+             withdrawal below could come from the wrong conjunct"
+        );
+
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        let seen = provider
+            .seen()
+            .expect("the provider must have been offered the file");
+        assert!(
+            !seen.can_push_predicate,
+            "a merging split with a non-PK predicate must withdraw PROVIDER \
+             pushdown, exactly as it withdraws the in-process row filter"
         );
     }
 

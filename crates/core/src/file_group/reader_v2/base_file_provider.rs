@@ -184,6 +184,23 @@ pub trait BaseFileDataProvider: Send + Sync {
     /// its timings; see [`BaseFileProviderStats`] for which counters the provider
     /// fills versus which hudi-core fills during drain).
     ///
+    /// ## Values contract — serve the file's PHYSICAL values, unaltered
+    ///
+    /// `projected_schema` is the intersection of the read's required schema with
+    /// **the base file's own footer**, so on a file carrying the apache/hudi#18132
+    /// mislabel it carries the LIE: a column the file labels tz-aware micros whose
+    /// stored i64s are millis is presented here as micros. Serve the stored i64s
+    /// anyway. hudi-core applies the logical-type repair to every served batch on
+    /// the way out — the same `project_batch_to_schema` the object-store read
+    /// applies — which RELABELS that column to the table's unit and leaves the
+    /// value untouched.
+    ///
+    /// A provider that "helpfully" rescales to make the values match the declared
+    /// unit therefore has every such value divided by 1000 a second time, silently.
+    /// The rule is the same one [`BaseFileDataRequest::can_push_predicate`] rests
+    /// on: a served file and a read file must be indistinguishable downstream, and
+    /// the object-store read hands over the raw i64.
+    ///
     /// ## Streaming / threading contract
     /// The returned reader is consumed lazily rather than drained here, so the
     /// whole served file never needs to be resident at once. hudi-core moves it

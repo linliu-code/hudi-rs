@@ -196,6 +196,17 @@ impl HudiBaseFileDataResult {
 /// onto the task that owns the served reader, so the provider cannot outlive
 /// its own streams by construction. Pinned by
 /// `a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`.
+///
+/// ⚠️ **`destroy` is consequently NOT guaranteed to run on the C++ thread that
+/// frees the reader handle, and is not ordered against that free.** Whichever of
+/// {the reader handle, the last served stream} is released second drops the last
+/// reference, and when that is the stream's producer task, `destroy` runs on a
+/// tokio BLOCKING-POOL thread hudi-rs owns, at a moment the caller does not
+/// choose. So `destroy` must be thread-agnostic and self-sufficient: it may not
+/// assume a thread-local the caller set up, and for a JNI-backed `ctx` it must
+/// attach to the JVM itself rather than assume an attached thread. This was not
+/// true before the reference above was added — `destroy` then always ran on the
+/// freeing thread — so it is a real change for an existing implementor.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct HudiBaseFileDataProviderVTable {
