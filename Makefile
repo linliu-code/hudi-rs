@@ -47,7 +47,14 @@ endef
 # =============================================================================
 COV_OUTPUT_DIR := ./cov-reports
 COV_THRESHOLD ?= 60
+# `--exclude hudi-cpp` (the PACKAGE, not just its files): cpp/src was already excluded from the
+# REPORT below, but --workspace still COMPILED the crate, and on this fork that drags in
+# `substrait` -> `protobuf-src`, which builds protobuf from source and exhausted the runner's disk
+# (`No space left on device` installing libprotoc.a). Excluding the package changes no coverage
+# number -- its sources were already out of the report -- and the crate keeps its own dedicated
+# gate, the `cpp-ffi` job, which builds and tests it.
 COV_EXCLUDE := \
+	--exclude hudi-cpp \
 	--exclude-files 'cpp/src/*' \
 	--exclude-files 'crates/core/src/avro_to_arrow/*' \
 	--exclude-files 'benchmark/*'
