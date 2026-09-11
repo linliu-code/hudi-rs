@@ -389,12 +389,18 @@ mod tests {
         );
     }
     #[test]
-    fn test_log_files_ordered_by_delta_commit_not_completion() -> Result<()> {
-        // Gold parity: `FileSlice.log_files` (a BTreeSet<LogFile>) mirrors Java's
-        // `FileSlice.logFiles` TreeSet, whose comparator keys off deltaCommitTime,
-        // never completion time. This is the container whose iteration order feeds
-        // the log-block merge sequence, so it is the level at which a wrong `Ord`
-        // actually changes which record wins.
+    fn test_log_files_ordered_by_delta_commit_not_completion() {
+        // Gold parity, and note WHICH Java container this mirrors. It is NOT
+        // `FileSlice.logFiles`: that one is a `TreeSet` over
+        // `getReverseLogFileComparator()` (FileSlice.java:68/82/90), i.e. DESCENDING,
+        // which is why `getLatestLogFile()` is `logFiles.stream().findFirst()`. The
+        // ascending list hudi-rs's `BTreeSet` iteration corresponds to is the MOR
+        // read's own, `InputSplit.java:56`, which re-sorts with the FORWARD comparator.
+        //
+        // Either way the comparator keys off deltaCommitTime and never completion
+        // time, and this is the container whose iteration order feeds the log-block
+        // merge sequence — so it is the level at which a wrong `Ord` changes which
+        // record wins.
         //
         // Scenario: two committed v8+ log files on the same file group whose
         // completion order is the INVERSE of their delta-commit (request) order
@@ -438,7 +444,5 @@ mod tests {
             "FileSlice log files must iterate in deltaCommitTime order (gold), \
              not completion-timestamp order"
         );
-
-        Ok(())
     }
 }
