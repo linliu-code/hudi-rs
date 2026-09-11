@@ -352,11 +352,16 @@ jobs:
           python -m pip install dist/*.whl
           python -c "import hudi; print(hudi.__file__)"
 
+  # UPSTREAM ONLY. codecov.io is apache/hudi-rs's account: `CODECOV_TOKEN` exists nowhere on
+  # this fork or its organisation, and the upload below is `fail_ci_if_error: true`, so on a
+  # fork this job is a guaranteed red that reports nothing about the code. The coverage
+  # artifacts are still produced and uploaded by rust-tests and python-tests either way --
+  # only the push to a third-party service upstream owns is conditional.
   publish-coverage:
     name: Publish coverage reports to codecov.io
     runs-on: ubuntu-latest
     needs: [ rust-tests, python-tests ]
-    if: github.event.pull_request.user.login != 'dependabot[bot]'
+    if: github.repository == 'apache/hudi-rs' && github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
