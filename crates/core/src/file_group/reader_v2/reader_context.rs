@@ -200,7 +200,7 @@ pub struct ReaderContext {
     ///
     /// Non-empty only arms the check. Whether a given file actually mislabels one
     /// of these columns is decided per file against its footer schema, in
-    /// `HoodieFileGroupReader::make_base_file_source`.
+    /// `HoodieFileGroupReader::base_file_source`.
     ///
     /// Empty is also the default, so a caller that pushes a filter without setting
     /// this gets no guard. That is deliberate — the reader cannot derive a

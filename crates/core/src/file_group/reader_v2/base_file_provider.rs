@@ -195,8 +195,16 @@ pub trait BaseFileDataProvider: Send + Sync {
     /// applies — which RELABELS that column to the table's unit and leaves the
     /// value untouched.
     ///
-    /// A provider that "helpfully" rescales to make the values match the declared
-    /// unit therefore has every such value divided by 1000 a second time, silently.
+    /// So a provider that "helpfully" rescales the stored millis up into the
+    /// declared micros unit hands back a value 1000x too large, which the relabel
+    /// then reinterprets AS millis — every such timestamp lands roughly three
+    /// orders of magnitude in the future, silently. hudi-core contributes no
+    /// arithmetic on this pairing: the repair arm rebuilds the array's `ArrayData`
+    /// with a new `DataType` and never touches a value
+    /// (`schema::batch_evolution`). The one arm that does divide is the NTZ
+    /// (local-timestamp) pairing, which the #18132 repair deliberately does not
+    /// reach.
+    ///
     /// The rule is the same one [`BaseFileDataRequest::can_push_predicate`] rests
     /// on: a served file and a read file must be indistinguishable downstream, and
     /// the object-store read hands over the raw i64.

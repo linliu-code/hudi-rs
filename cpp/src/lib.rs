@@ -602,7 +602,7 @@ pub(crate) fn counting_row_filter_builder(
 /// millis-semantics literal reads those values as 1970 and the scan drops rows
 /// that match. The repair arm fires only when the TABLE side is tz-aware millis,
 /// which makes the candidate set decidable here. The result arms the per-file
-/// footer check in `HoodieFileGroupReader::make_base_file_source`; empty means no
+/// footer check in `HoodieFileGroupReader::base_file_source`; empty means no
 /// base read does any per-file work, which is every table Spark wrote with micros.
 ///
 /// Scoped to [`PushedFilter::referenced_columns`], not `columns()`: the latter is

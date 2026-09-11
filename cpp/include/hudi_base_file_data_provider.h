@@ -134,7 +134,8 @@ typedef struct HudiBaseFileDataResult {
  * the reader handle and the stream.
  *
  * The other side of that guarantee: destroy is NOT ordered against the free of
- * the reader handle, and may NOT run on the thread that performs it. When a
+ * the reader handle, and is NOT GUARANTEED to run on the thread that performs
+ * it (it often will; it must not be relied on). When a
  * served stream outlives the handle, the last reference is held by a hudi-rs
  * background thread and destroy runs there. destroy must therefore be
  * thread-agnostic and self-sufficient — no reliance on a caller thread-local,

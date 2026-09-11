@@ -296,7 +296,8 @@ impl BaseSource {
 /// consumer by more than one batch.
 ///
 /// **The provider outlives the reader it returned.** A clone of the provider is
-/// moved onto the same task and dropped only when the task ends. That is not
+/// moved onto the same task, in a `ServedReader` struct whose field order makes
+/// the drop order structural, and is released only when the task ends. That is not
 /// bookkeeping: a provider is free to return a reader that borrows its own state
 /// — the C-ABI adapter returns an `ArrowArrayStream` whose `get_next`/`release`
 /// callbacks point into the provider's `ctx`, and `CApiBaseFileDataProvider`'s
@@ -306,7 +307,9 @@ impl BaseSource {
 /// the caller free them in an order that keeps `ctx` alive. Holding the clone
 /// here makes "the provider outlives every stream it served" true by
 /// construction, on every call path, at the cost of one `Arc` clone per served
-/// file.
+/// file. Pinned by
+/// `a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`, which
+/// fails if the provider field is removed from `ServedReader`.
 ///
 /// It does occupy a blocking-pool slot for the whole served read rather than for
 /// one batch, so the ceiling is concurrently-open file groups, not batches. That
@@ -320,9 +323,34 @@ fn served_batch_stream(
     stats: Arc<StdMutex<BaseFileProviderStats>>,
     provider: BaseFileDataProviderRef,
 ) -> BaseBatchStream {
+    /// Owns the served reader and the provider that produced it, in that order.
+    ///
+    /// The order is the point, and a struct is how it is made STRUCTURAL rather
+    /// than a property of how rustc happens to order closure captures. Struct
+    /// fields drop in declaration order, so `reader` — whose `release` callback
+    /// may point into the provider's `ctx` — is always released before the
+    /// provider whose `Drop` calls `destroy(ctx)`. That holds on every path,
+    /// including the one no test can reach: a task queued and then discarded
+    /// without ever running.
+    struct ServedReader {
+        reader: Box<dyn arrow_array::RecordBatchReader + Send>,
+        _provider: BaseFileDataProviderRef,
+    }
+    let served = ServedReader {
+        reader,
+        _provider: provider,
+    };
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
     tokio::task::spawn_blocking(move || {
-        for item in reader {
+        // Capture the WHOLE struct, not one field. Since edition 2021 a closure
+        // captures disjoint fields, so a body that only ever names `served.reader`
+        // captures just that — and `served._provider` would be dropped when this
+        // function returns, silently undoing the lifetime extension the struct
+        // exists for. Naming the binding itself is what forces the whole value in.
+        // `a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`
+        // catches the mistake; it caught this one.
+        let mut served = served;
+        while let Some(item) = served.reader.next() {
             let projected = match item {
                 Ok(batch) => {
                     crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)
@@ -344,20 +372,9 @@ fn served_batch_stream(
             // `Err` here means the consumer dropped the stream: stop pulling the
             // provider for a read nobody is reading.
             if tx.blocking_send(projected).is_err() || was_err {
-                break;
+                return;
             }
         }
-        // `provider` is moved in and never called: it is here to OUTLIVE the
-        // reader it handed back. See this function's doc for why that is a
-        // lifetime requirement rather than a stray clone.
-        //
-        // Bound AFTER the loop on purpose. Closure captures are dropped in
-        // capture order, and the loop's `for item in reader` is what makes
-        // `reader` the first capture — so the served stream is released before
-        // `destroy(ctx)`, on every path including one where the task is queued
-        // and then discarded without ever running. Binding it first inverted
-        // that, on a path no test can reach.
-        let _provider_kept_alive = provider;
     });
     futures::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
@@ -1176,9 +1193,17 @@ impl HoodieFileGroupReader {
         // DIRECTLY, so it is narrowed by construction. The row filter and the
         // row-group selector were bound from the un-narrowed value above and are
         // cleared imperatively by the block below — which cannot simply key on
-        // `!pushdown_is_safe`, because that is also false when the MERGE gate
-        // refused, and those two were already withdrawn at their binding. The
-        // three verdicts agree; only one of them is structurally unable to be
+        // `!pushdown_is_safe`. Not because the clearing would be wrong (it is
+        // idempotent; they were already `None` from their binding) but because
+        // the block also RECORDS: `record_pushdown_suppressed_by_repair` and a
+        // second `record_selector_suppressed`. Keying it on the narrowed value
+        // would attribute every merge-gate refusal to the repair gate and
+        // double-count the selector suppression already recorded at its binding,
+        // which is exactly the separation `repair_suppression_counts_the_row_group_selector`
+        // and `repair_suppression_is_not_counted_when_pushdown_survives` exist to
+        // keep.
+        //
+        // The three verdicts agree; only one of them is structurally unable to be
         // left behind. A fourth consumer added later should read the binding,
         // not the block.
         //
@@ -3814,8 +3839,14 @@ mod tests {
         );
     }
 
-    /// THE MERGE-GATE HALF. A merging split with a non-PK predicate must withdraw
-    /// the provider's pushdown too, with no repair conflict anywhere in sight.
+    /// THE MERGE-GATE HALF. A merging split that has made no primary-key-safety
+    /// claim must withdraw the provider's pushdown too, with no repair conflict
+    /// anywhere in sight.
+    ///
+    /// Note what the gate actually reads: `base_read_pushdown_is_safe()` is
+    /// `!has_log_files() || mor_pk_safe` and consults no predicate at all. So the
+    /// fixture installs none — what makes the gate refuse is a log file on the
+    /// split plus `mor_pk_safe == false`.
     ///
     /// `can_push_predicate` is a CONJUNCTION and each conjunct needs its own
     /// mutation to kill it. Dropping the repair conjunct is caught by
@@ -3865,8 +3896,122 @@ mod tests {
             .expect("the provider must have been offered the file");
         assert!(
             !seen.can_push_predicate,
-            "a merging split with a non-PK predicate must withdraw PROVIDER \
-             pushdown, exactly as it withdraws the in-process row filter"
+            "a merging split with no primary-key-safety claim must withdraw \
+             PROVIDER pushdown, exactly as it withdraws the in-process row filter"
+        );
+    }
+
+    /// And the merge gate's OTHER branch: a merging split that DOES claim
+    /// primary-key safety must keep provider pushdown.
+    ///
+    /// Without this, `can_push_predicate: pushdown_is_safe && !has_log_files()`
+    /// — which silently drops the `mor_pk_safe` widening and costs every
+    /// PK-safe MOR split its provider-side pushdown — survives all three of the
+    /// tests above, because none of them has both a log file and `mor_pk_safe`.
+    /// Strictly narrower than the delivered verdict, so it cannot over-drop rows;
+    /// it is a performance regression rather than a correctness one, and this is
+    /// what keeps it from being silent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pk_safe_merging_split_keeps_provider_pushdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::not_serving();
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema, provider.clone()).await;
+        reader.input_split = InputSplit::new(
+            Some(base_name.to_string()),
+            Some("20240101120000000".to_string()),
+            vec![".f1-0_20240101130000000.log.1_0-1-1".to_string()],
+            String::new(),
+        );
+        {
+            let ctx = Arc::get_mut(&mut reader.reader_context).expect("sole owner in test");
+            ctx.mor_pk_safe = true;
+        }
+        assert!(
+            reader.input_split.has_log_files(),
+            "fixture check: the split must MERGE, or this is the same case as the \
+             no-log-files fixtures"
+        );
+        assert!(
+            reader.base_read_pushdown_is_safe(),
+            "fixture check: mor_pk_safe must open the gate, or the assertion below \
+             passes for the wrong reason"
+        );
+
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        let seen = provider
+            .seen()
+            .expect("the provider must have been offered the file");
+        assert!(
+            seen.can_push_predicate,
+            "a primary-key-safe predicate keeps pushdown on a merging split, and \
+             the provider must be told so"
+        );
+    }
+
+    /// THE VALUES CONTRACT. A provider serves the file's PHYSICAL values and
+    /// hudi-core applies the #18132 repair to them, exactly as it does to a file
+    /// read from object storage.
+    ///
+    /// The provider is handed `intersection`, which carries the FILE's schema —
+    /// so on a mislabelled file it is told micros while the stored i64s are
+    /// millis. It serves them unaltered; `served_batch_stream`'s
+    /// `project_batch_to_schema` then RELABELS the column to the table's millis
+    /// without touching the value.
+    ///
+    /// Without this test the values contract on `try_base_file` is documentation
+    /// with nothing behind it: deleting the projection from the served path is a
+    /// silent data-corruption change on the production FFI path, and every other
+    /// provider test uses an int32 column that the repair never touches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_served_batch_gets_the_same_logical_type_repair_as_a_read_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        // On disk: the #18132 shape. The provider will serve DIFFERENT values in
+        // the same mislabelled shape, so the assertion can only pass if the
+        // PROVIDER's batch is what reached the caller.
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        // What the provider serves: the file's own (lying) schema, stored millis.
+        let served_schema: SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("_hoodie_record_key", arrow_schema::DataType::Utf8, true),
+            ts_field("ts", arrow_schema::TimeUnit::Microsecond),
+        ]));
+        let served = RecordBatch::try_new(
+            served_schema,
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["p1", "p2"])),
+                Arc::new(
+                    arrow_array::TimestampMicrosecondArray::from(vec![ABOVE_MS + 7, BELOW_MS + 7])
+                        .with_timezone("UTC"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let provider = StubDataProvider::serving(vec![served]);
+        let mut reader =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, straddling_table_schema())
+                .await;
+        reader.base_file_provider = Some(provider);
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        let ts = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+            .expect("the repair must RELABEL the served column to the table's millis");
+        assert_eq!(
+            (ts.value(0), ts.value(1)),
+            (ABOVE_MS + 7, BELOW_MS + 7),
+            "and must not rescale: the served i64s must arrive byte-for-byte, and \
+             they must be the PROVIDER's values, not the file's"
         );
     }
 
