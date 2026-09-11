@@ -310,21 +310,10 @@ mod ffi {
         /// is not torn.
         fn hudi_reader_memory_bytes(self: &HoodieFileGroupReader) -> u64;
 
-        /// Base-file provider read counters. **Phase 1: every counter is zero.**
+        /// Base-file provider read counters for this reader.
         ///
-        /// The provider handle is still accepted at the FFI boundary and this
-        /// getter is still declared, purely for ABI stability — velox passes a
-        /// handle today and must keep compiling — but the OSS-core bridge does
-        /// NOT wire it into core. Core has no provider seam on this path, so
-        /// every base file takes core's own object-store read (the same
-        /// fallback core takes when no provider is supplied) and no provider
-        /// counter is ever incremented. `read_record_batch` and
-        /// `get_closable_iterator` emit a one-shot warning when a handle was
-        /// supplied, so a caller does not have to infer this from a wall of
-        /// zeros.
-        ///
-        /// Phase 2 contract: once the provider is injected into core, the
-        /// provider is STREAMED, and the counters split by when they are final:
+        /// The provider is STREAMED, so the counters split by when they become
+        /// final:
         ///   - **setup counters** (files_served, storage_fallbacks, local/remote,
         ///     discover/connect/fetch wall-nanos) are populated by `open()`, before
         ///     any batch is streamed — read them any time after
@@ -333,10 +322,13 @@ mod ffi {
         ///     tallied as the consumer drains the returned stream, so they are only
         ///     final AFTER the stream is fully drained. Read this after draining to
         ///     capture them.
+        ///
         /// It reads a shared live slot, so it does not depend on the stream still
         /// being alive (safe to call after the stream is freed), and returns
-        /// all-zero when no provider was injected (the default) or
-        /// `get_closable_iterator` has not been called on this reader.
+        /// all-zero when no provider was injected (the default), when the
+        /// provider declined every base file, or when neither
+        /// `get_closable_iterator` nor `read_record_batch` has run on this
+        /// reader.
         fn base_file_provider_stats(self: &HoodieFileGroupReader) -> FfiBaseFileProviderStats;
         /// [ENG-47483] Bytes fetched from storage by this reader, summed over every
         /// range read, counted at the `AsyncFileReader` boundary.
@@ -493,21 +485,16 @@ pub struct HoodieFileGroupReader {
     // ── base-file data provider (composition-root-injected via C ABI) ─────
     // The concrete provider, presented as hudi-core's trait object. `None`
     // when no provider handle was supplied on the FFI context (the common
-    // path).
+    // path). Cloned into every core reader this FFI reader builds, via
+    // `HoodieFileGroupReaderBuilder::with_base_file_provider`.
     //
-    // Phase 1: held but never read. OSS core has no provider seam, so nothing
-    // is injected into the reader builder (see `get_closable_iterator`). The
-    // field still exists so `take_provider_from_handle` (which reclaims the
-    // `Box` behind the FFI handle into this `Arc`) has somewhere to put its
-    // result -- this field ends up owning the last strong reference, so
+    // Held for the whole FFI reader's lifetime, not just the build: this field
+    // owns the last strong reference reclaimed by `take_provider_from_handle`
+    // (which turns the boxed FFI handle back into this `Arc`), so
     // `destroy(ctx)` (`impl Drop for CApiBaseFileDataProvider`) runs exactly
     // when this FFI reader drops. Removing the `take_provider_from_handle`
-    // call would leak the provider `ctx` (the boxed handle is never
-    // reclaimed into a value that can drop). Dropping this field instead of
-    // holding it for the reader's lifetime would free the provider -- and run
-    // `destroy(ctx)` -- too early, while the reader (a Phase-2 consumer of
-    // the provider) may still be in scope.
-    #[allow(dead_code)]
+    // call would leak the provider `ctx`; dropping this field early would run
+    // `destroy(ctx)` while a core reader still holding a clone is in scope.
     base_file_provider: Option<BaseFileDataProviderRef>,
 
     // ── base-file provider read counters ──────────────────────────────────────
@@ -1135,18 +1122,6 @@ impl HoodieFileGroupReader {
             self.reader_context.merge_mode.as_str(),
         );
 
-        // RV-13 — say so out loud when the caller hands us a provider we ignore.
-        // The handle is accepted for ABI stability (see `base_file_provider_stats`),
-        // but Phase 1 injects nothing into OSS core, so a caller that wired one up
-        // would otherwise only see it in counters that read zero.
-        if self.base_file_provider.is_some() {
-            warn_once!(
-                "[hudi-rs-reader] a base-file data provider handle was supplied but \
-                 Phase 1 of the OSS-core bridge does not wire it into core; base files \
-                 take the object-store read and provider counters read zero"
-            );
-        }
-
         // ENG-42276 / ENG-42866 — the row_filter_builder + mor_pk_safe live
         // on reader_context (set at FFI entry, see new_file_group_reader_with_context).
         // The FG reader gate at make_base_file_batches and the parquet log
@@ -1154,18 +1129,48 @@ impl HoodieFileGroupReader {
         // consult base_read_pushdown_is_safe() to decide whether to
         // install the filter. The post-merge filter below still runs
         // unconditionally for non-pushed-down predicates.
-        // Phase 1: the provider handle stays in the cxx ABI so velox needs no
-        // change, but OSS core has no provider seam, so nothing is injected.
-        // Base files take core's own object-store read -- the same fallback
-        // core takes for `None`. Provider metrics therefore read zero; see
-        // `base_file_provider_stats`.
-        let mut reader = CoreFileGroupReader::builder()
+        // The base-file data provider the composition root handed us over the C
+        // ABI. Absent on the common path, in which case core reads every base
+        // file from object storage exactly as before.
+        let mut builder = CoreFileGroupReader::builder()
             .with_reader_context(self.reader_context.clone())
             .with_storage(self.storage.clone())
             .with_input_split(self.input_split.clone())
-            .with_reader_parameters(self.reader_parameters.clone())
+            .with_reader_parameters(self.reader_parameters.clone());
+        if let Some(provider) = &self.base_file_provider {
+            builder = builder.with_base_file_provider(provider.clone());
+        }
+        let mut reader = builder
             .build()
             .map_err(|e| format!("Failed to build file group reader: {e}"))?;
+
+        // Capture the provider counters before `reader` goes out of scope. The
+        // slot is shared with the served source, and this path drains the merge
+        // to completion, so the drain counters are final by the time it returns.
+        // See `get_closable_iterator` for why the streaming path cannot
+        // snapshot instead.
+        //
+        // Set-once, and here that has a consequence worth stating: this method
+        // builds a FRESH core reader (and so a fresh slot) on every call, so a
+        // second `read_record_batch` on the same FFI reader keeps reporting the
+        // FIRST read's counters. Left deliberately rather than accumulated —
+        // `get_closable_iterator` must install the live slot the returned stream
+        // is still draining into, and a slot this method had already claimed
+        // would shadow it, reporting zeros for the stream. One read per FFI
+        // reader is the shape every caller uses; the alternative trades a
+        // correct streaming path for a repeated-eager-read case that has none.
+        if self
+            .base_file_provider_stats
+            .set(hudi_dep::ffi_support::base_file_provider_live_stats(
+                &reader,
+            ))
+            .is_err()
+        {
+            log::debug!(
+                "[hudi-rs-reader] read_record_batch called again on one reader; \
+                 base_file_provider_stats keeps reporting the first read"
+            );
+        }
 
         // C3 — tokio re-entry guard. `block_on` panics if called from within a
         // tokio runtime thread, and a panic unwinding across the FFI boundary is
@@ -1267,18 +1272,6 @@ impl HoodieFileGroupReader {
             self.reader_context.merge_mode.as_str(),
         );
 
-        // RV-13 — say so out loud when the caller hands us a provider we ignore.
-        // The handle is accepted for ABI stability (see `base_file_provider_stats`),
-        // but Phase 1 injects nothing into OSS core, so a caller that wired one up
-        // would otherwise only see it in counters that read zero.
-        if self.base_file_provider.is_some() {
-            warn_once!(
-                "[hudi-rs-reader] a base-file data provider handle was supplied but \
-                 Phase 1 of the OSS-core bridge does not wire it into core; base files \
-                 take the object-store read and provider counters read zero"
-            );
-        }
-
         // C3 — tokio re-entry guard (preserved from read_record_batch). The
         // async setup below uses block_on on OBJECT_STORE_RUNTIME; block_on
         // panics if invoked from within a tokio runtime thread, and a panic
@@ -1302,16 +1295,16 @@ impl HoodieFileGroupReader {
         // Same construction as read_record_batch — see ENG-42276 / ENG-42866
         // doc comments there for why row_filter_builder + mor_pk_safe live on
         // the reader_context.
-        // Phase 1: the provider handle stays in the cxx ABI so velox needs no
-        // change, but OSS core has no provider seam, so nothing is injected.
-        // Base files take core's own object-store read -- the same fallback
-        // core takes for `None`. Provider metrics therefore read zero; see
-        // `base_file_provider_stats`.
-        let mut reader = CoreFileGroupReader::builder()
+        // See `read_record_batch` for the provider's ownership contract.
+        let mut builder = CoreFileGroupReader::builder()
             .with_reader_context(self.reader_context.clone())
             .with_storage(self.storage.clone())
             .with_input_split(self.input_split.clone())
-            .with_reader_parameters(self.reader_parameters.clone())
+            .with_reader_parameters(self.reader_parameters.clone());
+        if let Some(provider) = &self.base_file_provider {
+            builder = builder.with_base_file_provider(provider.clone());
+        }
+        let mut reader = builder
             .build()
             .map_err(|e| format!("Failed to build file group reader: {e}"))?;
 
@@ -1343,10 +1336,20 @@ impl HoodieFileGroupReader {
         self.reader_memory_bytes
             .store(merge_iter.current_in_memory_bytes(), Ordering::Relaxed);
 
-        // Phase 1: no provider counters to capture. Nothing was injected into
-        // core, so there is no live stats slot to fold `read_stats` into and
-        // `base_file_provider_stats` stays unset -- its `None` arm then reports
-        // all zeros, which is the honest answer for a read core served itself.
+        // Capture a handle to the provider counters. The served base file is
+        // STREAMED, so the drain counters (rows/bytes/batches) are not final at
+        // `open()` time — they accumulate as the C++ consumer drains the returned
+        // stream. So take the core reader's *live* slot, shared with the served
+        // source, rather than snapshotting a value: `reader` is dropped when this
+        // function returns, but the slot is an `Arc` kept alive by both the
+        // served source inside the returned stream and this handle.
+        //
+        // Set-once: a second `get_closable_iterator` on the same FFI reader keeps
+        // the first slot rather than orphaning a stream that may still be draining
+        // into it.
+        let _ = self.base_file_provider_stats.set(
+            hudi_dep::ffi_support::base_file_provider_live_stats(&reader),
+        );
 
         // Wrap with the per-chunk ENG-40156 post-merge filter (no-op when
         // no predicate was pushed). Schema is unchanged by filtering.
@@ -2273,5 +2276,291 @@ mod tests {
         );
 
         unsafe { hudi_free_arrow_stream(ptr) };
+    }
+    // ════════════════════════════════════════════════════════════════════
+    // End-to-end: a provider handed over the C ABI actually serves the read.
+    //
+    // The unit tests in `provider_abi` stop at the adapter — they prove a
+    // vtable is translated into hudi-core's trait correctly. These go the whole
+    // way: a handle on `FfiReaderContext`, through
+    // `new_file_group_reader_with_context`, into hudi-core's reader, and back
+    // out as rows and counters. That path is exactly what was missing while the
+    // bridge held the provider without injecting it, and a wall of zeros is
+    // what the gap looked like, so both are asserted.
+    // ════════════════════════════════════════════════════════════════════
+    mod provider_e2e {
+        use super::*;
+        use crate::provider_abi::{
+            HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION, HUDI_PROVIDER_OUTCOME_NOT_SERVED,
+            HUDI_PROVIDER_OUTCOME_SERVED, HudiBaseFileDataProviderVTable, HudiBaseFileDataRequest,
+            HudiBaseFileDataResult, HudiBaseFileProviderStats, hudi_base_file_data_provider_new,
+        };
+        use arrow_array::ffi_stream::FFI_ArrowArrayStream;
+        use arrow_array::{RecordBatch, RecordBatchIterator};
+        use arrow_schema::Schema;
+        use hudi_test::QuickstartTripsTable;
+        use std::ffi::c_void;
+        use std::os::raw::c_int;
+        use std::sync::atomic::AtomicUsize;
+
+        /// A base-only SPLIT over `city=sf`: its base file's two rows, and no log
+        /// files. Base-only because the provider seam sits on the base read, so
+        /// nothing else can account for a row-count change.
+        ///
+        /// Note the *partition* does hold a log file
+        /// (`.fee86b18-…-0_20260408053037787.log.1_0-27-73`); the split built
+        /// below simply does not list it, which is what makes these assertions
+        /// about the base read alone. A split that started picking it up would
+        /// change `BASE_ONLY_ROWS`, so the two must move together.
+        const BASE_ONLY_PARTITION: &str = "city=sf";
+        const BASE_ONLY_FILE: &str =
+            "fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet";
+        const BASE_ONLY_ROWS: usize = 2;
+
+        /// The read's projection, as Avro JSON — the shape a Velox split sends.
+        ///
+        /// Load-bearing, not boilerplate: without a requested schema the reader
+        /// takes its unprojected fallback, which reads the file as one batch
+        /// because its schema is only known after reading it, and the provider
+        /// seam (which must hand a provider the schema it should answer in) is
+        /// not on that path. Production always supplies one. A single column is
+        /// enough and keeps the fixture's other columns out of the assertions.
+        const PROJECTION_AVRO_JSON: &str = r#"{"type":"record","name":"trip","fields":[{"name":"id","type":["null","int"],"default":null}]}"#;
+
+        /// What the stub provider does when asked for a base file.
+        struct StubCtx {
+            outcome: c_int,
+            /// Number of EMPTY batches to serve at the request's projected schema.
+            ///
+            /// Empty on purpose: the projected schema is chosen by the reader and
+            /// is not known here, so the one batch shape that is always valid for
+            /// it is the empty one. It is still decisive — the file on disk has
+            /// `BASE_ONLY_ROWS` rows, so a read that returns none can only have
+            /// taken the provider's data — and it keeps `batches_received`
+            /// (a drain counter, tallied only as the merge pulls) separable from
+            /// `files_served` (a setup counter, recorded at serve time).
+            served_batches: usize,
+            /// Bumped by `destroy`, so a test can prove the handle's ownership
+            /// really transferred to the reader and was released exactly once.
+            destroys: *const AtomicUsize,
+        }
+
+        extern "C" fn stub_try(
+            ctx: *mut c_void,
+            req: *const HudiBaseFileDataRequest,
+            out: *mut HudiBaseFileDataResult,
+        ) -> c_int {
+            let stub = unsafe { &*(ctx as *const StubCtx) };
+            let req = unsafe { &*req };
+            let out = unsafe { &mut *out };
+            out.stats = HudiBaseFileProviderStats {
+                files_served: (stub.outcome == HUDI_PROVIDER_OUTCOME_SERVED) as u64,
+                storage_fallbacks: (stub.outcome != HUDI_PROVIDER_OUTCOME_SERVED) as u64,
+                discover_wall_nanos: 11,
+                connect_wall_nanos: 22,
+                fetch_wall_nanos: 33,
+                ..Default::default()
+            };
+            if stub.outcome == HUDI_PROVIDER_OUTCOME_SERVED {
+                // Import the schema the reader asked for and answer in it.
+                let schema: Schema = unsafe { &*req.projected_schema }
+                    .try_into()
+                    .expect("projected schema must be importable");
+                let schema = std::sync::Arc::new(schema);
+                let batches: Vec<std::result::Result<RecordBatch, arrow_schema::ArrowError>> = (0
+                    ..stub.served_batches)
+                    .map(|_| Ok(RecordBatch::new_empty(schema.clone())))
+                    .collect();
+                let iter = RecordBatchIterator::new(batches.into_iter(), schema);
+                out.stream = FFI_ArrowArrayStream::new(Box::new(iter));
+            }
+            stub.outcome
+        }
+
+        extern "C" fn stub_destroy(ctx: *mut c_void) {
+            let stub = unsafe { Box::from_raw(ctx as *mut StubCtx) };
+            unsafe { &*stub.destroys }.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn make_handle(outcome: c_int, served_batches: usize, destroys: &AtomicUsize) -> u64 {
+            let stub = Box::new(StubCtx {
+                outcome,
+                served_batches,
+                destroys: destroys as *const AtomicUsize,
+            });
+            let vtable = HudiBaseFileDataProviderVTable {
+                abi_version: HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+                try_base_file: stub_try,
+                destroy: stub_destroy,
+            };
+            unsafe { hudi_base_file_data_provider_new(&vtable, Box::into_raw(stub) as *mut c_void) }
+        }
+
+        /// The FFI context a Velox split would hand us for the base-only file
+        /// group, carrying `handle` as its provider (0 = no provider).
+        fn base_only_context(table_path: &str, handle: u64) -> ffi::FfiReaderContext {
+            ffi::FfiReaderContext {
+                table_path: table_path.to_string(),
+                partition_path: BASE_ONLY_PARTITION.to_string(),
+                latest_commit_time: hudi_dep::ffi_support::MAX_INSTANT_TIME.to_string(),
+                has_base_file: true,
+                base_file_name: BASE_ONLY_FILE.to_string(),
+                base_file_path: format!("{BASE_ONLY_PARTITION}/{BASE_ONLY_FILE}"),
+                merge_mode: "COMMIT_TIME_ORDERING".to_string(),
+                data_schema_json: PROJECTION_AVRO_JSON.to_string(),
+                requested_schema_json: PROJECTION_AVRO_JSON.to_string(),
+                table_config_keys: vec![HudiTableConfig::OrderingFields.as_ref().to_string()],
+                table_config_values: vec!["ts".to_string()],
+                base_file_provider_handle: handle,
+                ..Default::default()
+            }
+        }
+
+        fn reader(table_path: &str, handle: u64) -> Box<HoodieFileGroupReader> {
+            new_file_group_reader_with_context(base_only_context(table_path, handle))
+                .expect("build FFI reader")
+        }
+
+        /// Baseline: without a provider the file group reads its two rows off
+        /// storage and every provider counter is zero. Pins what the two tests
+        /// below are measured against, so a change in the fixture cannot make
+        /// them pass vacuously.
+        #[test]
+        fn no_provider_reads_from_storage_and_reports_zero_counters() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let reader = reader(&table_path, 0);
+            let (batch, _) = reader.read_record_batch().expect("read");
+            assert_eq!(
+                batch.num_rows(),
+                BASE_ONLY_ROWS,
+                "storage read is unchanged"
+            );
+            let stats = reader.base_file_provider_stats();
+            assert_eq!(stats.files_served, 0);
+            assert_eq!(stats.storage_fallbacks, 0);
+            assert_eq!(stats.rows_served, 0);
+        }
+
+        /// A provider that SERVES displaces the object-store read, and its
+        /// counters reach the C++ consumer. The row count is the proof the
+        /// provider's data was used: the file on disk holds two rows and the
+        /// provider serves none.
+        #[test]
+        fn a_serving_provider_displaces_the_storage_read_and_reports_counters() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let destroys = AtomicUsize::new(0);
+            let handle = make_handle(HUDI_PROVIDER_OUTCOME_SERVED, 2, &destroys);
+            assert_ne!(handle, 0, "the ABI accepted the vtable");
+
+            let reader = reader(&table_path, handle);
+            let (batch, _) = reader.read_record_batch().expect("read");
+            assert_eq!(
+                batch.num_rows(),
+                0,
+                "the provider served no rows, so the read must return none — \
+                 {BASE_ONLY_ROWS} rows here would mean the base file was read anyway"
+            );
+
+            let stats = reader.base_file_provider_stats();
+            assert_eq!(stats.files_served, 1, "the served file is counted");
+            assert_eq!(stats.storage_fallbacks, 0);
+            assert_eq!(
+                stats.batches_received, 2,
+                "drain counters are tallied as the merge pulls the served source"
+            );
+            assert_eq!(stats.rows_served, 0, "the served batches were empty");
+            assert_eq!(stats.discover_wall_nanos, 11, "setup timings pass through");
+            assert_eq!(stats.connect_wall_nanos, 22);
+            assert_eq!(stats.fetch_wall_nanos, 33);
+
+            assert_eq!(
+                destroys.load(Ordering::SeqCst),
+                0,
+                "the provider must outlive the reader that borrows it"
+            );
+            drop(reader);
+            assert_eq!(
+                destroys.load(Ordering::SeqCst),
+                1,
+                "dropping the reader releases the provider ctx exactly once"
+            );
+        }
+
+        /// A provider that declines falls through to the object-store read, and
+        /// says so in `storage_fallbacks` — the counter that separates "no
+        /// provider" from "a provider that served nothing".
+        #[test]
+        fn a_declining_provider_falls_through_to_storage_and_is_counted() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let destroys = AtomicUsize::new(0);
+            let handle = make_handle(HUDI_PROVIDER_OUTCOME_NOT_SERVED, 0, &destroys);
+
+            let reader = reader(&table_path, handle);
+            let (batch, _) = reader.read_record_batch().expect("read");
+            assert_eq!(
+                batch.num_rows(),
+                BASE_ONLY_ROWS,
+                "a declined file must read from storage exactly as with no provider"
+            );
+
+            let stats = reader.base_file_provider_stats();
+            assert_eq!(stats.storage_fallbacks, 1, "the fallback is counted");
+            assert_eq!(stats.files_served, 0);
+            assert_eq!(stats.rows_served, 0);
+        }
+
+        /// The streaming entry point (`get_closable_iterator`, the shape Velox
+        /// actually uses) reads the same LIVE slot, so the drain counters are
+        /// complete once the C++ consumer has drained the stream — and they are
+        /// not complete before it starts.
+        #[test]
+        fn the_streaming_path_fills_the_drain_counters_as_the_stream_is_consumed() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let destroys = AtomicUsize::new(0);
+            let handle = make_handle(HUDI_PROVIDER_OUTCOME_SERVED, 3, &destroys);
+
+            let reader = reader(&table_path, handle);
+            let stream_ptr = reader.get_closable_iterator().expect("open stream");
+
+            // Setup counters are final the moment the stream is handed over.
+            let at_open = reader.base_file_provider_stats();
+            assert_eq!(at_open.files_served, 1, "setup counter is final at open");
+
+            // SAFETY: `get_closable_iterator` returns a leaked, Rust-allocated
+            // stream this test owns; it is freed by `hudi_free_arrow_stream`
+            // below, exactly once, as the C++ consumer would.
+            let mut reader_stream = unsafe {
+                arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(
+                    stream_ptr as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream,
+                )
+            }
+            .expect("import the returned stream");
+            let mut rows = 0usize;
+            for batch in reader_stream.by_ref() {
+                rows += batch.expect("batch").num_rows();
+            }
+            assert_eq!(rows, 0, "the provider served no rows");
+
+            let drained = reader.base_file_provider_stats();
+            assert_eq!(
+                drained.batches_received, 3,
+                "every served batch is counted by the time the stream ends"
+            );
+            assert!(
+                drained.batches_received > at_open.batches_received,
+                "drain counters must fill in DURING the drain, not at open — \
+                 they read {} at open and {} after",
+                at_open.batches_received,
+                drained.batches_received
+            );
+
+            drop(reader_stream);
+            drop(reader);
+            assert_eq!(
+                destroys.load(Ordering::SeqCst),
+                1,
+                "the provider ctx is released exactly once"
+            );
+        }
     }
 }

@@ -84,6 +84,19 @@ pub fn stream_stats_handle(reader: &HoodieFileGroupReader) -> StreamStatsHandle 
     reader.stream_stats_handle()
 }
 
+/// Borrow the reader's base-file provider counters.
+///
+/// Same capture-before-drop rule as [`stream_stats_handle`], and for the same
+/// reason: the served base file is streamed, so its drain counters
+/// (`rows_served` / `bytes_materialized` / `batches_received`) keep filling in
+/// as the returned stream is consumed, long after the reader itself is gone.
+/// All-zero when no provider was injected.
+pub fn base_file_provider_live_stats(
+    reader: &HoodieFileGroupReader,
+) -> std::sync::Arc<std::sync::Mutex<BaseFileProviderStats>> {
+    reader.base_file_provider_live_stats()
+}
+
 /// Arrow schema for an Avro JSON schema, built the way the HFile base-file
 /// reader builds it (`RegisteredWriterSchema` + `AvroBlockDecoder::schema()`)
 /// rather than through `avro_to_arrow`, which has no `AvroSchema::Ref` support

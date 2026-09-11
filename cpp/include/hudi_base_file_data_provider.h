@@ -72,7 +72,17 @@ typedef struct HudiBaseFileDataRequest {
   /* Projected ("intersection") schema the read wants back. Never NULL. */
   const struct ArrowSchema *projected_schema;
   /* Whether a pushed predicate may be applied to this file. When false, the
-   * provider must serve unfiltered. */
+   * provider must serve unfiltered and let the post-merge filter apply it.
+   *
+   * PER FILE, not per split, and not a table property: it is exactly the
+   * decision hudi-rs's own parquet RowFilter pushdown got for this same file.
+   * Two independent gates must both pass -- the merge-safety gate (no log files
+   * on the split, or a primary-key-safe predicate) and the repair gate (this
+   * file's footer does not label a predicate column in a way the
+   * apache/hudi#18132 logical-type repair reinterprets on read). The second is
+   * decided from the file's own footer, so the SAME read can hand true for one
+   * base file and false for the next. A provider that caches the answer across
+   * files of a split is wrong, and drops rows that match. */
   bool can_push_predicate;
   /* Partition path of the split (e.g. "year=2024/month=01"). */
   HudiStrSlice partition_path;
@@ -113,8 +123,15 @@ typedef struct HudiBaseFileDataResult {
  * that call.
  *
  * Concurrency contract: try_base_file MAY be called concurrently from several
- * threads on the same ctx; the implementation must be thread-safe. destroy is
- * called exactly once, after the last try_base_file has returned.
+ * threads on the same ctx; the implementation must be thread-safe.
+ *
+ * Lifetime contract: destroy is called exactly once, after the last
+ * try_base_file has returned AND after every ArrowArrayStream this provider
+ * served has been fully drained or released. A served stream's get_next/release
+ * callbacks may therefore point into ctx. hudi-rs guarantees this structurally
+ * (the task that owns a served stream holds a strong reference to the
+ * provider), so it does not depend on the order in which the C++ caller frees
+ * the reader handle and the stream.
  *
  * Error contract: any internal failure must be reported by returning
  * HUDI_PROVIDER_OUTCOME_NOT_SERVED, never by a mechanism that could fail the
@@ -125,6 +142,7 @@ typedef struct HudiBaseFileDataProviderVTable {
   uint32_t abi_version;
   int (*try_base_file)(void *ctx, const HudiBaseFileDataRequest *req,
                        HudiBaseFileDataResult *out);
+  /* See the lifetime contract above for when this runs. */
   void (*destroy)(void *ctx);
 } HudiBaseFileDataProviderVTable;
 
