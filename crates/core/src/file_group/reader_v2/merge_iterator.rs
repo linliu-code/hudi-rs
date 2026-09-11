@@ -1136,11 +1136,14 @@ mod tests {
             }
             other => panic!("expected the base source error to surface, got {other:?}"),
         }
-        // Two in, two out: the batch and then the error. The source holds nothing
-        // after the `Err`, so this pins that the error is REPORTED as a chunk rather
-        // than swallowed into an early `None` — not that a following item would be
-        // skipped, which this fixture cannot show.
-        assert_eq!(chunks.len(), 2, "the error is reported, not swallowed");
+        // The `match` above already establishes that the error is reported rather than
+        // swallowed. What this adds is the absence of a THIRD chunk: nothing is
+        // appended after a terminal error.
+        assert_eq!(
+            chunks.len(),
+            2,
+            "exactly two chunks — the batch and the error, nothing appended after it"
+        );
     }
 
     /// A base source that fails mid-read surfaces the failure. The rows already
