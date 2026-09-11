@@ -1464,13 +1464,23 @@ mod tests {
     ///
     /// `scan_for_next_block_offset(from_pos)` starts its scan at
     /// `from_pos + MAGIC.len()`, and `from_pos` enters the arithmetic in that one
-    /// place. Every other test of that function passes 0 — the four variants of
-    /// `test_corrupt_recovery_scan_finds_a_magic_split_across_windows` all do,
-    /// because `corrupt_then_good_file` puts the damage at byte 0 — and with
+    /// place. **No pre-existing test could observe it.** Two call sites pass 0 —
+    /// `test_scan_for_next_block_offset_stays_within_file_bounds`, and the four
+    /// window variants of `test_corrupt_recovery_scan_finds_a_magic_split_across_windows`,
+    /// whose `corrupt_then_good_file` puts the damage at byte 0 — and with
     /// `from_pos == 0` the resume term is indistinguishable from a bug that drops it
-    /// (`MAGIC.len()` either way). Production only ever calls it from
-    /// `create_corrupted_block(magic_pos)`, where a nonzero `magic_pos` is the
-    /// ordinary case: damage anywhere but the very start of the file.
+    /// (`MAGIC.len()` either way). The other three pass `len - 1`, `len - magic` and
+    /// `len` (`test_recovery_scan_answers_eof_when_the_scan_start_is_at_or_past_it`),
+    /// which are deliberately AT or PAST end-of-file: they exercise the two
+    /// early-return branches and assert `stream_len`, which is the answer whether or
+    /// not the resume term is there.
+    ///
+    /// So no in-range nonzero offset was exercised anywhere — which is what this test
+    /// adds. An earlier version of this comment said "every other test passes 0";
+    /// three of them do not, and review round 4 caught the enumeration being short.
+    /// Production only ever calls it from `create_corrupted_block(magic_pos)`, where a
+    /// nonzero in-range `magic_pos` is the ordinary case: damage anywhere but the very
+    /// start of the file.
     ///
     /// Getting the resume wrong skips or re-reads a block span after damage, which
     /// is silent — the walk still returns blocks, just not the right ones.
@@ -1729,10 +1739,14 @@ mod tests {
     /// The eager path already pins all of this (`test_read_log_file_with_rollback_block`),
     /// and the branch ships a `test_lazy_sweep_matches_eager_for_*` family claiming the
     /// two paths agree — for DATA blocks. For command-block headers that claim was
-    /// unpinned, and the only sweep-path statement about a command block anywhere was
-    /// `blocks.iter().any(|b| b.block_type == BlockType::Command)` inside
-    /// `test_load_content_is_idempotent_for_every_block_type`, where it is a
-    /// precondition for a different subject.
+    /// unpinned. Two sweep-path statements about a command block existed, and neither
+    /// touches its headers: `blocks.iter().any(|b| b.block_type == BlockType::Command)`
+    /// inside `test_load_content_is_idempotent_for_every_block_type`, where it is a
+    /// precondition for a different subject, and the block-TYPE sequence
+    /// `vec![BlockType::Command, BlockType::Corrupted]` inside
+    /// `a_corrupt_tail_with_no_following_magic_spans_to_eof`, which is about the
+    /// corrupt tail. (An earlier version of this comment said "the only" — review
+    /// round 4 found the second, printed by this entry's own `grep`.)
     ///
     /// A sweep that misreads a rollback merges rolled-back records back in.
     #[tokio::test]

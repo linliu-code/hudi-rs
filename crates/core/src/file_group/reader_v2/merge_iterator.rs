@@ -1102,10 +1102,16 @@ mod tests {
     /// short result as a complete one, which is the worst failure this path can
     /// produce, and the eager arm is the one most reads take.
     ///
-    /// No eager test could reach this before: every one of them is built with
-    /// `new_eager_from_vec`, whose body is `stream::iter(batches.map(Ok))` — it
-    /// maps every item to `Ok`, so an `Err` cannot occur. Hence `new_eager` +
-    /// `base_of` here rather than the usual convenience wrapper.
+    /// No eager test fed an `Err` before this one. Three of the four build their
+    /// stream with `new_eager_from_vec`, whose body is
+    /// `stream::iter(batches.map(Ok))` — it maps every item to `Ok`, so they
+    /// structurally cannot; the fourth, `eager_accepts_an_arbitrary_base_stream`,
+    /// already uses `new_eager` + `base_of` and simply passes `Ok` items.
+    ///
+    /// So the gap was the `Err` input, not the construction — an earlier version of
+    /// this comment said every eager test went through the `Vec` wrapper and offered
+    /// `new_eager` + `base_of` as the novelty, which the test 300 lines below
+    /// refutes (review round 4).
     #[test]
     fn eager_base_source_error_surfaces_rather_than_truncating() {
         let schema = small_schema();
@@ -1130,7 +1136,11 @@ mod tests {
             }
             other => panic!("expected the base source error to surface, got {other:?}"),
         }
-        assert_eq!(chunks.len(), 2, "the stream stops after the error");
+        // Two in, two out: the batch and then the error. The source holds nothing
+        // after the `Err`, so this pins that the error is REPORTED as a chunk rather
+        // than swallowed into an early `None` — not that a following item would be
+        // skipped, which this fixture cannot show.
+        assert_eq!(chunks.len(), 2, "the error is reported, not swallowed");
     }
 
     /// A base source that fails mid-read surfaces the failure. The rows already
