@@ -90,10 +90,17 @@ impl InputSplit {
     }
 
     /// Sort log file paths ascending by deltaCommitTime → logVersion → writeToken —
-    /// the gold's three keys, which are the only ones that can fire here: an input
-    /// split is one file group (so [`LogFile`]'s `file_id` tiebreak is constant) and
-    /// `.cdc` paths are removed by [`Self::filter_cdc_log_files`] before this runs
-    /// (so its `extension` tiebreak is too).
+    /// the gold's three keys, which are the only ones that can fire here. [`LogFile`]'s
+    /// two further tiebreaks are both constant: an input split is one file group, so
+    /// `file_id` is; and every name `LogFile::from_str` accepts here carries
+    /// `extension == "log"`, so `extension` is.
+    ///
+    /// Note what does NOT make `extension` constant — `.cdc` filtering. A `.cdc` name
+    /// parses with `extension == "log"` like any other: `parse_file_name` splits on the
+    /// LAST `_`, so `.fid_ts.log.1_0-1-2.cdc` yields `write_token == "0-1-2.cdc"` and
+    /// the suffix lands in key 3, not key 4. [`Self::filter_cdc_log_files`] mirrors
+    /// `InputSplit.java:57` and is a separate concern. An earlier version of this
+    /// comment gave the filtering as the reason (review round 4).
     ///
     /// Mirrors Java's `InputSplit` constructor which sorts via
     /// `HoodieLogFile.getLogFileComparator()`.
