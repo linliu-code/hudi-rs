@@ -1144,11 +1144,26 @@ impl HoodieFileGroupReader {
                 Vec::new()
             };
 
-        // ONE verdict, both consumers, withdrawn in one block. That is the same
-        // property the merge-safety gate is bound once for, one layer in: an edit
-        // to the condition cannot leave the row-group selector behind, and pruning
-        // is the one that must not be left behind — it drops rows before anything
-        // downstream can see them.
+        // ONE verdict, THREE consumers. This SHADOWS the merge-safety gate bound
+        // above: the row filter, the row-group selector and the injected
+        // provider's `can_push_predicate` all read the narrowed value from here
+        // down, so a consumer cannot be left behind by a later edit. That is the
+        // same property the merge gate is bound once for, one layer in.
+        //
+        // The provider is the consumer that would otherwise be left behind, and
+        // nothing would have said so: it arrived on a branch that forked BEFORE
+        // this gate existed (`2ba0dbd`), so the merge that brought it in was
+        // textually clean and touched no call site the repair work had ever seen.
+        // A provider told it may push applies the predicate to the file's own
+        // physical values and drops the same rows the in-process `RowFilter`
+        // would have — rows the post-merge filter cannot restore. Withdrawing
+        // only the in-process filter would leave the FFI reader exposed on
+        // exactly the files this guard exists for.
+        //
+        // Rebound rather than folded into the `if` below because the value, not
+        // the branch, is what the provider request reads: it is the same
+        // narrowing internal `reader/mod.rs` applies, expressed for this tree.
+        let pushdown_is_safe = pushdown_is_safe && repair_conflict.is_empty();
         if !repair_conflict.is_empty() {
             let volume = self.storage.read_volume();
             // Counted for every withdrawal; `row_group_selector_suppressed` can
@@ -1200,6 +1215,12 @@ impl HoodieFileGroupReader {
         // provider for it would be a round-trip for nothing.
         //
         // `None`, or no provider injected, falls through to the unchanged read.
+        //
+        // `can_push_predicate` below is the REPAIR-NARROWED verdict, not the
+        // merge gate: `pushdown_is_safe` was rebound above, after the footer read
+        // and before this request, which is the only ordering on which the
+        // provider can see the same decision the in-process `RowFilter` got for
+        // this file.
         if !use_position && let Some(provider) = self.base_file_provider.clone() {
             let file_uri = join_url_segments(&self.storage.base_url, &[path.as_str()])
                 .map(|u| u.to_string())
@@ -3689,6 +3710,118 @@ mod tests {
         );
     }
 
+    // ── the repair gate vs. the INJECTED PROVIDER ────────────────────────────
+    //
+    // Ported from internal `file_group/reader/mod.rs`
+    // (`repair_conflict_also_withdraws_provider_pushdown`) and re-expressed for
+    // this tree: different file, different reader, different provider trait, and
+    // a stub that lives in this module rather than that one — so this is a port
+    // from tree, not a cherry-pick.
+    //
+    // The pair matters more than either half. `..._withdraws_provider_pushdown`
+    // alone would pass against a seam hard-wired to `false`; `..._keeps_...`
+    // alone would pass against the un-narrowed merge gate, which is exactly the
+    // defect. Only both together pin the verdict to the per-file decision.
+
+    /// THE PROVIDER PATH. `can_push_predicate` must carry the same verdict the
+    /// in-process `RowFilter` got for this file.
+    ///
+    /// An injected provider told it may push applies the predicate to the file's
+    /// own physical values and drops the same rows the parquet `RowFilter` would
+    /// have — and the post-merge filter cannot restore them. So a guard that
+    /// clears only `row_filter`/`row_group_selector` leaves the FFI reader
+    /// exposed on precisely the files it exists for.
+    ///
+    /// Mutation proof: revert the `let pushdown_is_safe = pushdown_is_safe &&
+    /// repair_conflict.is_empty();` rebinding in `base_file_source` and this test
+    /// fails on the `!can_push` assertion, while every other test in this file
+    /// still passes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repair_conflict_also_withdraws_provider_pushdown() {
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(
+            tmp.path(),
+            base_name,
+            arrow_schema::TimeUnit::Microsecond, // the LIE
+        );
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            straddling_table_schema(),
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        // Declines to serve, so the read falls through to storage and the only
+        // thing under test is the request the provider was handed.
+        let provider = StubDataProvider::not_serving();
+        reader.base_file_provider = Some(provider.clone());
+        assert!(
+            reader.base_read_pushdown_is_safe(),
+            "the merge gate passes on a slice with no log files; the repair \
+             conflict is what must withdraw the provider's pushdown"
+        );
+
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        let seen = provider
+            .seen()
+            .expect("the provider must have been offered the file");
+        assert!(
+            !seen.can_push_predicate,
+            "a file needing a value-reinterpreting repair must withdraw PROVIDER \
+             pushdown too, not only the in-process row filter"
+        );
+    }
+
+    /// The other half, and the reason the assertion above is not vacuous: the
+    /// same fixture with an honestly labelled file must still hand the provider
+    /// `true`.
+    ///
+    /// Without this, `can_push_predicate: false` — a blanket regression that
+    /// costs every well-formed table its provider-side pushdown — passes the test
+    /// above.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_honestly_labelled_file_keeps_provider_pushdown() {
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Millisecond);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            straddling_table_schema(),
+            builder,
+            None,
+            &["ts"], // the guard is ARMED; the file is simply honest
+        )
+        .await;
+        let provider = StubDataProvider::not_serving();
+        reader.base_file_provider = Some(provider.clone());
+
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        let seen = provider
+            .seen()
+            .expect("the provider must have been offered the file");
+        assert!(
+            seen.can_push_predicate,
+            "an armed guard over an honestly labelled file must leave provider \
+             pushdown intact"
+        );
+    }
+
     #[test]
     fn builder_routes_repair_risk_columns_into_reader_context() {
         let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
@@ -4139,7 +4272,7 @@ mod tests {
     }
 
     /// The provider is handed the base file's absolute URI, the projected schema
-    /// the read wants back, the reader's pushdown gate and the partition
+    /// the read wants back, the reader's pushdown decision and the partition
     /// coordinates — the inputs an implementation cannot be correct without.
     #[tokio::test(flavor = "multi_thread")]
     async fn base_file_provider_request_carries_uri_schema_and_pushdown_gate() {
@@ -4175,7 +4308,11 @@ mod tests {
         );
         assert_eq!(
             seen.can_push_predicate, expected_gate,
-            "request must carry the reader's pushdown gate verbatim"
+            "request must carry the reader's pushdown decision for this file. \
+             This fixture arms no repair-risk column, so the repair gate cannot \
+             narrow anything and the decision coincides with the merge gate; the \
+             case where it does NOT is \
+             `repair_conflict_also_withdraws_provider_pushdown`"
         );
         assert_eq!(
             seen.partition_fields,

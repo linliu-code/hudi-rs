@@ -131,14 +131,27 @@ pub struct BaseFileDataRequest<'a> {
     pub file_uri: &'a str,
     /// The projected ("intersection") schema the read wants back.
     pub projected_schema: &'a SchemaRef,
-    /// Whether it is safe to apply a pushed predicate to this file: true when the
-    /// split has no log files (nothing merges, so the base rows are final) or the
-    /// predicate is primary-key-safe — the same gate the reader applies to its own
-    /// parquet `RowFilter` pushdown
-    /// (`HoodieFileGroupReader::base_read_pushdown_is_safe`). A provider that
-    /// pushes a predicate must
-    /// honor this: when `false`, serve unfiltered so a post-merge filter can apply
-    /// it.
+    /// Whether it is safe to apply a pushed predicate **to this file**. A provider
+    /// that pushes a predicate must honor it: when `false`, serve unfiltered so a
+    /// post-merge filter can apply the predicate instead.
+    ///
+    /// This is a PER-FILE decision, not a table-level property, and it is exactly
+    /// the decision the reader's own parquet `RowFilter` pushdown got for the same
+    /// file. Two gates, both of which must pass:
+    ///
+    /// 1. the merge gate, `HoodieFileGroupReader::base_read_pushdown_is_safe` —
+    ///    the split has no log files (nothing merges, so the base rows are final)
+    ///    or the predicate is primary-key-safe; and
+    /// 2. the repair gate — this file's footer does not label a predicate column
+    ///    in a way the apache/hudi#18132 logical-type repair reinterprets on read.
+    ///    Parquet evaluates a pushed predicate against the file's PHYSICAL values,
+    ///    so a file that labels a tz-aware column micros while its stored i64 is
+    ///    millis makes a millis-semantics literal read those rows as 1970 and drop
+    ///    rows that match. Nothing downstream can restore them.
+    ///
+    /// Gate 2 is why this must not be read as "the merge gate": the same read can
+    /// hand `true` for one base file and `false` for the next, and a provider that
+    /// caches the answer per split is wrong.
     pub can_push_predicate: bool,
     /// Partition path of the split (e.g. `year=2024/month=01`), used to report
     /// partition-column metadata to the provider.
