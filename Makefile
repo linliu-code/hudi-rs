@@ -109,7 +109,17 @@ format-python: ## Format Python code
 	ruff format $(PYTHON_DIR)
 
 .PHONY: check
-check: check-rust check-python ## Run check on Rust and Python
+check: check-version check-rust check-python ## Run check on version single-sourcing, Rust and Python
+
+.PHONY: check-version
+check-version: ## Assert the project version has exactly one authority
+	$(info --- Check the version is single-sourced ---)
+	@.github/scripts/check-version-single-source.sh
+
+.PHONY: version-sync
+version-sync: ## Propagate [workspace.package] version to the manifests that cannot derive it
+	$(info --- Sync the version from Cargo.toml ---)
+	@.github/scripts/check-version-single-source.sh --fix
 
 .PHONY: check-rust
 check-rust: ## Run check on Rust

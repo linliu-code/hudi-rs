@@ -16,7 +16,28 @@
 # under the License.
 
 cmake_minimum_required(VERSION 3.20)
-project(hudi-cpp VERSION 0.6.0)
+# Derived from the ONE authority: `[workspace.package] version` in the root Cargo.toml.
+# CMake's project VERSION takes numeric components only, so the pre-release suffix that
+# version carries (`-dev`) is dropped here -- x.y.z-dev becomes x.y.z, which is the shape
+# OSS #749 wrote by hand. Read with file(READ)+regex rather than by running a script, so
+# `cmake` needs nothing on PATH that it did not already need.
+# The pattern requires `version` to be the FIRST key of the section, which is how both this
+# fork and apache/hudi-rs write it. That is deliberate: an unanchored search would happily
+# match the `version` inside `rust-version` if the keys were ever reordered and hand back a
+# rustc version as the project version. This fails loudly instead.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../Cargo.toml" _hudi_root_manifest)
+string(REGEX MATCH "\\[workspace\\.package\\][ \t]*?
+[ \t]*version[ \t]*=[ \t]*\"([^\"]+)\""
+       _hudi_version_match "${_hudi_root_manifest}")
+if(NOT _hudi_version_match)
+  message(FATAL_ERROR
+    "could not read [workspace.package] version from ../Cargo.toml -- it must be the first key of that section")
+endif()
+set(HUDI_WORKSPACE_VERSION "${CMAKE_MATCH_1}")
+string(REGEX REPLACE "^([0-9]+\\.[0-9]+\\.[0-9]+).*$" "\\1" HUDI_CPP_VERSION "${HUDI_WORKSPACE_VERSION}")
+
+project(hudi-cpp VERSION ${HUDI_CPP_VERSION})
+message(STATUS "hudi-cpp version ${HUDI_CPP_VERSION} (derived from [workspace.package] version ${HUDI_WORKSPACE_VERSION})")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

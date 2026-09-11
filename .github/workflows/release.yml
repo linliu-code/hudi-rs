@@ -32,7 +32,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "the workspace version this ad-hoc release carries (e.g. 0.6.0-dev); must equal Cargo.toml's [workspace.package] version"
+        description: "the workspace version this ad-hoc release carries; must equal [workspace.package] version in Cargo.toml, which .github/scripts/workspace-version.sh prints"
         required: true
 
 jobs:
