@@ -2166,6 +2166,8 @@ mod tests {
     /// DIFFER — i.e. a position-keyed map, which is exactly the case the comment
     /// is about. (m1 ISSUES I-14 item 4's territory; see DECISIONS D-6 for why
     /// the byte-level half of that item is NOT ported.)
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn spilled_delete_tombstone_keeps_its_own_key_not_the_map_key() {
         let mut map = SpillableRecordMap::with_config(tiny_budget_config(0));

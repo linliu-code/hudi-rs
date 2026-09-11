@@ -1242,6 +1242,15 @@ mod tests {
     /// the corrupt-recovery family all run on files with a later marker or a
     /// short final window (the third branch) — so these were the remaining
     /// untested `Ok(stream_len)` returns the original audit's item 10 named.
+    ///
+    /// The `window == 0` branch needs one assertion the other two do not. There
+    /// `pos == stream_len` by construction, so returning `pos` is
+    /// indistinguishable from returning `stream_len`, and DELETING the guard
+    /// outright still yields `stream_len` via the short-window branch below it.
+    /// The value alone therefore pins the contract but not the branch. What the
+    /// branch uniquely promises is that it answers WITHOUT READING, so the
+    /// reader's position is asserted unchanged across the call — the
+    /// fall-through would move it via `seek_to(pos)`.
     /// m1's R-4 established there is no product-code delta against internal main
     /// here (three such branches on both sides), so this closes coverage and
     /// ports nothing.
@@ -1263,10 +1272,19 @@ mod tests {
 
         // Branch 2: the scan start lands EXACTLY on the end (window == 0).
         // from_pos = len - magic  =>  pos = len, remaining = 0.
+        // Pin the branch, not just its value: it must answer without reading, so
+        // the reader's position may not move. Deleting the guard makes the
+        // short-window branch answer instead, but only after `seek_to(pos)`.
+        let before = reader.reader.position();
         assert_eq!(
             reader.scan_for_next_block_offset(len - magic).await?,
             len,
             "a scan starting exactly at the end must answer end-of-file"
+        );
+        assert_eq!(
+            reader.reader.position(),
+            before,
+            "the window==0 branch must answer without seeking or reading"
         );
 
         // A third, adjacent case worth pinning while the arithmetic is in view:
@@ -1720,15 +1738,6 @@ mod tests {
         Ok(())
     }
 
-    /// A minimal, self-consistent V1 COMMAND block.
-    ///
-    /// Handwritten rather than taken from a fixture because the corrupt-tail
-    /// cases below need a KNOWN-good block to precede the damage: a fixture's
-    /// block would also have to be located before the tail could be appended.
-    ///
-    /// `block_length` spans version..=trailing pointer, excluding the magic and
-    /// the length field itself; the trailing reverse pointer counts the magic on
-    /// top, which is what `is_block_corrupted` checks against.
     /// Block-type ordinals as they appear on disk, for [`a_v1_block`].
     const V1_BLOCK_TYPE_COMMAND: u32 = 0;
     const V1_BLOCK_TYPE_AVRO_DATA: u32 = 3;
@@ -1791,6 +1800,10 @@ mod tests {
     /// Getting either wrong makes `is_block_corrupted` short-circuit the walk
     /// before the header is ever parsed, so a test meaning to exercise header
     /// parsing would silently exercise corruption detection instead.
+    ///
+    /// NOTE: `content` is `&[]` at every current call site, so no test
+    /// distinguishes the content write from omitting it. The parameter exists so
+    /// the layout is stated whole rather than half — do not read it as pinned.
     fn a_v1_block(block_type: u32, header: &[V1Header<'_>], content: &[u8]) -> Vec<u8> {
         let mut header_bytes = Vec::new();
         header_bytes.extend_from_slice(&(header.len() as u32).to_be_bytes());
@@ -1818,7 +1831,12 @@ mod tests {
         buf
     }
 
-    /// A well-formed V1 Command block carrying one InstantTime header entry.
+    /// A minimal, self-consistent V1 COMMAND block carrying one InstantTime
+    /// header entry.
+    ///
+    /// Handwritten rather than taken from a fixture because the corrupt-tail
+    /// cases below need a KNOWN-good block to precede the damage: a fixture's
+    /// block would also have to be located before the tail could be appended.
     fn a_valid_command_block(instant: &str) -> Vec<u8> {
         a_v1_block(
             V1_BLOCK_TYPE_COMMAND,

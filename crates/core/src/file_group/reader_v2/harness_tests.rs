@@ -1600,6 +1600,13 @@ fg_case_test!(
 //   `!has_log_files() || mor_pk_safe`, and this slice has log files) nor the log
 //   blocks. Everything is read, the merge applies, and the answer is the merged
 //   truth above.
+//
+//   ⚠️ This case discriminates the LOG-BLOCK gate only. Every base row has `num`
+//   in {1,2,3,4}, all of which satisfy `num < 10`, so a leak of the BASE gate
+//   produces byte-identical output here. The base half is pinned separately by
+//   `harness_filter_unsafe_not_pushed_mor`, where the predicate actually
+//   excludes a base row; what this case adds is the parquet-log-block half and
+//   their composition through the merge.
 // * **Gate leaking** — `num = 11` and `num = 22` both FAIL `num < 10`, so both log
 //   records are filtered out of their parquet blocks before the merge ever sees
 //   them. The merge then has only base rows, and k1/k2 silently **revert to their
@@ -1612,7 +1619,7 @@ fg_case_test!(
 fg_case_test!(
     harness_parquet_log_block_non_pk_filter_leaves_log_records_intact_through_the_merge,
     FgReaderCase {
-        name: "parquet_log_block_non_pk_filter_composes_with_the_merge",
+        name: "parquet_log_block_non_pk_filter_leaves_log_records_intact_through_the_merge",
         fixture: QuickstartTripsTable::MorLayoutParquetLogBlock,
         partition: "",
         base_file: "9c161c05-86e5-46cc-85ab-14ce5326cfb0-0_0-79-130_20260607061232259.parquet",
