@@ -36,10 +36,14 @@ description = "The native Rust implementation for Apache Hudi"
 homepage = "https://github.com/apache/hudi-rs"
 repository = "https://github.com/apache/hudi-rs"
 
-# Dependencies are built without debug info. Measured on this workspace: `target/debug/deps` is
-# ~36 GB with it and the CI runner that builds the coverage job has ~11 GB free, so the coverage
-# job could not complete -- librocksdb-sys' `ar` and protobuf's `cmake --install` both failed with
-# `No space left on device`.
+# Dependencies are built without debug info. Measured on this workspace, `target/debug/deps` is
+# ~36 GB with it, against ~11 GB free on the CI runner that builds the Rust test job.
+#
+# What this does NOT do, stated because it was first claimed and then measured: it does not rescue
+# the tarpaulin coverage run. That run asks for debug info itself, for source mapping, so the
+# profile is overridden -- it filled the disk at 585 crates with this block and at 578 without it.
+# Coverage is upstream-only for that reason (see the rust-tests job). This block is what keeps the
+# non-instrumented test run inside the runner's disk, and it makes every other cargo job cheaper.
 #
 # `package."*"` applies to DEPENDENCIES ONLY, never to workspace members, so every crate this
 # repository owns keeps full debug info: coverage line-mapping, backtraces and breakpoints in our
