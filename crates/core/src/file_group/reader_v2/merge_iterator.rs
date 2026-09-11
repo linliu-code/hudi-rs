@@ -1110,8 +1110,9 @@ mod tests {
     ///
     /// So the gap was the `Err` input, not the construction — an earlier version of
     /// this comment said every eager test went through the `Vec` wrapper and offered
-    /// `new_eager` + `base_of` as the novelty, which the test 300 lines below
-    /// refutes (review round 4).
+    /// `new_eager` + `base_of` as the novelty, which `eager_accepts_an_arbitrary_base_stream`
+    /// refutes (review round 4). That test is named rather than located: round 8 found
+    /// this comment still saying "300 lines below" when the distance had become 406.
     #[test]
     fn eager_base_source_error_surfaces_rather_than_truncating() {
         let schema = small_schema();
