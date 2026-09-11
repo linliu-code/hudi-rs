@@ -92,8 +92,11 @@ impl InputSplit {
     /// Sort log file paths ascending by deltaCommitTime → logVersion → writeToken —
     /// the gold's three keys, which are the only ones that can fire here. [`LogFile`]'s
     /// two further tiebreaks are both constant: an input split is one file group, so
-    /// `file_id` is; and every name `LogFile::from_str` accepts here carries
-    /// `extension == "log"`, so `extension` is.
+    /// `file_id` is; and every log file a Hudi table puts in one is a `.log`, so
+    /// `extension` is (ISSUES I-5). Note that is a property of what CALLERS hand this
+    /// function, not of what `from_str` accepts — `parse_file_name` takes `parts[1]`
+    /// verbatim, so `.fid_ts.archive.1_tok` would parse with `extension == "archive"`,
+    /// matching the gold's own `(log|archive)` pattern.
     ///
     /// Note what does NOT make `extension` constant — `.cdc` filtering. A `.cdc` name
     /// parses with `extension == "log"` like any other: `parse_file_name` splits on the
