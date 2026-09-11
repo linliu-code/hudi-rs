@@ -36,6 +36,18 @@ description = "The native Rust implementation for Apache Hudi"
 homepage = "https://github.com/apache/hudi-rs"
 repository = "https://github.com/apache/hudi-rs"
 
+# Dependencies are built without debug info. Measured on this workspace: `target/debug/deps` is
+# ~36 GB with it and the CI runner that builds the coverage job has ~11 GB free, so the coverage
+# job could not complete -- librocksdb-sys' `ar` and protobuf's `cmake --install` both failed with
+# `No space left on device`.
+#
+# `package."*"` applies to DEPENDENCIES ONLY, never to workspace members, so every crate this
+# repository owns keeps full debug info: coverage line-mapping, backtraces and breakpoints in our
+# own code are unaffected. What is lost is stepping into a dependency's source in a debugger,
+# which is recoverable by commenting this block out locally.
+[profile.dev.package."*"]
+debug = false
+
 [workspace.dependencies]
 # arrow
 arrow = { version = "58" }

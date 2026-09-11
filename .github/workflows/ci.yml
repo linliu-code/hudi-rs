@@ -90,13 +90,22 @@ jobs:
       # the host's preinstalled toolchains the way the python-tests job does -- it has its own
       # filesystem -- so the headroom here comes from what the build does NOT compile
       # (see COV_EXCLUDE in the Makefile), not from what is deleted.
-      - name: Disk before
-        run: df -h /__w /tmp || df -h
+      # This job runs in a container, so it cannot delete the host's preinstalled toolchains the
+      # way the python-tests job does -- the container has its own filesystem and the host's
+      # ~62 GB of 72 GB is already spent before any step runs. The headroom therefore has to come
+      # from what the build does NOT produce: no debug info for dependencies
+      # (`[profile.dev.package."*"]` in Cargo.toml, worth tens of GB here) and no incremental
+      # artifacts, which CI never reuses. The df lines are printed either way so a future failure
+      # names what was actually available rather than leaving it to be guessed at.
+      - name: Disk and workspace size before
+        run: df -h; du -sh target 2>/dev/null || true
       - name: Rust unit tests with coverage report
+        env:
+          CARGO_INCREMENTAL: 0
         run: make coverage-xml
-      - name: Disk after
+      - name: Disk and workspace size after
         if: always()
-        run: df -h /__w /tmp || df -h
+        run: df -h; du -sh target/debug/deps target/debug/build 2>/dev/null || true
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
         with:
