@@ -23,8 +23,10 @@ on:
       - main
       - release/**
   pull_request:
-    branches:
-      - main
+    # No `branches:` filter. GitHub matches it against the pull request's BASE branch, so
+    # scoping it to `main` gave a PR onto any other base NO checks at all -- not a red one,
+    # none, which reads as green. Internal `main`'s own ci.yml already drops the filter; this
+    # follows that precedent. Cost: every PR onto every branch now runs this workflow.
 
 jobs:
   check-code:
