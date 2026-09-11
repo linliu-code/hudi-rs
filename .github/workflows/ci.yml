@@ -99,14 +99,39 @@ jobs:
       # names what was actually available rather than leaving it to be guessed at.
       - name: Disk and workspace size before
         run: df -h; du -sh target 2>/dev/null || true
-      - name: Rust unit tests with coverage report
+
+      # COVERAGE INSTRUMENTATION IS UPSTREAM ONLY, and this is a disk decision, not a taste one.
+      # This job runs in a container, so it cannot free the host's preinstalled toolchains the way
+      # python-tests does -- it starts with 11 GB free of 72 GB, measured by the df above. A
+      # `--engine llvm` tarpaulin run over this workspace does not fit: it filled the disk at 578
+      # crates before `--exclude hudi-cpp` and at 585 after, and again after dependency debug info
+      # was turned off, because tarpaulin needs debug info for source mapping and asks for it
+      # regardless of the profile. The measurements are in the milestone's evidence folder.
+      #
+      # The coverage REPORT already had no consumer here: `publish-coverage` is upstream-only
+      # because CODECOV_TOKEN exists on neither this repository nor its organisation. So on a fork
+      # this job was spending 25 minutes and more disk than it has to produce an artifact nothing
+      # reads. The TESTS are the part with value on a fork, and they still run -- the same
+      # packages, the same features, just without the instrumentation.
+      #
+      # The cost, stated rather than hidden: a break in `make coverage-xml` itself is no longer
+      # caught here, only upstream.
+      - name: Rust unit tests with coverage report (upstream)
+        if: github.repository == 'apache/hudi-rs'
         env:
           CARGO_INCREMENTAL: 0
         run: make coverage-xml
+      - name: Rust unit tests, without coverage instrumentation (non-upstream)
+        if: github.repository != 'apache/hudi-rs'
+        env:
+          CARGO_INCREMENTAL: 0
+        run: cargo test --workspace --exclude hudi-cpp --all-features --no-fail-fast
+
       - name: Disk and workspace size after
         if: always()
         run: df -h; du -sh target/debug/deps target/debug/build 2>/dev/null || true
       - name: Upload coverage report
+        if: github.repository == 'apache/hudi-rs'
         uses: actions/upload-artifact@v7
         with:
           name: cov-report-rust-tests-${{ runner.os }}
@@ -445,7 +470,8 @@ jobs:
           python -m pip install dist/*.whl
           python -c "import hudi; print(hudi.__file__)"
 
-  # UPSTREAM ONLY. codecov.io is apache/hudi-rs's account: `CODECOV_TOKEN` exists nowhere on
+  # UPSTREAM ONLY -- and rust-tests only produces the coverage artifact upstream too, for the
+  # disk reason recorded on that job. codecov.io is apache/hudi-rs's account: `CODECOV_TOKEN` exists nowhere on
   # this fork or its organisation, and the upload below is `fail_ci_if_error: true`, so on a
   # fork this job is a guaranteed red that reports nothing about the code. The coverage
   # artifacts are still produced and uploaded by rust-tests and python-tests either way --
