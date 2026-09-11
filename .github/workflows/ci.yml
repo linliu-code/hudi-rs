@@ -180,6 +180,56 @@ jobs:
       - name: Check the workspace on the MSRV
         run: cargo +"$MSRV" check --workspace --all-targets --all-features
 
+  # PORTED FROM INTERNAL `main`'s ci.yml (`cpp-ffi`). This was the one CI dimension internal
+  # `main` covered and this branch did not: nothing else here compiles `hudi-cpp` at all, so the
+  # cxx FFI bridge could break and every gate would still be green.
+  #
+  # It earns its place twice over on THIS lineage. `cpp/` is the only consumer of
+  # `OBJECT_STORE_RUNTIME` (crates/core/src/ffi_support), which is internal-only -- OSS deleted it
+  # in #689 -- and therefore the thing a future rebase onto OSS is most likely to drop. This job
+  # is what turns that into a compile error instead of a silent loss.
+  #
+  # Internal's version opens with `aws-actions/configure-aws-credentials@v4`, which is NOT ported.
+  # That step exists solely so `.cargo/config.toml`'s `token-from-stdout` credential provider can
+  # mint a CodeArtifact token for the forked arrow crates internal `main` pins through
+  # `[patch.crates-io]`. This branch has neither the patch section nor the registry -- it takes
+  # `arrow = "58"` from crates.io -- so the step would authenticate against nothing. Dropping it is
+  # the arrow-rs posture applied, not a shortcut around it.
+  cpp-ffi:
+    name: C++ FFI build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache dependencies
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: cpp-ffi
+
+      # protobuf-compiler: lance-encoding/lance-file build prost. clang/libclang: librocksdb-sys
+      # generates its bindings with bindgen at build time. cmake/build-essential: the cxx bridge
+      # needs a C++ toolchain -- ubuntu-latest ships one, installed defensively in case the image
+      # trims it, exactly as internal's job does.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler clang libclang-dev
+          if ! command -v cmake >/dev/null 2>&1; then
+            sudo apt-get install -y -qq build-essential cmake
+          fi
+
+      - name: cargo build -p hudi-cpp
+        run: cargo build -p hudi-cpp
+
+      # NOTE: --lib --tests, no --doc. Carried over from internal's job: hudi-cpp's own lib is
+      # named `hudi` and it also depends on the `hudi` umbrella crate, so `cargo test --doc` shows
+      # rustdoc two `--extern hudi=...rlib` candidates and aborts with E0464. This branch renames
+      # the dependency (`hudi-dep = { package = "hudi", ... }`), which may already avoid it, but
+      # the crate has no runnable doctests so excluding the doc target costs no coverage either
+      # way and keeps the two sides' invocation identical.
+      - name: cargo test -p hudi-cpp
+        run: cargo test --no-fail-fast -p hudi-cpp --lib --tests
+
   rust-tests-windows:
     runs-on: windows-2025
     # disable until https://github.com/apache/hudi-rs/issues/445 is resolved
