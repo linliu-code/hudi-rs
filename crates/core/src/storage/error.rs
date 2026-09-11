@@ -54,4 +54,15 @@ pub enum StorageError {
 
     #[error(transparent)]
     UrlParseError(#[from] url::ParseError),
+
+    /// A cached load this caller coalesced onto failed in another task.
+    ///
+    /// Distinct from the underlying failure on purpose: the single-flight cache
+    /// shares one error across every waiter as an `Arc`, and only the sole
+    /// holder can reclaim the original by value. Re-wrapping a shared error into
+    /// a concrete variant would assert a failure category that may be wrong (a
+    /// `NotFound` reported as a corrupt-footer parse error), so the waiters get
+    /// this instead, carrying the original's message.
+    #[error("coalesced load failed: {0}")]
+    CoalescedLoadFailed(String),
 }
