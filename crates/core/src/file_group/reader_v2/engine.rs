@@ -3219,11 +3219,15 @@ mod tests {
         // -file case, where the survivor is the one row above it, is the neighbouring
         // `base_read_keeps_pushdown_when_the_file_is_honestly_labelled`.
         //
-        // 0 is not this counter's uninformative initial value: the same fixture read
-        // WITHOUT the pushed filter yields 2 rows -- see
-        // `base_read_declines_pushdown_when_the_file_needs_a_reinterpreting_repair`,
-        // which asserts exactly that. So a filter that is built but never applied
-        // fails this assertion.
+        // 0 is not this counter's uninformative initial value. The fixture holds two
+        // rows, and the neighbouring
+        // `base_read_declines_pushdown_when_the_file_needs_a_reinterpreting_repair`
+        // asserts that both of them reach the output when this same file is read with
+        // the repair ARMED (gate 1 on, so no filter is pushed). That test is not this
+        // read minus the filter -- it passes `&["ts"]` where this passes `&[]`, so the
+        // repair fires and relabels micros to millis -- but it does establish the row
+        // count of the fixture. So a filter that is built and then never applied
+        // returns 2 here and fails this assertion.
         assert_eq!(
             out.num_rows(),
             0,
