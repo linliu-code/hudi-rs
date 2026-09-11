@@ -350,7 +350,7 @@ fn served_batch_stream(
         // `a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`
         // catches the mistake; it caught this one.
         let mut served = served;
-        while let Some(item) = served.reader.next() {
+        for item in served.reader.by_ref() {
             let projected = match item {
                 Ok(batch) => {
                     crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)
