@@ -37,14 +37,17 @@ pub mod scanner;
 /// - For v6 tables: base commit timestamp (matches the base file's commit timestamp).
 /// - For v8+ tables: request instant timestamp of the deltacommit.
 ///
-/// The `completion_timestamp` field is used to determine the correct ordering and
-/// file slice association:
+/// The `completion_timestamp` field is used to determine file slice association
+/// (which base instant a log file belongs to):
 /// - For v6 tables: This is always `None` (v6 does not track completion timestamps).
 /// - For v8+ tables: Set from the timeline when the commit is completed.
 ///   If `None`, the commit is still pending and the file should not be included in queries.
 ///
-/// Ordering is based on `completion_timestamp` (if available), falling back to `timestamp`
-/// for uncommitted files. Completed files are ordered before uncommitted ones.
+/// Ordering ([Ord]) is by `timestamp` (the deltaCommitTime / request instant) → `version`
+/// → `write_token` → `extension`, mirroring Java's `HoodieLogFile.getLogFileComparator`.
+/// The `extension` tiebreak also keeps [Ord] consistent with [PartialEq] (which compares
+/// `file_name()`), so distinct files never collapse in a `BTreeSet<LogFile>`. Completion
+/// time is NOT used for ordering — only for slice association and committed-file filtering.
 #[derive(Clone, Debug)]
 pub struct LogFile {
     pub file_id: String,
@@ -230,35 +233,29 @@ impl PartialOrd for LogFile {
 
 impl Ord for LogFile {
     fn cmp(&self, other: &Self) -> Ordering {
-        // For ordering, use completion_timestamp when available.
-        // Files with completion_timestamp are considered earlier than those without.
-        // If both have completion_timestamp, compare by completion_timestamp.
-        // If both lack completion_timestamp, compare by request timestamp.
-        // TODO support `.cdc` suffix
-        match (&self.completion_timestamp, &other.completion_timestamp) {
-            (Some(ct1), Some(ct2)) => {
-                // Both completed: compare by completion timestamp, then version, then write_token
-                ct1.cmp(ct2)
-                    .then(self.version.cmp(&other.version))
-                    .then(self.write_token.cmp(&other.write_token))
-            }
-            (Some(_), None) => {
-                // Self is completed, other is pending: self comes first
-                Ordering::Less
-            }
-            (None, Some(_)) => {
-                // Self is pending, other is completed: other comes first
-                Ordering::Greater
-            }
-            (None, None) => {
-                // Both pending or both v6 (no completion_timestamp set yet):
-                // compare by request timestamp for deterministic ordering
-                self.timestamp
-                    .cmp(&other.timestamp)
-                    .then(self.version.cmp(&other.version))
-                    .then(self.write_token.cmp(&other.write_token))
-            }
-        }
+        // Mirror Java's `HoodieLogFile.LogFileComparator` (`getLogFileComparator`):
+        // order by deltaCommitTime (the request instant embedded in the file name,
+        // stored here as `timestamp`) → logVersion → logWriteToken → suffix (`extension`).
+        //
+        // Completion time is deliberately absent. Java uses it to bucket a log file into
+        // the right file slice (`HoodieFileGroup.getBaseInstantTime`) and to filter
+        // uncommitted files, never to order the merge — see
+        // `hudi-common/.../table/read/InputSplit.java`, which sorts the MOR read's own log
+        // list with this comparator. Ordering by completion time applies log blocks in the
+        // wrong sequence whenever writers complete out of request order, which silently
+        // picks a different merge winner than the Java reader for the same table.
+        //
+        // The `extension` tiebreak is Java's 4th key. It also keeps `Ord` consistent with
+        // `Eq`/`file_name()` (which includes `extension`): a `BTreeSet<LogFile>` dedups on
+        // `Ord` returning `Equal`, so without this tiebreak two files differing only by
+        // extension would collapse to one entry. This matters once `.cdc` suffix support
+        // (see `parse_file_name`) routes `cdc` into `extension` — a `.log` and its `.cdc`
+        // sibling sharing timestamp/version/write_token must remain distinct entries.
+        self.timestamp
+            .cmp(&other.timestamp)
+            .then(self.version.cmp(&other.version))
+            .then(self.write_token.cmp(&other.write_token))
+            .then(self.extension.cmp(&other.extension))
     }
 }
 
@@ -434,8 +431,14 @@ mod tests {
     }
 
     #[test]
-    fn test_log_file_ordering_by_completion_time() {
-        // Log file with earlier completion timestamp
+    fn test_log_file_ordering_ignores_completion_timestamp() {
+        // Gold parity: completion timestamp must NOT influence ordering. Ordering is
+        // by deltaCommitTime (`timestamp`) alone (then version, then write_token),
+        // regardless of whether/what completion timestamps are set. This mirrors
+        // Java's `HoodieLogFile.getLogFileComparator`, which keys only off the
+        // file-name fields.
+
+        // Later request instant, but earliest completion.
         let log1 = LogFile {
             file_id: "file-0".to_string(),
             timestamp: "20250113230302428".to_string(),
@@ -446,21 +449,25 @@ mod tests {
             file_metadata: None,
         };
 
-        // Log file with later completion timestamp (but earlier request timestamp)
+        // Earliest request instant, but latest completion.
         let log2 = LogFile {
             file_id: "file-0".to_string(),
-            timestamp: "20250113230300000".to_string(), // Earlier request time
-            completion_timestamp: Some("20250113230320000".to_string()), // Later completion time
+            timestamp: "20250113230300000".to_string(), // earliest request time
+            completion_timestamp: Some("20250113230320000".to_string()), // latest completion time
             extension: "log".to_string(),
             version: 1,
             write_token: "0-188-387".to_string(),
             file_metadata: None,
         };
 
-        // Uncommitted log file (no completion timestamp)
+        // Latest request instant, and no completion timestamp. On a layout-v2 table
+        // this is not only a pending file: an ARCHIVED deltacommit also has no entry
+        // in the completion map yet passes `TimelineView::is_committed`, so a mixed
+        // Some/None pair is reachable in production. Ordering by request instant is
+        // what makes that case come out right.
         let log3 = LogFile {
             file_id: "file-0".to_string(),
-            timestamp: "20250113230305000".to_string(),
+            timestamp: "20250113230305000".to_string(), // latest request time
             completion_timestamp: None,
             extension: "log".to_string(),
             version: 1,
@@ -468,24 +475,118 @@ mod tests {
             file_metadata: None,
         };
 
-        // Test ordering: completed files come before uncommitted, ordered by completion time
-        assert!(
-            log1 < log2,
-            "log1 should be before log2 (earlier completion)"
-        );
-        assert!(
-            log1 < log3,
-            "completed log1 should be before uncommitted log3"
-        );
-        assert!(
-            log2 < log3,
-            "completed log2 should be before uncommitted log3"
-        );
+        // Ordering follows request/deltaCommit time (log2 < log1 < log3), NOT completion.
+        assert!(log2 < log1, "order by request instant, not completion");
+        assert!(log1 < log3, "order by request instant, not completion");
+        assert!(log2 < log3, "order by request instant, not completion");
 
-        // Test sorting
+        // Presence/absence of a completion timestamp does not reorder relative to
+        // request instant: log3 (no completion) still sorts last by its request time.
         let mut logs = vec![log3.clone(), log1.clone(), log2.clone()];
         logs.sort();
-        assert_eq!(logs, vec![log1, log2, log3]);
+        assert_eq!(logs, vec![log2, log1, log3]);
+    }
+
+    #[test]
+    fn test_log_file_ordering_matches_java_delta_commit_time() {
+        // Gold parity: `HoodieLogFile.LogFileComparator` orders log files by
+        // deltaCommitTime (the request instant embedded in the file name) →
+        // logVersion → writeToken. It NEVER uses completion time for ordering.
+        //
+        // This exercises the divergence case: two committed v8+ log files whose
+        // completion order is the INVERSE of their delta-commit (request) order,
+        // as happens with concurrent writers that complete out of request order.
+        // The merge sequence must follow delta-commit time, matching the Java
+        // reader — otherwise the last-applied (winning) record differs.
+
+        // Earlier request instant, but COMPLETES later.
+        let earlier_request = LogFile {
+            file_id: "file-0".to_string(),
+            timestamp: "20250113230300000".to_string(), // earlier deltaCommitTime
+            completion_timestamp: Some("20250113230320000".to_string()), // later completion
+            extension: "log".to_string(),
+            version: 1,
+            write_token: "0-188-387".to_string(),
+            file_metadata: None,
+        };
+
+        // Later request instant, but COMPLETES earlier.
+        let later_request = LogFile {
+            file_id: "file-0".to_string(),
+            timestamp: "20250113230310000".to_string(), // later deltaCommitTime
+            completion_timestamp: Some("20250113230315000".to_string()), // earlier completion
+            extension: "log".to_string(),
+            version: 1,
+            write_token: "0-188-387".to_string(),
+            file_metadata: None,
+        };
+
+        assert!(
+            earlier_request < later_request,
+            "log files must order by deltaCommitTime (request instant), like Java's \
+             getLogFileComparator, not by completion timestamp"
+        );
+
+        let mut logs = vec![later_request.clone(), earlier_request.clone()];
+        logs.sort();
+        assert_eq!(
+            logs,
+            vec![earlier_request, later_request],
+            "sorted order must follow deltaCommitTime ascending"
+        );
+    }
+
+    #[test]
+    fn test_log_file_ordering_extension_is_last_tiebreak() {
+        // Gold parity: Java's `getLogFileComparator` uses `suffix` (the `.cdc` marker)
+        // as its 4th and final tiebreak, after deltaCommitTime → version → write_token.
+        // hudi-rs has no `.cdc` parsing yet (`parse_file_name`), so `extension` stands in
+        // for that slot. Its real job here is to keep `Ord` consistent with `Eq`
+        // (`file_name()` includes the extension), so that a `BTreeSet<LogFile>` never
+        // collapses two distinct files that differ only by extension — the failure mode
+        // once `.cdc` suffix support routes `cdc` into `extension`.
+        let base = LogFile {
+            file_id: "file-0".to_string(),
+            timestamp: "20250113230302428".to_string(),
+            completion_timestamp: None,
+            extension: "cdc".to_string(),
+            version: 1,
+            write_token: "0-188-387".to_string(),
+            file_metadata: None,
+        };
+        // Identical to `base` in every ordering key except extension ("cdc" < "log").
+        let log = LogFile {
+            extension: "log".to_string(),
+            ..base.clone()
+        };
+
+        // Extension breaks the tie: "cdc" < "log".
+        assert_eq!(base.cmp(&log), Ordering::Less);
+        // ...and they are NOT equal, so a BTreeSet must keep both.
+        assert_ne!(base, log);
+
+        let mut set = std::collections::BTreeSet::new();
+        set.insert(log.clone());
+        set.insert(base.clone());
+        assert_eq!(set.len(), 2, "distinct extensions must not collapse");
+        // Ordered ascending: the "cdc" extension sorts before "log".
+        assert_eq!(
+            set.into_iter().collect::<Vec<_>>(),
+            vec![base.clone(), log.clone()]
+        );
+
+        // Extension is the LAST tiebreak: a later version outranks the extension
+        // difference even when the extension would otherwise sort first.
+        let log_v2 = LogFile {
+            extension: "log".to_string(),
+            version: 2,
+            ..base.clone()
+        };
+        assert_eq!(
+            base.cmp(&log_v2),
+            Ordering::Less,
+            "version must take precedence over extension"
+        );
     }
 }
 
