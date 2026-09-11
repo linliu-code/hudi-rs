@@ -65,9 +65,18 @@ jobs:
       - name: Install system dependencies
         # librocksdb-sys generates its bindings with bindgen at build time, which
         # needs libclang. The hosted runners ship it; this container does not.
+        #
+        # cmake is an INTERNAL-FORK addition to this list. `cpp/` depends on
+        # `substrait`, which exists on internal `main` and not on `oss/main`, and
+        # whose `protobuf-src` build-dependency compiles protobuf FROM SOURCE with
+        # cmake -- `protobuf-compiler` above installs the binary and does not
+        # satisfy it. Upstream's copy of this job never builds substrait, so it
+        # never needed cmake; measured here as
+        # `failed to execute command: No such file or directory ... is `cmake` not
+        # installed?` from protobuf-src's build script (run 34633465410).
         run: |
           apt-get update
-          apt-get install -y protobuf-compiler clang libclang-dev
+          apt-get install -y protobuf-compiler clang libclang-dev cmake
       - name: Cache dependencies
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -256,6 +265,21 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+
+      # INTERNAL-FORK addition. `make build` and `make develop` each run maturin
+      # over a workspace this fork has grown (cpp/, jni/, jvm-ffi/ and their
+      # dependency closures on top of upstream's), and the ubuntu leg hit
+      # `No space left on device (os error 28)` with `Free space left: 4 MB`
+      # while maturin copied the built library (run 34633465410). The paths
+      # removed are preinstalled toolchains this workflow never uses; the `df`
+      # is deliberate, so a future failure here shows what was actually
+      # available rather than leaving it to be guessed.
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
 
       - name: Install protobuf compiler (Linux)
         if: runner.os == 'Linux'
