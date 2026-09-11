@@ -259,6 +259,20 @@ jobs:
         with:
           key: cpp-ffi
 
+      # This is the heaviest single build in the workflow: hudi-cpp pulls substrait, whose
+      # protobuf-src build-dependency compiles protobuf FROM SOURCE, on top of rocksdb and
+      # datafusion. It exhausted the runner's disk hard enough to kill the runner process itself
+      # ("System.IO.IOException: No space left on device" writing the runner's own diagnostic
+      # log), which reports as a bare job failure with no step logs at all. Unlike rust-tests
+      # this job is not containerised, so it CAN reclaim the host's preinstalled toolchains --
+      # the same step python-tests uses. df is printed either way so the next failure here names
+      # what was available.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
       # protobuf-compiler: lance-encoding/lance-file build prost. clang/libclang: librocksdb-sys
       # generates its bindings with bindgen at build time. cmake/build-essential: the cxx bridge
       # needs a C++ toolchain -- ubuntu-latest ships one, installed defensively in case the image
@@ -282,6 +296,10 @@ jobs:
       # way and keeps the two sides' invocation identical.
       - name: cargo test -p hudi-cpp
         run: cargo test --no-fail-fast -p hudi-cpp --lib --tests
+
+      - name: Disk after
+        if: always()
+        run: df -h /
 
   rust-tests-windows:
     runs-on: windows-2025
