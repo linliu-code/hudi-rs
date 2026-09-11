@@ -17,20 +17,14 @@
  * under the License.
  */
 
-//! **Phase 1 note.** These types live in the cpp crate, not hudi-core,
-//! because OSS core has no provider seam yet. The cxx ABI still carries the
-//! provider handle so velox needs no changes, but nothing is handed to core --
-//! base files take core's own object-store read, which is the documented
-//! fallback. Phase 2 moves this file into hudi-core and wires it up.
-
 //! Injectable base-file data provider — an interface for serving base-file
 //! data from an alternative source instead of the object-store read.
 //!
 //! hudi-rs defines this trait and calls it; it does **not** implement it and has
 //! no dependency on any particular source. A downstream crate provides a
 //! concrete [`BaseFileDataProvider`] and injects it via
-//! `with_base_file_provider`. The composition
-//! root that constructs the provider (the native FFI bridge) is the only place
+//! [`HoodieFileGroupReaderBuilder::with_base_file_provider`](super::engine::HoodieFileGroupReaderBuilder::with_base_file_provider).
+//! The composition root that constructs the provider (the native FFI bridge) is the only place
 //! that names both hudi-rs and the concrete source — so this file, and hudi-core
 //! as a whole, name no source at all.
 //!
@@ -49,10 +43,10 @@ use std::sync::Arc;
 ///
 /// hudi-core neither produces nor interprets these beyond summing them across
 /// the base files of a read; a provider fills in whatever it tracks and leaves
-/// the rest zero. In this crate they are surfaced to backends (e.g. the Gluten
-/// JNI metrics bridge) as the `base_file_provider_stats` getter on the cxx
-/// bridge's `HoodieFileGroupReader` — plain text, not a rustdoc link, because
-/// neither the `mod ffi` bridge block nor the method backing it is public.
+/// the rest zero. Surfaced to backends (e.g. the Gluten JNI metrics bridge) via
+/// [`HoodieReadStats::base_file_provider`](super::read_stats::HoodieReadStats::base_file_provider)
+/// and, while a stream is still draining, through
+/// [`HoodieFileGroupReader::base_file_provider_live_stats`](super::engine::HoodieFileGroupReader::base_file_provider_live_stats).
 /// The field set is intentionally generic — no wire/protocol type of any
 /// concrete provider leaks here.
 ///
@@ -139,10 +133,10 @@ pub struct BaseFileDataRequest<'a> {
     pub projected_schema: &'a SchemaRef,
     /// Whether it is safe to apply a pushed predicate to this file: true when the
     /// split has no log files (nothing merges, so the base rows are final) or the
-    /// predicate is primary-key-safe. See
-    /// `HoodieFileGroupReader::base_read_pushdown_is_safe` — ENG-47506 replaced the
-    /// former table-type check, so this is now true for a MOR slice with no log
-    /// files where it previously was not. A provider that pushes a predicate must
+    /// predicate is primary-key-safe — the same gate the reader applies to its own
+    /// parquet `RowFilter` pushdown
+    /// (`HoodieFileGroupReader::base_read_pushdown_is_safe`). A provider that
+    /// pushes a predicate must
     /// honor this: when `false`, serve unfiltered so a post-merge filter can apply
     /// it.
     pub can_push_predicate: bool,
@@ -159,8 +153,11 @@ pub struct BaseFileDataRequest<'a> {
 /// read.
 ///
 /// Implemented downstream (never in hudi-core) and injected via
-/// `with_base_file_provider`. Called once per
-/// base file, before the object-store read. Implementations must map any
+/// [`HoodieFileGroupReaderBuilder::with_base_file_provider`](super::engine::HoodieFileGroupReaderBuilder::with_base_file_provider).
+/// Called once per base file **the read opens**, before the object-store read.
+/// A base file the instant range excludes is settled before any read is set up
+/// and is never offered, so a provider's `files_served + storage_fallbacks` is a
+/// count of files read, not of files in the split. Implementations must map any
 /// internal error to `None` — a provider failure is never allowed to fail the
 /// read.
 #[async_trait]
@@ -175,21 +172,37 @@ pub trait BaseFileDataProvider: Send + Sync {
     /// fills versus which hudi-core fills during drain).
     ///
     /// ## Streaming / threading contract
-    /// The returned reader is consumed lazily inside the merge loop, so the whole
-    /// served file never needs to be resident at once. On OSS, that merge loop is
-    /// driven by `next_chunk().await`, itself invoked from inside
-    /// `OBJECT_STORE_RUNTIME.block_on(...)` — so a tokio `Handle` is current
-    /// wherever `RecordBatchReader::next` runs. A provider whose `next` calls
-    /// `block_on` (e.g. to drive an async fetch) will therefore panic on nested
-    /// re-entry, and a panic unwinding across the FFI boundary is undefined
-    /// behavior. A Phase-2 provider must not `block_on` inside `next()`; hand the
-    /// async work off via a channel or `spawn_blocking` instead. The reader must
-    /// be `Send` so it can move from this async method into that driver.
+    /// The returned reader is consumed lazily rather than drained here, so the
+    /// whole served file never needs to be resident at once. hudi-core moves it
+    /// onto **one** `spawn_blocking` task that owns it for its whole life and
+    /// feeds the merge over a depth-1 channel. Three consequences an
+    /// implementation may rely on:
+    ///
+    /// - **`next()` may block.** It runs on tokio's blocking pool, never on a
+    ///   runtime worker, so blocking on IO cannot stall the executor driving the
+    ///   rest of the read.
+    /// - **`next()` may call `block_on`** on the runtime driving the read. A
+    ///   blocking-pool thread has that runtime's *handle* set (`Handle::enter`)
+    ///   but is not "entered" in the sense `Handle::block_on` refuses, so nested
+    ///   `block_on` there does not panic. (Do not rely on this from a runtime
+    ///   worker — that is where it does panic, and a panic unwinding across the
+    ///   FFI boundary is undefined behavior.)
+    /// - **Every `next()` runs on the same thread**, so a thread-local arena or
+    ///   a thread-bound connection is safe to hold across batches.
+    ///
+    /// The one thing to know in the other direction: the reader is pulled **up to
+    /// two batches ahead** of the merge (one buffered, one blocked on send), so a
+    /// read that ends early may have paid for two batches nobody consumed.
+    /// `next()` must therefore be free of side effects the caller would not want
+    /// on a cancelled read.
+    ///
+    /// The reader must be `Send` + `'static` so it can move from this async
+    /// method onto that task.
     async fn try_base_file(
         &self,
         req: BaseFileDataRequest<'_>,
     ) -> (
-        Option<Box<dyn RecordBatchReader + Send>>,
+        Option<Box<dyn RecordBatchReader + Send + 'static>>,
         BaseFileProviderStats,
     );
 }

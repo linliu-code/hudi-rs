@@ -104,4 +104,18 @@ pub struct HoodieReadStats {
     /// source-batch eviction, so a benchmark can confirm the in-memory
     /// footprint stayed within budget while the rest spilled.
     pub merge_map_peak_in_memory_bytes: u64,
+
+    // ── Base-file data provider (injected) ───────────────────────────────
+    /// Client-side counters for base files served by an injected
+    /// [`BaseFileDataProvider`](super::base_file_provider::BaseFileDataProvider),
+    /// summed across the read's base files. `None` when no provider is injected,
+    /// so the provider concept adds no cost to the default (OSS) read path.
+    ///
+    /// Complete after [`HoodieFileGroupReader::read`](super::engine::HoodieFileGroupReader::read).
+    /// After [`open`](super::engine::HoodieFileGroupReader::open) the drain
+    /// counters are still filling in as the caller pulls the stream, so read them
+    /// from
+    /// [`base_file_provider_live_stats`](super::engine::HoodieFileGroupReader::base_file_provider_live_stats)
+    /// instead — the same slot this field is a snapshot of.
+    pub base_file_provider: Option<super::base_file_provider::BaseFileProviderStats>,
 }

@@ -16,7 +16,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-pub mod base_file_provider;
 pub mod blocking_merge_stream;
 pub mod context;
 pub mod provider_abi;
@@ -25,7 +24,6 @@ mod util;
 /// Re-export core types for integration tests and downstream consumers.
 pub use hudi_dep as hudi_core;
 
-use crate::base_file_provider::{BaseFileDataProviderRef, BaseFileProviderStats};
 use crate::blocking_merge_stream::BlockingMergeStream;
 use crate::context::FileGroupReaderContext;
 use crate::util::{create_raw_pointer_for_record_batch_reader, free_arrow_stream};
@@ -36,6 +34,7 @@ use hudi_dep::config::table::HudiTableConfig;
 use hudi_dep::config::util::split_hudi_options_from_others;
 use hudi_dep::ffi_support::InstantRange;
 use hudi_dep::ffi_support::OBJECT_STORE_RUNTIME;
+use hudi_dep::ffi_support::{BaseFileDataProviderRef, BaseFileProviderStats};
 use hudi_dep::ffi_support::{
     CompletionGateInputs, FileGroupReaderSchemaHandler,
     HoodieFileGroupReader as CoreFileGroupReader, InputSplit, ReaderContext, ReaderParameters,
@@ -235,7 +234,7 @@ mod ffi {
 
     /// Base-file provider read counters for one file group, returned to the
     /// C++ consumer (Velox `HudiSplitReader`) after the merged stream is drained.
-    /// Maps onto `crate::base_file_provider::BaseFileProviderStats`
+    /// Maps onto `hudi_dep::ffi_support::BaseFileProviderStats`
     /// field-for-field (all `u64`, FFI-safe); the consumer maps these onto its
     /// operator stats keys.
     #[derive(Default)]

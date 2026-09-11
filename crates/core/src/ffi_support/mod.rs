@@ -35,6 +35,9 @@ const SCHEMA_BATCH_SIZE: usize = 1024;
 
 pub use crate::file_group::base_file::reader::KeyPredicate;
 pub use crate::file_group::reader_v2::MAX_INSTANT_TIME;
+pub use crate::file_group::reader_v2::base_file_provider::{
+    BaseFileDataProvider, BaseFileDataProviderRef, BaseFileDataRequest, BaseFileProviderStats,
+};
 pub use crate::file_group::reader_v2::engine::HoodieFileGroupReader;
 pub use crate::file_group::reader_v2::input_split::InputSplit;
 pub use crate::file_group::reader_v2::merge_iterator::{
