@@ -879,6 +879,9 @@ mod tests {
             .decode_avro_record_content(buf.as_slice(), &header)
             .expect("a producer-named writer schema must decode against a table-named reader");
 
+        // The row COUNT first: inspecting column(0).value(0) alone passes for a
+        // decode that also emits a spurious extra row.
+        assert_eq!(batches.num_data_rows(), 1);
         let col = batches.data_batches[0]
             .column(0)
             .as_any()
@@ -917,6 +920,7 @@ mod tests {
             .decode_avro_record_content(buf.as_slice(), &header)
             .expect("an unqualified producer record name must decode too");
 
+        assert_eq!(batches.num_data_rows(), 1);
         let col = batches.data_batches[0]
             .column(0)
             .as_any()

@@ -1097,6 +1097,42 @@ mod tests {
         );
     }
 
+    /// The same property on the EAGER (no-merge) arm — CoW, or a file group with
+    /// no log files. A read that truncates silently on an I/O error presents a
+    /// short result as a complete one, which is the worst failure this path can
+    /// produce, and the eager arm is the one most reads take.
+    ///
+    /// No eager test could reach this before: every one of them is built with
+    /// `new_eager_from_vec`, whose body is `stream::iter(batches.map(Ok))` — it
+    /// maps every item to `Ok`, so an `Err` cannot occur. Hence `new_eager` +
+    /// `base_of` here rather than the usual convenience wrapper.
+    #[test]
+    fn eager_base_source_error_surfaces_rather_than_truncating() {
+        let schema = small_schema();
+        let base = base_of(vec![
+            Ok(batch(schema.clone(), &["a"], &[1])),
+            Err(CoreError::ReadFileSliceError("base read blew up".into())),
+        ]);
+        let it = FileGroupMergeStream::new_eager(base, schema, None, new_stream_stats_handle());
+        let chunks = drain(it);
+        assert_eq!(
+            rows(&chunks[0].as_ref().unwrap().clone()),
+            vec![("a".to_string(), 1)],
+            "the batch read before the failure still comes through"
+        );
+        match chunks.get(1) {
+            Some(Err(e)) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("base read blew up"),
+                    "the source's own error must reach the caller, got: {msg}"
+                );
+            }
+            other => panic!("expected the base source error to surface, got {other:?}"),
+        }
+        assert_eq!(chunks.len(), 2, "the stream stops after the error");
+    }
+
     /// A base source that fails mid-read surfaces the failure. The rows already
     /// emitted make a truncated read look like a short but successful one, so
     /// swallowing the error here would report partial data as complete - the

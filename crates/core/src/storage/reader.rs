@@ -649,5 +649,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&content[..], &expected[1000..1256]);
+
+        // A fetch starting at offset 0 is a distinct arithmetic case from a
+        // mid-file range: an underflow guard or a `start.max(1)` only shows at the
+        // boundary. Taken from a second fetcher, which also pins that fetchers read
+        // independently rather than sharing a cursor.
+        let head = reader.block_fetcher().read_content(0, 16).await.unwrap();
+        assert_eq!(&head[..], &expected[0..16]);
     }
 }

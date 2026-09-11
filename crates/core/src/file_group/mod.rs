@@ -618,6 +618,10 @@ mod tests {
         );
         fg1.add_log_file(log).unwrap();
 
+        // How MANY slices, before looking at any one of them: every other assertion
+        // here is a lookup by key, so an association bug that ALSO creates a third
+        // slice would pass untouched.
+        assert_eq!(fg1.file_slices.len(), 2);
         let slice = fg1.get_file_slice_as_of("20250113230050000").unwrap();
         assert!(slice.base_file.is_none());
         assert_eq!(slice.log_files.len(), 1);
@@ -638,6 +642,7 @@ mod tests {
         );
         fg2.add_log_file(log).unwrap();
 
+        assert_eq!(fg2.file_slices.len(), 1);
         let slice = fg2.get_file_slice_as_of("20250113230000010").unwrap();
         assert!(slice.base_file.is_none());
         assert_eq!(slice.file_id(), "file-id-0");
@@ -826,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_group_v6_log_file_no_suitable_slice_error() {
+    fn test_file_group_v6_log_file_creates_log_only_slice() {
         // V6 table: log file without completion_timestamp
         let mut fg = FileGroup::new("file-id-0".to_string(), "partition1".to_string());
         let base = create_base_file_with_completion("file-id-0", "20240101130000000", None);
@@ -838,6 +843,9 @@ mod tests {
         let log_file = create_log_file_with_completion("file-id-0", "20240101120000000", None, 1);
         fg.add_log_file(log_file).unwrap();
 
+        // Same reason as the v8 twin above: the lookups below cannot see a
+        // spurious THIRD slice, only the count can.
+        assert_eq!(fg.file_slices.len(), 2);
         let slice = fg.get_file_slice_as_of("20240101120000000").unwrap();
         assert!(
             slice.base_file.is_none(),

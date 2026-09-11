@@ -229,6 +229,10 @@ mod tests {
             view.get_completion_time("20240101120000000"),
             Some("20240101120005000")
         );
+        // Membership is a separate question from the completion map, and the
+        // view's OWN as-of instant is the one a map assertion cannot speak for.
+        assert!(view.is_committed("20240101120000000"));
+        assert!(view.is_committed("20240101130000000"));
     }
 
     #[test]
@@ -250,8 +254,10 @@ mod tests {
         assert_eq!(view.as_of_timestamp(), "20240101130000000");
         // Layout v1 tracks no completion times...
         assert!(view.get_completion_time("20240101120000000").is_none());
-        // ...but must still know the commit completed.
+        // ...but must still know the commit completed — including the view's own
+        // as-of instant, which is the one the caller reads the view for.
         assert!(view.is_committed("20240101120000000"));
+        assert!(view.is_committed("20240101130000000"));
     }
 
     #[test]

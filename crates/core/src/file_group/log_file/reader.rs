@@ -1029,6 +1029,21 @@ mod tests {
             LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
         let mut blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
 
+        // How many blocks the sweep found, before touching one: a truncation
+        // detector that also loses a block would still produce the error asserted
+        // below, and this test would still pass.
+        assert_eq!(blocks.len(), 1, "the fixture holds exactly one block");
+
+        // And that the fixture decodes AT ALL before it is damaged — otherwise the
+        // error below could be surfacing for some entirely unrelated reason.
+        let mut good = blocks[0].clone();
+        good.load_content(&Decoder::new(hudi_configs.clone()))
+            .await?;
+        assert!(
+            good.record_batches().is_some(),
+            "the undamaged block must decode, or the error below proves nothing"
+        );
+
         let block = blocks.last_mut().expect("the fixture has a block to walk");
         assert!(
             block.resident_content.is_none(),
@@ -1452,6 +1467,76 @@ mod tests {
     /// both carry the same instant time, so a window below it skips both — the
     /// walk then has to reach the end cleanly rather than find garbage where the
     /// second magic should be.
+    /// Recovery from a corrupt block that sits at a NONZERO offset.
+    ///
+    /// `scan_for_next_block_offset(from_pos)` starts its scan at
+    /// `from_pos + MAGIC.len()`, and `from_pos` enters the arithmetic in that one
+    /// place. Every other test of that function passes 0 — the four variants of
+    /// `test_corrupt_recovery_scan_finds_a_magic_split_across_windows` all do,
+    /// because `corrupt_then_good_file` puts the damage at byte 0 — and with
+    /// `from_pos == 0` the resume term is indistinguishable from a bug that drops it
+    /// (`MAGIC.len()` either way). Production only ever calls it from
+    /// `create_corrupted_block(magic_pos)`, where a nonzero `magic_pos` is the
+    /// ordinary case: damage anywhere but the very start of the file.
+    ///
+    /// Getting the resume wrong skips or re-reads a block span after damage, which
+    /// is silent — the walk still returns blocks, just not the right ones.
+    #[tokio::test]
+    async fn test_corrupt_recovery_resumes_from_a_nonzero_offset() -> Result<()> {
+        // good | corrupt (MAGIC + a length no file can hold + garbage) | good
+        let first = a_valid_command_block("20250101000000000");
+        let corrupt_at = first.len() as u64;
+        let mut bytes = first;
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&9_999_999u64.to_be_bytes());
+        bytes.extend_from_slice(&[9, 9, 9, 9]);
+        let good_at = bytes.len() as u64;
+        bytes.extend_from_slice(&a_valid_command_block("20250102000000000"));
+
+        assert!(
+            corrupt_at > 0,
+            "the damage must NOT be at offset 0, or this repeats the existing tests"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file_name = "corrupt-middle.log.1_0-0-0".to_string();
+        std::fs::write(tmp.path().join(&file_name), &bytes).unwrap();
+
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+
+        // The scan itself, asked to resume from the corrupt block's own offset.
+        // It must not hand that same magic back, and must land exactly on the good
+        // block's magic rather than on EOF.
+        let mut scanner =
+            LogFileReader::new_streaming(hudi_configs.clone(), storage.clone(), &file_name).await?;
+        assert_eq!(
+            scanner.scan_for_next_block_offset(corrupt_at).await?,
+            good_at,
+            "recovery from a nonzero offset must land on the following block's magic"
+        );
+
+        // ...and the whole walk therefore reports good, corrupt, good — with the
+        // block AFTER the damage still carrying its own instant time, which is what
+        // proves the reader resumed at the right byte rather than at a plausible one.
+        let mut reader = LogFileReader::new_streaming(hudi_configs, storage, &file_name).await?;
+        let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|b| b.block_type.clone())
+                .collect::<Vec<_>>(),
+            vec![BlockType::Command, BlockType::Corrupted, BlockType::Command],
+        );
+        assert_eq!(blocks[0].instant_time()?, "20250101000000000");
+        assert_eq!(
+            blocks[2].instant_time()?,
+            "20250102000000000",
+            "the block recovered from a nonzero-offset corruption must be the right one"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_skipping_a_block_lands_on_the_next_ones_magic() -> Result<()> {
         let (dir, file_name) = get_valid_log_avro_data();
@@ -1634,6 +1719,40 @@ mod tests {
         Ok(())
     }
 
+    /// The metadata-only sweep must parse a rollback command block's HEADERS, not
+    /// merely notice that a Command block is there.
+    ///
+    /// The eager path already pins all of this (`test_read_log_file_with_rollback_block`),
+    /// and the branch ships a `test_lazy_sweep_matches_eager_for_*` family claiming the
+    /// two paths agree — for DATA blocks. For command-block headers that claim was
+    /// unpinned, and the only sweep-path statement about a command block anywhere was
+    /// `blocks.iter().any(|b| b.block_type == BlockType::Command)` inside
+    /// `test_load_content_is_idempotent_for_every_block_type`, where it is a
+    /// precondition for a different subject.
+    ///
+    /// A sweep that misreads a rollback merges rolled-back records back in.
+    #[tokio::test]
+    async fn test_metadata_only_sweep_parses_rollback_command_block_headers() -> Result<()> {
+        let (dir, file_name) = get_valid_log_rollback();
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(&dir)?)?;
+        let mut reader = LogFileReader::new_streaming(hudi_configs, storage, &file_name).await?;
+
+        let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
+        assert_eq!(blocks.len(), 1, "expected one rollback command block");
+
+        let block = &blocks[0];
+        assert_eq!(block.block_type, BlockType::Command);
+        assert!(block.is_rollback_block());
+        // The two header values the eager path asserts, and the pair a mis-parsed
+        // sweep gets wrong: WHICH instant is being rolled back, and that the command
+        // really is a rollback rather than some other command ordinal.
+        assert_eq!(block.instant_time()?, "20250126040936578");
+        assert_eq!(block.target_instant_time()?, "20250126040826878");
+        assert_eq!(block.command_block_type()?, CommandBlock::Rollback);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_skip_out_of_range_block_fast_path() -> Result<()> {
         // use a file with a single data block
@@ -1730,6 +1849,14 @@ mod tests {
             .read_all_blocks(&InstantRange::up_to("99991231235959999", "utc"))
             .await
             .expect_err("a metadata value overrunning its block must be refused");
+        // The VARIANT, because that is what callers match on: a refactor that
+        // returns a different error with similar wording keeps the message
+        // assertion below green. Kept alongside it rather than instead of it —
+        // naming the bound that rejected the read is a separate claim.
+        assert!(
+            matches!(err, CoreError::LogFormatError(_)),
+            "expected LogFormatError, got {err:?}"
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("exceeds block length"),
