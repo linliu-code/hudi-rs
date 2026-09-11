@@ -1460,13 +1460,6 @@ mod tests {
         Ok(())
     }
 
-    /// Skipping a block has to land exactly on the next block's magic. On a
-    /// one-block file it cannot: landing anywhere in the last few bytes reads as
-    /// end-of-file either way, so the arithmetic is only pinned when another
-    /// block follows. Two copies of a fixture is a valid two-block file, and
-    /// both carry the same instant time, so a window below it skips both — the
-    /// walk then has to reach the end cleanly rather than find garbage where the
-    /// second magic should be.
     /// Recovery from a corrupt block that sits at a NONZERO offset.
     ///
     /// `scan_for_next_block_offset(from_pos)` starts its scan at
@@ -1493,6 +1486,10 @@ mod tests {
         let good_at = bytes.len() as u64;
         bytes.extend_from_slice(&a_valid_command_block("20250102000000000"));
 
+        // A fixture guard, not a behavioural assertion: it cannot fail while
+        // `a_valid_command_block` emits a non-empty block. It is here so that an
+        // edit which shrinks the fixture to nothing cannot silently turn this
+        // test back into a duplicate of the from_pos == 0 cases.
         assert!(
             corrupt_at > 0,
             "the damage must NOT be at offset 0, or this repeats the existing tests"
@@ -1537,6 +1534,13 @@ mod tests {
         Ok(())
     }
 
+    /// Skipping a block has to land exactly on the next block's magic. On a
+    /// one-block file it cannot: landing anywhere in the last few bytes reads as
+    /// end-of-file either way, so the arithmetic is only pinned when another
+    /// block follows. Two copies of a fixture is a valid two-block file, and
+    /// both carry the same instant time, so a window below it skips both — the
+    /// walk then has to reach the end cleanly rather than find garbage where the
+    /// second magic should be.
     #[tokio::test]
     async fn test_skipping_a_block_lands_on_the_next_ones_magic() -> Result<()> {
         let (dir, file_name) = get_valid_log_avro_data();
@@ -1744,9 +1748,10 @@ mod tests {
         let block = &blocks[0];
         assert_eq!(block.block_type, BlockType::Command);
         assert!(block.is_rollback_block());
-        // The two header values the eager path asserts, and the pair a mis-parsed
-        // sweep gets wrong: WHICH instant is being rolled back, and that the command
-        // really is a rollback rather than some other command ordinal.
+        // The header values the eager path asserts, and the ones a mis-parsed sweep
+        // gets wrong: which instant this block belongs to, WHICH instant is being
+        // rolled back, and that the command really is a rollback rather than some
+        // other command ordinal.
         assert_eq!(block.instant_time()?, "20250126040936578");
         assert_eq!(block.target_instant_time()?, "20250126040826878");
         assert_eq!(block.command_block_type()?, CommandBlock::Rollback);

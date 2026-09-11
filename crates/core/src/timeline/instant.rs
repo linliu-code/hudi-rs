@@ -711,7 +711,10 @@ mod tests {
                 "short timestamp {bad:?} must error, not panic"
             );
         }
-        assert!(Instant::parse_datetime("20260710235017", "UTC").is_ok());
+        // The positive control for this guard lives with the malformed-14-char case in
+        // `test_parse_datetime_malformed_14_char_still_errors`, where a blanket 14-char
+        // rejection is the regression it exists to catch. Repeating it here would be a
+        // second copy of one assertion.
     }
 
     #[test]
