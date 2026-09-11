@@ -267,9 +267,9 @@ impl FileGroup {
         Ok(self)
     }
 
-    /// Add multiple [LogFile]s to the corresponding [FileSlice]s in the [FileGroup].
-    /// Add several [LogFile]s, in the order [`add_log_file`](Self::add_log_file)
-    /// needs rather than the order they arrive in.
+    /// Add several [LogFile]s to the corresponding [FileSlice]s in the [FileGroup], in
+    /// the order [`add_log_file`](Self::add_log_file) needs rather than the order they
+    /// arrive in.
     ///
     /// Placement consults the slices already present, so a log file added before
     /// an earlier one finds nothing to attach to and starts a slice of its own.
@@ -278,25 +278,30 @@ impl FileGroup {
     /// remember: getting it wrong splits a log-only file group in two, and a
     /// read as of an instant then sees only the later half.
     ///
-    /// [`LogFile`]'s own ordering is the right one, and since `m7.3` it is the right
-    /// one for a second reason. It keys on the request instant (deltaCommitTime), so
+    /// [`LogFile`]'s own ordering is the right one to sort by, and since `m7.3` it is
+    /// right for a second reason. It keys on the request instant (deltaCommitTime), so
     /// the files arrive oldest-request-first and the log-only slice is keyed by the
-    /// EARLIEST request instant in the group — whereupon every later file's completion
-    /// time is `>=` that key (a commit completes no earlier than it was requested), so
-    /// each one attaches to that slice instead of starting another.
+    /// EARLIEST request instant in the group. Every later file then attaches to that
+    /// slice instead of starting another, by whichever of the two lookups below applies:
+    /// a completed file compares its completion time, which is `>=` its own request
+    /// instant and so `>=` the key (a commit completes no earlier than it was
+    /// requested); a file with no completion timestamp compares its request instant
+    /// directly, likewise `>=` the key.
     ///
-    /// This is also what Java does at the same point:
-    /// `AbstractTableFileSystemView.addLogFile` feeds
-    /// `logFiles.stream().sorted(HoodieLogFile.getLogFileComparator())`, the same
-    /// forward deltaCommitTime order.
+    /// Java sorts the same way at the same point:
+    /// `AbstractTableFileSystemView.buildFileGroups` feeds
+    /// `logFiles.stream().sorted(HoodieLogFile.getLogFileComparator())`
+    /// (`AbstractTableFileSystemView.java:253`) into
+    /// `HoodieFileGroup.addLogFile(completionTimeQueryView, logFile)`
+    /// (`HoodieFileGroup.java:138`) — the same forward deltaCommitTime order.
     ///
-    /// It did NOT key on completion time before `m7.3` in a way that was safe here:
-    /// with completions out of request order the first-processed file could be a LATER
+    /// The way it keyed on completion time before `m7.3` was NOT safe here. With
+    /// completions out of request order the first-processed file could be a LATER
     /// request, so the slice was keyed later than the group's earliest deltacommit and
     /// a read as of an instant between the two saw nothing. And a file with no
-    /// completion timestamp sorted after every completed one, which split an archived
-    /// deltacommit into a slice of its own. Both are pinned by
-    /// `test_add_log_files_keys_the_slice_by_the_earliest_request_instant`.
+    /// completion timestamp sorted after every completed one, so an archived
+    /// deltacommit was processed last and started a slice of its own. Both are pinned
+    /// by `test_add_log_files_keys_the_slice_by_the_earliest_request_instant`.
     pub fn add_log_files<I>(&mut self, log_files: I) -> Result<&Self>
     where
         I: IntoIterator<Item = LogFile>,
@@ -575,8 +580,9 @@ mod tests {
     ///    t1. Request order keys it t1.
     /// 2. **An archived file, carrying no completion timestamp.** The old ordering
     ///    sorted every `None` after every `Some`, so the archived (oldest) file was
-    ///    processed last and, finding no slice at or below its own completion time,
-    ///    started a second one — splitting one file group's records across two slices.
+    ///    processed last and, finding no slice at or below its own REQUEST instant (it
+    ///    has no completion time — that is what makes it take this branch), started a
+    ///    second one, splitting one file group's records across two slices.
     #[test]
     fn test_add_log_files_keys_the_slice_by_the_earliest_request_instant() {
         const FILE_ID: &str = "7483a08a-02f1-4510-bc1d-1317924f4189-0";

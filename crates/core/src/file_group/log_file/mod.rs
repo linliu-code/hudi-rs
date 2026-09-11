@@ -50,10 +50,16 @@ pub mod scanner;
 ///
 /// Two further keys, `extension` then `file_id`, follow. They are **not** gold keys (Java's
 /// 4th key is the `.cdc` `suffix`, a field hudi-rs does not parse yet, and Java never
-/// compares `fileId` at all). They exist so that [Ord] is consistent with [PartialEq],
-/// which compares the whole `file_name()` — without them two distinct files can compare
-/// `Equal` and one is silently dropped from a `BTreeSet<LogFile>`. Neither can reorder
-/// anything the gold orders: they only separate files the first three keys tie.
+/// compares `fileId` at all). They exist so that **no two files with distinct `file_name()`
+/// fields compare `Equal`** — the key set now covers every field `file_name()` interpolates,
+/// so a `BTreeSet<LogFile>` cannot silently drop one of them. Neither can reorder anything
+/// the gold orders: they only separate files the first three keys tie.
+///
+/// The converse of that guarantee does NOT hold, and is not this type's to fix: [PartialEq]
+/// compares the *formatted* `file_name()`, which is lossy across the `_` separators, so two
+/// different field-sets can render one name and compare `Equal` while `cmp` says otherwise
+/// (`{file_id: "a", timestamp: "b_c"}` and `{file_id: "a_b", timestamp: "c"}`). Unreachable
+/// through `parse_file_name`, which splits on the first `_`, but the fields are `pub`.
 #[derive(Clone, Debug)]
 pub struct LogFile {
     pub file_id: String,
@@ -551,14 +557,15 @@ mod tests {
     }
 
     #[test]
-    fn test_log_file_ordering_extension_is_last_tiebreak() {
-        // Gold parity: Java's `getLogFileComparator` uses `suffix` (the `.cdc` marker)
-        // as its 4th and final tiebreak, after deltaCommitTime → version → write_token.
-        // hudi-rs has no `.cdc` parsing yet (`parse_file_name`), so `extension` stands in
-        // for that slot. Its real job here is to keep `Ord` consistent with `Eq`
-        // (`file_name()` includes the extension), so that a `BTreeSet<LogFile>` never
-        // collapses two distinct files that differ only by extension — the failure mode
-        // once `.cdc` suffix support routes `cdc` into `extension`.
+    fn test_log_file_ordering_tiebreaks_are_extension_then_file_id() {
+        // `extension` and `file_id` are hudi-rs's OWN keys, not the gold's — Java's 4th
+        // key is `getSuffix()`, the `.cdc` marker, which hudi-rs does not parse, and Java
+        // never compares `fileId` at all (see `impl Ord`). They exist so that `Ord` agrees
+        // with `Eq`, which compares the whole `file_name()`: without them two distinct
+        // files can compare `Equal` and a `BTreeSet<LogFile>` silently drops one.
+        //
+        // This test pins their presence AND their relative order, which is the part a
+        // key-drop mutation cannot see.
         let base = LogFile {
             file_id: "file-0".to_string(),
             timestamp: "20250113230302428".to_string(),

@@ -89,7 +89,10 @@ impl InputSplit {
             .collect()
     }
 
-    /// Sort log file paths ascending by deltaCommitTime → logVersion → writeToken.
+    /// Sort log file paths ascending by deltaCommitTime → logVersion → writeToken —
+    /// the gold's three keys, which are the only ones that can fire here: an input
+    /// split is one file group (so [`LogFile`]'s `file_id` tiebreak is constant) and
+    /// `.cdc` paths are filtered out below (so its `extension` tiebreak is too).
     ///
     /// Mirrors Java's `InputSplit` constructor which sorts via
     /// `HoodieLogFile.getLogFileComparator()`.
