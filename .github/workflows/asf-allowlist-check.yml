@@ -38,7 +38,18 @@ permissions:
   contents: read
 
 jobs:
+  # UPSTREAM ONLY. The allowlist this action checks against is ASF infrastructure policy and is
+  # enforced only on ASF-hosted repositories; on this fork the action reports, but nothing acts
+  # on the report. It is also red here BY CONSTRUCTION and permanently so: the internal-only
+  # jni-native.yml uses `aws-actions/configure-aws-credentials@v4` to assume the org's publisher
+  # role, an action the ASF will not allowlist and which that workflow cannot do without.
+  #
+  # The file is kept, unmodified apart from this condition, rather than deleted: its value is
+  # for code on its way UPSTREAM, where the failure mode it guards ("Startup failure", no logs,
+  # no check reported, PR looks green) is real. Deleting it would have made an inconvenient red
+  # disappear and silently dropped a capability; this states the reason in the file instead.
   asf-allowlist-check:
+    if: github.repository == 'apache/hudi-rs'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
