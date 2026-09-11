@@ -4282,6 +4282,20 @@ mod tests {
     /// fill the FFI-observable slot only as batches are pulled, not up front.
     /// That is the memory contract — the whole served file is never resident at
     /// serve time — and a counter populated early is the symptom of losing it.
+    ///
+    /// The pre-drain bound is `<= 3`, not `== 0`, and the difference is a real
+    /// flake this milestone had to fix rather than a weakening. `== 0` assumes
+    /// the producer has not been scheduled yet, which nothing guarantees: the
+    /// task runs concurrently and legitimately pulls up to three batches before
+    /// parking (one delivered, one buffered in the depth-1 channel, one blocked
+    /// in `blocking_send` — the bound
+    /// `a_served_reader_runs_two_batches_ahead_and_no_further` pins structurally).
+    /// Under full-suite load it does, and the inherited assertion failed there —
+    /// intermittently, which is worse than failing.
+    ///
+    /// FIVE served batches rather than two, so the bound is meaningful: with two,
+    /// "at most three" is vacuous. What the test now says is the contract — the
+    /// source is not drained up front — instead of a timing accident.
     #[tokio::test(flavor = "multi_thread")]
     async fn base_file_provider_served_source_is_lazy_and_counts_on_drain() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4289,35 +4303,49 @@ mod tests {
         let base_name = "f1-0_0-1-1_001.parquet";
         write_parquet_file(tmp.path(), base_name, &on_disk);
 
-        // Two served batches so `batches_received` is meaningfully > 1.
-        let (_, b1) = id_batch(vec![7, 8]);
-        let (_, b2) = id_batch(vec![9]);
-        let provider = StubDataProvider::serving(vec![b1, b2]);
+        // Five served batches, so "at most three pulled before a drain" is a real
+        // bound rather than a restatement of the batch count.
+        let served: Vec<RecordBatch> = [vec![7, 8], vec![9], vec![10], vec![11], vec![12]]
+            .into_iter()
+            .map(|v| id_batch(v).1)
+            .collect();
+        let provider = StubDataProvider::serving(served);
         let mut reader =
             reader_with_provider(tmp.path(), base_name, schema.clone(), provider).await;
 
         let live = reader.base_file_provider_live_stats();
         let source = reader.base_file_source().await.unwrap();
 
-        // Setup counter seeded at serve time; drain counters still zero because
-        // the lazy source has not been pulled yet.
+        // Setup counter seeded at serve time; the drain counters may have moved,
+        // but only as far as the read-ahead allows.
         {
             let s = live.lock().unwrap();
             assert_eq!(s.files_served, 1, "setup counter seeded before drain");
-            assert_eq!(s.batches_received, 0, "no batches drained yet");
-            assert_eq!(s.rows_served, 0, "no rows drained yet");
+            assert!(
+                s.batches_received <= 3,
+                "the source must not be drained up front — at most one delivered, \
+                 one buffered and one blocked in send before the merge pulls \
+                 anything, saw {}",
+                s.batches_received
+            );
+            assert!(
+                s.rows_served <= 4,
+                "and the rows with them (the first three batches hold 2+1+1), saw {}",
+                s.rows_served
+            );
         }
 
         // Draining the lazy source fills the drain counters in place.
         let out = drain_base_source(source).await;
-        assert_eq!(id_values(&out), vec![7, 8, 9], "served data, streamed");
-        let s = live.lock().unwrap();
         assert_eq!(
-            s.batches_received, 2,
-            "both served batches counted on drain"
+            id_values(&out),
+            vec![7, 8, 9, 10, 11, 12],
+            "served data, streamed"
         );
-        assert_eq!(s.rows_served, 3, "all served rows counted on drain");
-        // Bound it rather than just `> 0`: three i32 values plus validity cannot
+        let s = live.lock().unwrap();
+        assert_eq!(s.batches_received, 5, "every served batch counted on drain");
+        assert_eq!(s.rows_served, 6, "all served rows counted on drain");
+        // Bound it rather than just `> 0`: six i32 values plus validity cannot
         // plausibly need a megabyte, and an unbounded assertion would pass on a
         // counter that had accumulated garbage.
         assert!(
