@@ -160,6 +160,16 @@ pub struct BaseFileDataRequest<'a> {
     pub partition_fields: &'a [String],
     /// The table's data schema, used to resolve partition-column types.
     pub data_schema: Option<&'a SchemaRef>,
+    // NOTE — the KEY PREDICATE is deliberately not part of this request.
+    //
+    // The object-store read threads `reader_context.key_predicate` through
+    // `base_read_options`, so a format that can seek narrows which blocks it
+    // reads. A served file gets no such hint and returns every row, which is
+    // correct but not identical work — the one qualification on "a served file
+    // and a read file are indistinguishable downstream" elsewhere in this file.
+    // Inert today: `key_predicate` is `None` at every construction site in this
+    // tree, including the FFI bridge. Widening the seam is a deliberate decision
+    // for whoever needs it, not an oversight.
 }
 
 /// A pluggable source that may serve a base file instead of the object-store

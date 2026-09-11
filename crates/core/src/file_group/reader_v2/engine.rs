@@ -293,7 +293,11 @@ impl BaseSource {
 /// The task is not tracked by a `JoinHandle` because the channel already bounds
 /// it: dropping the returned stream drops the receiver, the next `blocking_send`
 /// fails, and the producer returns. There is no path on which it outlives its
-/// consumer by more than one batch.
+/// consumer by more than one batch OF WORK — but that is a bound on work, not on
+/// time. A `next()` already in flight is not cancelled, so a provider blocked on
+/// IO keeps the task, and the provider reference it holds, alive until that call
+/// returns. `destroy(ctx)` is therefore deferred until then, however long after
+/// the caller released both the reader handle and the stream.
 ///
 /// **The provider outlives the reader it returned.** A clone of the provider is
 /// moved onto the same task, in a `ServedReader` struct whose field order makes
@@ -1055,6 +1059,12 @@ impl HoodieFileGroupReader {
         // always supplies a required_schema). It reads the file as one batch,
         // because its schema is only known once the file has been read, so the
         // instant-range decision below cannot be made before reading it.
+        //
+        // ⚠️ This branch returns BEFORE the footer read, so the repair gate below
+        // never runs on it and a #18132-mislabelled file would keep its pushdown
+        // here. Latent rather than live — no FFI caller reaches it, and no
+        // provider is offered the file on this path either — but it is the one
+        // hole left in the guard. Tracked as ISSUES OI-11.
         let Some(required_schema) = self.schema_handler.required_schema.clone() else {
             let batch = self
                 .base_file_reader()?
@@ -1195,13 +1205,14 @@ impl HoodieFileGroupReader {
         // cleared imperatively by the block below — which cannot simply key on
         // `!pushdown_is_safe`. Not because the clearing would be wrong (it is
         // idempotent; they were already `None` from their binding) but because
-        // the block also RECORDS: `record_pushdown_suppressed_by_repair` and a
-        // second `record_selector_suppressed`. Keying it on the narrowed value
-        // would attribute every merge-gate refusal to the repair gate and
-        // double-count the selector suppression already recorded at its binding,
-        // which is exactly the separation `repair_suppression_counts_the_row_group_selector`
-        // and `repair_suppression_is_not_counted_when_pushdown_survives` exist to
-        // keep.
+        // the block also RECORDS `pushdown_suppressed_by_repair`. Keying it on
+        // the narrowed value would fire that counter on every MERGE-gate refusal
+        // too, and the counter exists precisely to separate the two causes:
+        // `record_selector_suppressed` already speaks for the merge gate at its
+        // own binding. Pinned by
+        // `a_selector_the_gate_refuses_is_counted_not_silently_dropped`, which
+        // asserts the repair counter stays at zero for a merge-gate refusal —
+        // the only test in this file that fails under that mis-keying.
         //
         // The three verdicts agree; only one of them is structurally unable to be
         // left behind. A fourth consumer added later should read the binding,
@@ -2434,6 +2445,18 @@ mod tests {
             "and the reason it never ran is on the record"
         );
         assert_eq!(volume.row_groups_read.load(Relaxed), 3);
+        // The two causes must stay separable. This is a MERGE-gate refusal, so
+        // the repair counter must not move — and it is what stops the withdrawal
+        // block in `base_file_source` from being keyed on the narrowed
+        // `pushdown_is_safe`, which would attribute every merge-gate refusal to
+        // the repair gate. Without this assertion that mis-keying passes the
+        // whole file.
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            0,
+            "a merge-gate refusal is not a repair withdrawal, and the counters \
+             exist to tell them apart"
+        );
     }
 
     /// The same merging slice with a primary-key-safe predicate: the gate opens,
@@ -3998,9 +4021,35 @@ mod tests {
         let mut reader =
             test_file_group_reader_for_base_file(tmp.path(), base_name, straddling_table_schema())
                 .await;
-        reader.base_file_provider = Some(provider);
+        reader.base_file_provider = Some(provider.clone());
 
         let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        // THE REQUEST SIDE of the same contract, and the only place in this file
+        // that can pin it: every other provider fixture uses an `id: int32`
+        // column, where `intersection` and `required_schema` are equal and the
+        // two are indistinguishable.
+        //
+        // `projected_schema` must be the INTERSECTION — the file's own footer,
+        // lie included — not the table's `required_schema`. Handing over the
+        // table's schema tells a provider "millis" about a file whose footer says
+        // "micros"; a conforming provider casts on read, dividing by 1000, and
+        // `project_batch_to_schema` then sees millis→millis and applies NO repair.
+        // Corruption with the repair arm bypassed, on the exact #18132 path this
+        // milestone exists for — and it type-checks.
+        let seen = provider
+            .seen()
+            .expect("the provider must have been offered the file");
+        assert_eq!(
+            seen.projected_schema.field(1).data_type(),
+            &arrow_schema::DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some("UTC".into())
+            ),
+            "the provider is handed the FILE's schema, lie included — not the \
+             table's. Serving raw values is only correct if the request says what \
+             the file claims they are"
+        );
 
         let ts = out
             .column(1)
@@ -4283,18 +4332,21 @@ mod tests {
     /// That is the memory contract — the whole served file is never resident at
     /// serve time — and a counter populated early is the symptom of losing it.
     ///
-    /// The pre-drain bound is `<= 3`, not `== 0`, and the difference is a real
+    /// The pre-drain bound is `<= 2`, not `== 0`, and the difference is a real
     /// flake this milestone had to fix rather than a weakening. `== 0` assumes
-    /// the producer has not been scheduled yet, which nothing guarantees: the
-    /// task runs concurrently and legitimately pulls up to three batches before
-    /// parking (one delivered, one buffered in the depth-1 channel, one blocked
-    /// in `blocking_send` — the bound
-    /// `a_served_reader_runs_two_batches_ahead_and_no_further` pins structurally).
-    /// Under full-suite load it does, and the inherited assertion failed there —
-    /// intermittently, which is worse than failing.
+    /// the producer has not been scheduled yet, which nothing guarantees: it runs
+    /// concurrently and, by the time this assertion reads the slot, can
+    /// legitimately have counted TWO — one batch occupying the depth-1 channel's
+    /// single permit and one parked in `blocking_send`. Nothing has been
+    /// DELIVERED at this point, because the receiver has not been polled; the
+    /// third batch in `a_served_reader_runs_two_batches_ahead_and_no_further`'s
+    /// bound is the one the merge has already taken, and that test pulls a batch
+    /// first. Two is also what `try_base_file`'s own contract says ("pulled up to
+    /// two batches ahead"). Under full-suite load the inherited `== 0` failed on
+    /// exactly this — intermittently, which is worse than failing.
     ///
     /// FIVE served batches rather than two, so the bound is meaningful: with two,
-    /// "at most three" is vacuous. What the test now says is the contract — the
+    /// "at most two" is vacuous. What the test now says is the contract — the
     /// source is not drained up front — instead of a timing accident.
     #[tokio::test(flavor = "multi_thread")]
     async fn base_file_provider_served_source_is_lazy_and_counts_on_drain() {
@@ -4322,15 +4374,15 @@ mod tests {
             let s = live.lock().unwrap();
             assert_eq!(s.files_served, 1, "setup counter seeded before drain");
             assert!(
-                s.batches_received <= 3,
-                "the source must not be drained up front — at most one delivered, \
-                 one buffered and one blocked in send before the merge pulls \
-                 anything, saw {}",
+                s.batches_received <= 2,
+                "the source must not be drained up front — the receiver has not \
+                 been polled, so at most one batch occupies the depth-1 channel \
+                 and one is blocked in send, saw {}",
                 s.batches_received
             );
             assert!(
-                s.rows_served <= 4,
-                "and the rows with them (the first three batches hold 2+1+1), saw {}",
+                s.rows_served <= 3,
+                "and the rows with them (the first two batches hold 2+1), saw {}",
                 s.rows_served
             );
         }
@@ -4931,9 +4983,14 @@ mod tests {
     ///
     /// This pins the property that makes that safe — the served stream's own task
     /// holds a strong reference — by dropping EVERY other reference and checking
-    /// the provider is still alive. Deleting `let _provider_kept_alive = provider;`
-    /// from `served_batch_stream` fails it, which is the point: that binding looks
-    /// like dead code and is not.
+    /// the provider is still alive. Removing the `_provider` field from
+    /// `ServedReader` fails it, and so does capturing `served.reader` instead of
+    /// `served` — which is how it actually broke once, and is the shape the RED
+    /// proof reproduces. The field looks like dead code and is not.
+    ///
+    /// What this test does NOT pin is the ORDER the two drop in;
+    /// [`a_served_readers_release_runs_before_the_providers_destroy`] owns that,
+    /// and without it swapping `ServedReader`'s two fields passes every test here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped() {
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -5015,6 +5072,138 @@ mod tests {
             dropped.load(Relaxed),
             "and it must be released once the stream is exhausted, or the \
              reference is a leak rather than a lifetime extension"
+        );
+    }
+
+    /// **The served reader is released BEFORE the provider's `destroy(ctx)`.**
+    ///
+    /// `a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`
+    /// pins that the provider outlives the stream. It does NOT pin the order the
+    /// two are released in, and the order is the half that matters to the C ABI:
+    /// the served `ArrowArrayStream`'s `release` callback points into the
+    /// provider's `ctx`, so releasing the provider first is the same
+    /// use-after-free `OI-1` was raised to close — just reached from the other
+    /// end.
+    ///
+    /// That order is supplied by `ServedReader`'s FIELD DECLARATION ORDER, and
+    /// swapping two fields is an entirely plausible tidy-up that compiles and
+    /// (without this test) passes everything: the liveness test still sees the
+    /// provider alive during the drain and released after it. Three separate doc
+    /// comments assert the order is "structural"; this is what makes that true
+    /// rather than asserted.
+    ///
+    /// The probe is the reader itself: its `Drop` reads the provider's flag and
+    /// records whether the provider had already gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_served_readers_release_runs_before_the_providers_destroy() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+        /// Set when the provider is dropped — i.e. when `destroy(ctx)` would run.
+        #[derive(Clone)]
+        struct ProviderGone(Arc<AtomicBool>);
+        impl Drop for ProviderGone {
+            fn drop(&mut self) {
+                self.0.store(true, Relaxed);
+            }
+        }
+
+        /// Reads `ProviderGone` in its own `Drop`, which is exactly what a C
+        /// stream's `release` callback does when it touches `ctx`.
+        struct ReleaseProbe {
+            schema: SchemaRef,
+            remaining: usize,
+            provider_gone: Arc<AtomicBool>,
+            saw_provider_gone: Arc<AtomicBool>,
+        }
+        impl Drop for ReleaseProbe {
+            fn drop(&mut self) {
+                self.saw_provider_gone
+                    .store(self.provider_gone.load(Relaxed), Relaxed);
+            }
+        }
+        impl Iterator for ReleaseProbe {
+            type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.remaining == 0 {
+                    return None;
+                }
+                self.remaining -= 1;
+                Some(Ok(RecordBatch::new_empty(self.schema.clone())))
+            }
+        }
+        impl arrow_array::RecordBatchReader for ReleaseProbe {
+            fn schema(&self) -> SchemaRef {
+                self.schema.clone()
+            }
+        }
+
+        struct ReleaseOrderProvider {
+            gone: ProviderGone,
+            saw_provider_gone: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl crate::file_group::reader_v2::base_file_provider::BaseFileDataProvider
+            for ReleaseOrderProvider
+        {
+            async fn try_base_file(
+                &self,
+                req: BaseFileDataRequest<'_>,
+            ) -> (
+                Option<Box<dyn arrow_array::RecordBatchReader + Send + 'static>>,
+                BaseFileProviderStats,
+            ) {
+                (
+                    Some(Box::new(ReleaseProbe {
+                        schema: req.projected_schema.clone(),
+                        remaining: 2,
+                        provider_gone: self.gone.0.clone(),
+                        saw_provider_gone: self.saw_provider_gone.clone(),
+                    })),
+                    BaseFileProviderStats {
+                        files_served: 1,
+                        ..Default::default()
+                    },
+                )
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider_gone = Arc::new(AtomicBool::new(false));
+        let saw_provider_gone = Arc::new(AtomicBool::new(false));
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), base_name, schema).await;
+        reader.base_file_provider = Some(Arc::new(ReleaseOrderProvider {
+            gone: ProviderGone(provider_gone.clone()),
+            saw_provider_gone: saw_provider_gone.clone(),
+        }));
+
+        let source = reader.base_file_source().await.unwrap();
+        drop(reader);
+        let out = drain_base_source(source).await;
+        assert_eq!(out.num_rows(), 0, "the probe serves empty batches");
+
+        // The producer task ends after the last batch is taken; poll rather than
+        // sleep a guessed interval.
+        for _ in 0..200 {
+            if provider_gone.load(Relaxed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            provider_gone.load(Relaxed),
+            "fixture check: the provider must have been released by now, or the \
+             assertion below has not been exercised"
+        );
+        assert!(
+            !saw_provider_gone.load(Relaxed),
+            "the served reader was released AFTER the provider — a C stream's \
+             release callback would be reading a ctx that destroy() already \
+             freed. ServedReader's field order is what prevents this; check that \
+             `reader` is still declared before `_provider`"
         );
     }
 
