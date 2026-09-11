@@ -551,8 +551,30 @@ mod tests {
         logs.sort();
         assert_eq!(
             logs,
-            vec![earlier_request, later_request],
+            vec![earlier_request.clone(), later_request],
             "sorted order must follow deltaCommitTime ascending"
+        );
+
+        // KEY ORDER, gold keys 2 and 3: logVersion outranks logWriteToken. Every other
+        // precedence pair in `impl Ord` is pinned somewhere -- deltaCommitTime over version
+        // by `test_log_file_ordering_no_completion_timestamp`, version over extension and
+        // extension over file_id by `..._tiebreaks_are_extension_then_file_id` -- but this
+        // adjacent pair of the GOLD's own keys had no fixture where the two disagree, so
+        // swapping them in `impl Ord` changed nothing any test could see (review round 12).
+        //
+        // The two keys must CONFLICT or the assertion is vacuous: `earlier_request` is
+        // {version 1, write_token "0-188-387"}; this is {version 2, write_token "0-188-000"}.
+        // Version-first says Less (1 < 2); write-token-first says Greater ("387" > "000").
+        let later_version_earlier_token = LogFile {
+            version: 2,
+            write_token: "0-188-000".to_string(),
+            ..earlier_request.clone()
+        };
+        assert_eq!(
+            earlier_request.cmp(&later_version_earlier_token),
+            Ordering::Less,
+            "logVersion must take precedence over logWriteToken, as in Java's \
+             LogFileComparator (Integer.compare on version, then the write token)"
         );
     }
 
