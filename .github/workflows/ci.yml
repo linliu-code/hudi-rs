@@ -85,8 +85,18 @@ jobs:
           cache-targets: false
           # Reduce cache size by cleaning old artifacts
           cache-all-crates: false
+      # Printed before and after, so a disk failure in this container job names what was
+      # actually available instead of leaving it to be guessed at. The container cannot free
+      # the host's preinstalled toolchains the way the python-tests job does -- it has its own
+      # filesystem -- so the headroom here comes from what the build does NOT compile
+      # (see COV_EXCLUDE in the Makefile), not from what is deleted.
+      - name: Disk before
+        run: df -h /__w /tmp || df -h
       - name: Rust unit tests with coverage report
         run: make coverage-xml
+      - name: Disk after
+        if: always()
+        run: df -h /__w /tmp || df -h
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
         with:
