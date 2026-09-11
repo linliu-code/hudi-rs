@@ -1470,14 +1470,21 @@ mod tests {
     /// whose `corrupt_then_good_file` puts the damage at byte 0 — and with
     /// `from_pos == 0` the resume term is indistinguishable from a bug that drops it
     /// (`MAGIC.len()` either way). The other three pass `len - 1`, `len - magic` and
-    /// `len` (`test_recovery_scan_answers_eof_when_the_scan_start_is_at_or_past_it`),
-    /// which are deliberately AT or PAST end-of-file: they exercise the two
-    /// early-return branches and assert `stream_len`, which is the answer whether or
-    /// not the resume term is there.
+    /// `len` (`test_recovery_scan_answers_eof_when_the_scan_start_is_at_or_past_it`).
+    /// Note what is and is not true of those: `len - 1` and `len - magic` are in-range
+    /// nonzero ARGUMENTS — what lands at or past the end is the derived scan start,
+    /// `from_pos + MAGIC.len()`. That is the point of them: they pin the two
+    /// early-return branches (`checked_sub` underflow, and `window == 0`), both of
+    /// which answer `stream_len` before `pos` is ever used to read, so they come out
+    /// the same whether or not the resume term is there.
     ///
-    /// So no in-range nonzero offset was exercised anywhere — which is what this test
-    /// adds. An earlier version of this comment said "every other test passes 0";
-    /// three of them do not, and review round 4 caught the enumeration being short.
+    /// So no nonzero offset at which the resume arithmetic is actually EXERCISED
+    /// appears anywhere — which is what this test adds. Two earlier versions of this
+    /// comment got it wrong in opposite directions: the first said "every other test
+    /// passes 0" (three do not — round 4), the second said those three are "at or past
+    /// end-of-file" and that "no in-range nonzero offset" was exercised, which the
+    /// grep in the entry's own fact chain refutes (round 6 caught it in the document,
+    /// round 7 found it still standing here).
     /// Production only ever calls it from `create_corrupted_block(magic_pos)`, where a
     /// nonzero in-range `magic_pos` is the ordinary case: damage anywhere but the very
     /// start of the file.
