@@ -3215,9 +3215,9 @@ mod tests {
         // The count is 0 rather than internal's 1 because the fixtures differ, and
         // deliberately: this file DECLARES micros while holding millisecond counts,
         // and with gate 1 disarmed nothing relabels it, so the filter normalises both
-        // values from the declared unit and neither clears the threshold. The honest
-        // -file case, where the survivor is the one row above it, is the neighbouring
-        // `base_read_keeps_pushdown_when_the_file_is_honestly_labelled`.
+        // values from the declared unit and neither clears the threshold. The
+        // honest-file case, where the survivor is the one row above it, is the
+        // neighbouring `base_read_keeps_pushdown_when_the_file_is_honestly_labelled`.
         //
         // 0 is not this counter's uninformative initial value. The fixture holds two
         // rows, and the neighbouring
