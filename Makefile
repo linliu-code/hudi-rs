@@ -51,8 +51,11 @@ COV_THRESHOLD ?= 60
 # REPORT below, but --workspace still COMPILED the crate, and on this fork that drags in
 # `substrait` -> `protobuf-src`, which builds protobuf from source and exhausted the runner's disk
 # (`No space left on device` installing libprotoc.a). Excluding the package changes no coverage
-# number -- its sources were already out of the report -- and the crate keeps its own dedicated
-# gate, the `cpp-ffi` job, which builds and tests it.
+# report, so no line that was being measured stops being measured. It does remove hudi-cpp's
+# OWN TESTS from the run, which could have exercised hudi-core lines, so the measured
+# percentage can move slightly -- worth knowing if COV_THRESHOLD is ever enforced in CI, which
+# today it is not. The crate keeps its own dedicated gate, the `cpp-ffi` job, which builds and
+# tests it.
 COV_EXCLUDE := \
 	--exclude hudi-cpp \
 	--exclude-files 'cpp/src/*' \

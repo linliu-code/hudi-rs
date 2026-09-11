@@ -21,12 +21,18 @@ cmake_minimum_required(VERSION 3.20)
 # version carries (`-dev`) is dropped here -- x.y.z-dev becomes x.y.z, which is the shape
 # OSS #749 wrote by hand. Read with file(READ)+regex rather than by running a script, so
 # `cmake` needs nothing on PATH that it did not already need.
+# NOTE: the pattern below contains a literal CR byte (0x0D) before the \n, so a CRLF manifest
+# still matches. CMake's regex engine has no \r escape, so it cannot be written any other
+# way -- but it is invisible in review and any tool that normalises line endings will strip
+# it. If this stops matching on a CRLF checkout, that byte is why.
+#
 # The pattern requires `version` to be the FIRST key of the section, which is how both this
 # fork and apache/hudi-rs write it. That is deliberate: an unanchored search would happily
 # match the `version` inside `rust-version` if the keys were ever reordered and hand back a
 # rustc version as the project version. This fails loudly instead.
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../Cargo.toml" _hudi_root_manifest)
-string(REGEX MATCH "\\[workspace\\.package\\][ \t]*?
+string(REGEX MATCH "\\[workspace\\.package\\][ \t]*
+?
 [ \t]*version[ \t]*=[ \t]*\"([^\"]+)\""
        _hudi_version_match "${_hudi_root_manifest}")
 if(NOT _hudi_version_match)

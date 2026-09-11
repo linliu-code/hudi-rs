@@ -41,22 +41,51 @@ SWEEP_SKIP_SUFFIXES = (".md",)
 
 # Sites that used to carry a hardcoded copy and must now visibly derive one. Rule 2 catches a
 # re-hardcode; this catches the other way a derivation can be lost -- being deleted outright.
+# The marker is the INVOCATION, not the bare script name: `release.yml` and `cpp/CMakeLists.txt`
+# both MENTION their source in prose, so a rule anchored on the name would still pass if the
+# derivation itself were deleted and only the comment left behind.
 MUST_DERIVE = {
-    ".github/workflows/jni-native.yml": "workspace-version.sh",
-    ".github/workflows/release.yml": "workspace-version.sh",
-    "Makefile": "workspace-version.sh",
-    "cpp/CMakeLists.txt": "[workspace.package]",
+    ".github/workflows/jni-native.yml": "$(.github/scripts/workspace-version.sh",
+    ".github/workflows/release.yml": "$(.github/scripts/workspace-version.sh",
+    "Makefile": "$(shell .github/scripts/workspace-version.sh",
+    "cpp/CMakeLists.txt": "file(READ",
 }
 
-DEV_SHAPED = re.compile(r"\b\d+\.\d+\.\d+-dev\b")
-SECTION = re.compile(r"^\[([^\]]+)\]\s*$")
-ENTRY = re.compile(r"^([A-Za-z0-9_.-]+)\s*=\s*(.*)$")
+# Rule 2 sweeps for TWO patterns, because either alone has a hole:
+#   * the `-dev` shape catches any development version, including a STALE one left behind
+#     by a bump -- but it finds nothing at all once the project ships a non-dev version;
+#   * the authority string itself catches a fresh copy of the current version, which is
+#     the case the first pattern misses at a real release.
+# Left lookbehind rejects a preceding DIGIT or DOT, so a longer number is not read as a version
+# starting mid-way through it, but deliberately ALLOWS a letter so a `v`-prefixed copy is a hit --
+# `\b` would not be, because between `v` and the digit both sides are word characters.
+# Right lookahead rejects a following word character (so `-development` is not a version) but
+# ALLOWS a following dot, because the carrier form this check exists to catch is exactly
+# `<version>.<short sha>`.
+DEV_SHAPED = re.compile(r"(?<![\d.])\d+\.\d+\.\d+-dev(?![\w-])")
+SECTION = re.compile(r"^\[([^\[\]]+)\]\s*$")
+# `[[bench]]` / `[[bin]]` are array-of-table headers. Without matching them the previous
+# section stayed in force, so an inline table inside a `[[bench]]` that followed a
+# `[dependencies]` block was read AS a dependency -- a false failure, and under --fix a
+# rewrite of a line that is not a dependency requirement.
+ARRAY_SECTION = re.compile(r"^\[\[([^\[\]]+)\]\]\s*$")
+# A dependency can also be written as its own sub-table -- `[dependencies.hudi-core]` with its
+# keys on the lines that follow. That is legal Cargo and the repo already uses it
+# (`python/Cargo.toml` has `[dependencies.pyo3]`). It is PARSED here rather than refused: a shape
+# this checker skipped would let a drifted version be reported as clean, and a shape it refused
+# would demand the repo rewrite a perfectly good manifest to suit the checker.
+DEP_SUBTABLE = re.compile(r"^((?:target\.[^.]+\.)?(?:dev-|build-)?dependencies)\.(.+)$")
+ENTRY = re.compile(r"^\"?([A-Za-z0-9_.-]+)\"?\s*=\s*(.*)$")
 KEY_PATH = re.compile(r'(?<![A-Za-z0-9_-])path\s*=\s*"([^"]*)"')
 KEY_VERSION = re.compile(r'(?<![A-Za-z0-9_-])version\s*=\s*"([^"]*)"')
 
 
 def dep_entries(text: str):
-    """Yields (section, name, inline_table_text) for every dependency written as a table.
+    """Yields (section, name, inline_table_text) for every dependency written as an inline table.
+
+    Handles three shapes: `name = { ... }` inline tables, quoted keys, and `[dependencies.name]`
+    sub-tables. Yields ("__UNPARSED__", <what>, "") for anything else, so the caller fails loudly
+    instead of reporting a skipped dependency as a clean one.
 
     Hand-rolled rather than via `tomllib`, which only exists on Python 3.11+ -- this has to run
     on whatever python3 a contributor's machine and the CI runner happen to have. It only needs
@@ -68,9 +97,27 @@ def dep_entries(text: str):
     i = 0
     while i < len(lines):
         line = lines[i]
-        m = SECTION.match(line.strip())
+        stripped_line = line.strip()
+        m = ARRAY_SECTION.match(stripped_line)
         if m:
             section = m.group(1)
+            i += 1
+            continue
+        m = SECTION.match(stripped_line)
+        if m:
+            section = m.group(1)
+            sub = DEP_SUBTABLE.match(section)
+            if sub:
+                # Collect the sub-table's own keys, up to the next section header of any kind.
+                body, j = [], i + 1
+                while j < len(lines) and not (
+                    SECTION.match(lines[j].strip()) or ARRAY_SECTION.match(lines[j].strip())
+                ):
+                    body.append(lines[j])
+                    j += 1
+                yield sub.group(1), sub.group(2), "\n".join(body)
+                i = j
+                continue
             i += 1
             continue
         if not section.split(".")[-1].endswith("dependencies"):
@@ -95,17 +142,31 @@ def dep_entries(text: str):
 
 
 def authority() -> str:
-    out = subprocess.run(
-        [str(ROOT / ".github/scripts/workspace-version.sh")],
-        capture_output=True, text=True, check=True,
-    )
+    script = ROOT / ".github/scripts/workspace-version.sh"
+    try:
+        out = subprocess.run([str(script)], capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        stderr = getattr(exc, "stderr", "") or ""
+        raise SystemExit(
+            f"cannot read the authoritative version: {script} failed ({exc}). {stderr.strip()}\n"
+            f"Check it exists and is executable (chmod +x)."
+        )
     return out.stdout.strip()
 
 
 def tracked_files() -> list[str]:
-    out = subprocess.run(
-        ["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True,
-    )
+    # Rule 2 sweeps the tracked set rather than the directory tree, so build outputs and vendored
+    # sources cannot manufacture a finding. The cost is a dependency on git, which an extracted
+    # source tarball does not have -- say that plainly rather than failing as a git error.
+    try:
+        out = subprocess.run(
+            ["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit(
+            f"this check needs a git work tree to enumerate tracked files, and `git ls-files` "
+            f"failed in {ROOT} ({exc}). Run it from a clone rather than an extracted archive."
+        )
     return [line for line in out.stdout.splitlines() if line]
 
 
@@ -125,6 +186,13 @@ def main() -> int:
         if not rel.endswith("Cargo.toml"):
             continue
         for section, name, spec in dep_entries((ROOT / rel).read_text()):
+            if section == "__UNPARSED__":
+                failures.append(
+                    f"{rel}: {name} is a Cargo shape this checker does not parse -- teach it to "
+                    f"read this shape rather than skipping it, since a skipped dependency would "
+                    f"let a drifted version be reported as clean"
+                )
+                continue
             if not KEY_PATH.search(spec):
                 continue  # not an intra-workspace dependency
             got = KEY_VERSION.search(spec)
@@ -159,8 +227,12 @@ def main() -> int:
             text = path.read_text()
         except (UnicodeDecodeError, OSError):
             continue  # binary or unreadable: cannot contain a version literal we care about
+        authority_shaped = re.compile(r"(?<![\d.])" + re.escape(want) + r"(?![\w-])")
         for lineno, line in enumerate(text.splitlines(), 1):
-            for hit in DEV_SHAPED.findall(line):
+            # Both patterns match the same text when the authority is itself dev-shaped, so the
+            # hits are de-duplicated -- one line reported twice reads as two defects.
+            hits = {h for pattern in (DEV_SHAPED, authority_shaped) for h in pattern.findall(line)}
+            for hit in sorted(hits):
                 failures.append(
                     f"{rel} line {lineno}: hardcoded project version \"{hit}\" -- derive it from "
                     f".github/scripts/workspace-version.sh instead"
