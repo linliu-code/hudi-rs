@@ -1223,6 +1223,62 @@ mod tests {
         Ok(())
     }
 
+    /// The two end-of-file branches of the recovery scan that no fixture reaches
+    /// by walking a file, pinned directly.
+    ///
+    /// `scan_for_next_block_offset` starts `MAGIC.len()` bytes past `from_pos`,
+    /// so a corrupt block discovered near the end of a file produces a start
+    /// position at or past EOF and the scan must answer "end of file" without
+    /// reading. There are two such branches, reached by different arithmetic:
+    ///
+    /// * `from_pos + MAGIC.len() >  file_len` — the `checked_sub` underflows;
+    /// * `from_pos + MAGIC.len() == file_len` — the subtraction succeeds and the
+    ///   window is exactly 0.
+    ///
+    /// Both must return `file_len`. Returning `pos` instead hands the caller an
+    /// offset PAST the end of the file, and `create_corrupted_block` feeds that
+    /// straight into `seek_to`. Neither is reachable from a walk-the-file
+    /// fixture — `test_scan_for_next_block_offset_stays_within_file_bounds` and
+    /// the corrupt-recovery family all run on files with a later marker or a
+    /// short final window (the third branch) — so these were the remaining
+    /// untested `Ok(stream_len)` returns the original audit's item 10 named.
+    /// m1's R-4 established there is no product-code delta against internal main
+    /// here (three such branches on both sides), so this closes coverage and
+    /// ports nothing.
+    #[tokio::test]
+    async fn test_recovery_scan_answers_eof_when_the_scan_start_is_at_or_past_it() -> Result<()> {
+        let (dir, file_name) = get_valid_log_avro_data();
+        let mut reader = create_log_file_reader(&dir, &file_name).await?;
+        let len = reader.reader.file_len();
+        let magic = MAGIC.len() as u64;
+        assert!(len > magic, "fixture must be longer than one magic marker");
+
+        // Branch 1: the scan start runs PAST the end (checked_sub underflows).
+        // from_pos = len - 1  =>  pos = len - 1 + magic > len.
+        assert_eq!(
+            reader.scan_for_next_block_offset(len - 1).await?,
+            len,
+            "a scan starting past the end must answer end-of-file, not an offset past it"
+        );
+
+        // Branch 2: the scan start lands EXACTLY on the end (window == 0).
+        // from_pos = len - magic  =>  pos = len, remaining = 0.
+        assert_eq!(
+            reader.scan_for_next_block_offset(len - magic).await?,
+            len,
+            "a scan starting exactly at the end must answer end-of-file"
+        );
+
+        // A third, adjacent case worth pinning while the arithmetic is in view:
+        // from_pos AT the end underflows the same way as branch 1.
+        assert_eq!(
+            reader.scan_for_next_block_offset(len).await?,
+            len,
+            "a scan starting at end-of-file must answer end-of-file"
+        );
+        Ok(())
+    }
+
     /// Options carrying a base path, and a streaming window when one is asked
     /// for. `Storage::new_with_base_url` builds its own configs, so the window
     /// knob has to be set on the storage the reader is opened from.
@@ -1600,37 +1656,28 @@ mod tests {
     /// happen to be valid UTF-8.
     #[tokio::test]
     async fn test_block_metadata_value_length_is_bounded_by_the_block() -> Result<()> {
-        const LOG_FORMAT_VERSION: u32 = 1;
-        const BLOCK_TYPE_AVRO_DATA: u32 = 3;
-        const HEADER_KEY_INSTANT_TIME: u32 = 0;
-
         // One header entry whose declared value length is far larger than the
-        // block that contains it, while the real value is 3 bytes.
+        // block that contains it, while the real value is 3 bytes. The layout
+        // itself comes from the shared `a_v1_block` encoder (m1 ISSUES I-12);
+        // only the LIE is this test's own.
         let bogus_value_len: u32 = 5_000;
-        let mut header = Vec::new();
-        header.extend_from_slice(&1u32.to_be_bytes()); // one entry
-        header.extend_from_slice(&HEADER_KEY_INSTANT_TIME.to_be_bytes());
-        header.extend_from_slice(&bogus_value_len.to_be_bytes());
-        header.extend_from_slice(b"abc");
+        let mut out = a_v1_block(
+            V1_BLOCK_TYPE_AVRO_DATA,
+            &[V1Header::lying_entry(
+                V1_HEADER_KEY_INSTANT_TIME,
+                b"abc",
+                bogus_value_len,
+            )],
+            &[],
+        );
 
-        let mut body = Vec::new();
-        body.extend_from_slice(&LOG_FORMAT_VERSION.to_be_bytes());
-        body.extend_from_slice(&BLOCK_TYPE_AVRO_DATA.to_be_bytes());
-        body.extend_from_slice(&header);
-        body.extend_from_slice(&0u64.to_be_bytes()); // empty content
-        body.extend_from_slice(&0u32.to_be_bytes()); // empty footer
-
-        // The recorded length spans everything after it, the trailing pointer
-        // included; the trailing value counts the magic on top of that. Getting
-        // these right is what keeps `is_block_corrupted` from short-circuiting
-        // the walk before the header is ever parsed.
-        let block_length = (body.len() + 8) as u64;
-        let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&block_length.to_be_bytes());
-        out.extend_from_slice(&body);
-        out.extend_from_slice(&(block_length + MAGIC.len() as u64).to_be_bytes());
-
+        // `block_length` as the encoder recorded it: the bytes after the length
+        // field, the trailing pointer included.
+        let block_length = u64::from_be_bytes(
+            out[MAGIC.len()..MAGIC.len() + 8]
+                .try_into()
+                .expect("the encoder writes an 8-byte block length"),
+        );
         assert!(
             block_length < bogus_value_len as u64,
             "the test is only meaningful while the declared value overruns its block"
@@ -1643,23 +1690,11 @@ mod tests {
         // cannot be the thing that rejects the overrun above — leaving the
         // block-length check as the only candidate.
         let filler = vec![b'x'; 8_000];
-        let mut header2 = Vec::new();
-        header2.extend_from_slice(&1u32.to_be_bytes());
-        header2.extend_from_slice(&HEADER_KEY_INSTANT_TIME.to_be_bytes());
-        header2.extend_from_slice(&(filler.len() as u32).to_be_bytes());
-        header2.extend_from_slice(&filler);
-
-        let mut body2 = Vec::new();
-        body2.extend_from_slice(&LOG_FORMAT_VERSION.to_be_bytes());
-        body2.extend_from_slice(&BLOCK_TYPE_AVRO_DATA.to_be_bytes());
-        body2.extend_from_slice(&header2);
-        body2.extend_from_slice(&0u64.to_be_bytes());
-        body2.extend_from_slice(&0u32.to_be_bytes());
-        let block_length2 = (body2.len() + 8) as u64;
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&block_length2.to_be_bytes());
-        out.extend_from_slice(&body2);
-        out.extend_from_slice(&(block_length2 + MAGIC.len() as u64).to_be_bytes());
+        out.extend_from_slice(&a_v1_block(
+            V1_BLOCK_TYPE_AVRO_DATA,
+            &[V1Header::entry(V1_HEADER_KEY_INSTANT_TIME, &filler)],
+            &[],
+        ));
 
         let tmp = tempfile::tempdir().unwrap();
         let file_name = "corrupt.log.1_0-0-0".to_string();
@@ -1694,25 +1729,105 @@ mod tests {
     /// `block_length` spans version..=trailing pointer, excluding the magic and
     /// the length field itself; the trailing reverse pointer counts the magic on
     /// top, which is what `is_block_corrupted` checks against.
-    fn a_valid_command_block(instant: &str) -> Vec<u8> {
-        let instant_bytes = instant.as_bytes();
-        let header_len = 4 + 4 + 4 + instant_bytes.len();
-        let block_length = 4 + 4 + header_len + 8 + 4 + 8;
-        let trailing = (block_length + MAGIC.len()) as u64;
+    /// Block-type ordinals as they appear on disk, for [`a_v1_block`].
+    const V1_BLOCK_TYPE_COMMAND: u32 = 0;
+    const V1_BLOCK_TYPE_AVRO_DATA: u32 = 3;
+    /// Header-key ordinal for `BlockMetadataKey::InstantTime`.
+    const V1_HEADER_KEY_INSTANT_TIME: u32 = 0;
 
+    /// One V1 header entry: the key ordinal, the value bytes, and the length to
+    /// DECLARE for that value.
+    ///
+    /// `declared_len` exists for exactly one caller. Honest blocks declare
+    /// `value.len()` (use [`V1Header::entry`]); the block-metadata bound test
+    /// needs a block that LIES about its value length, which is the whole point
+    /// of the guard it exercises — so the lie is a parameter of the encoder
+    /// rather than a second encoder.
+    struct V1Header<'a> {
+        key: u32,
+        value: &'a [u8],
+        declared_len: u32,
+    }
+
+    impl<'a> V1Header<'a> {
+        /// An honest entry: declared length == actual length.
+        fn entry(key: u32, value: &'a [u8]) -> Self {
+            Self {
+                key,
+                value,
+                declared_len: value.len() as u32,
+            }
+        }
+
+        /// An entry that declares a length it does not have.
+        fn lying_entry(key: u32, value: &'a [u8], declared_len: u32) -> Self {
+            Self {
+                key,
+                value,
+                declared_len,
+            }
+        }
+    }
+
+    /// Encode ONE V1 on-disk log block, the whole layout in one place:
+    /// `MAGIC | block_length | format version | block type | header | content
+    /// length | content | footer count | trailing reverse pointer`.
+    ///
+    /// This is the single encoder for the V1 layout in this module. There were
+    /// two — this one and an inline copy in
+    /// `test_block_metadata_value_length_is_bounded_by_the_block` — written
+    /// months apart for different bugs. Both were correct, which is what made it
+    /// a drift hazard rather than a defect: the next change to the on-disk layout
+    /// has to land in both and nothing made the second one visible (m1 ISSUES
+    /// I-12).
+    ///
+    /// Two invariants a caller must not have to rediscover, and which the two
+    /// old copies each re-derived by hand:
+    ///
+    /// * `block_length` counts everything AFTER itself, the trailing pointer
+    ///   included — but not the magic and not its own 8 bytes;
+    /// * the trailing reverse pointer counts `block_length` PLUS the magic.
+    ///
+    /// Getting either wrong makes `is_block_corrupted` short-circuit the walk
+    /// before the header is ever parsed, so a test meaning to exercise header
+    /// parsing would silently exercise corruption detection instead.
+    fn a_v1_block(block_type: u32, header: &[V1Header<'_>], content: &[u8]) -> Vec<u8> {
+        let mut header_bytes = Vec::new();
+        header_bytes.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        for entry in header {
+            header_bytes.extend_from_slice(&entry.key.to_be_bytes());
+            header_bytes.extend_from_slice(&entry.declared_len.to_be_bytes());
+            header_bytes.extend_from_slice(entry.value);
+        }
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_be_bytes()); // format version V1
+        body.extend_from_slice(&block_type.to_be_bytes());
+        body.extend_from_slice(&header_bytes);
+        body.extend_from_slice(&(content.len() as u64).to_be_bytes());
+        body.extend_from_slice(content);
+        body.extend_from_slice(&0u32.to_be_bytes()); // empty footer
+
+        // +8 for the trailing reverse pointer that block_length must span.
+        let block_length = (body.len() + 8) as u64;
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&(block_length as u64).to_be_bytes());
-        buf.extend_from_slice(&1u32.to_be_bytes()); // format version V1
-        buf.extend_from_slice(&0u32.to_be_bytes()); // block type Command
-        buf.extend_from_slice(&1u32.to_be_bytes()); // one header entry
-        buf.extend_from_slice(&0u32.to_be_bytes()); // key ordinal: InstantTime
-        buf.extend_from_slice(&(instant_bytes.len() as u32).to_be_bytes());
-        buf.extend_from_slice(instant_bytes);
-        buf.extend_from_slice(&0u64.to_be_bytes()); // empty content
-        buf.extend_from_slice(&0u32.to_be_bytes()); // empty footer
-        buf.extend_from_slice(&trailing.to_be_bytes());
+        buf.extend_from_slice(&block_length.to_be_bytes());
+        buf.extend_from_slice(&body);
+        buf.extend_from_slice(&(block_length + MAGIC.len() as u64).to_be_bytes());
         buf
+    }
+
+    /// A well-formed V1 Command block carrying one InstantTime header entry.
+    fn a_valid_command_block(instant: &str) -> Vec<u8> {
+        a_v1_block(
+            V1_BLOCK_TYPE_COMMAND,
+            &[V1Header::entry(
+                V1_HEADER_KEY_INSTANT_TIME,
+                instant.as_bytes(),
+            )],
+            &[],
+        )
     }
 
     /// One good block, then a corrupt tail: a MAGIC, a length no file could

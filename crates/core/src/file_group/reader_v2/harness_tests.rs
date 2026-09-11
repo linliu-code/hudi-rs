@@ -1570,6 +1570,80 @@ fg_case_test!(
     case_parquet_log_block_pk_filter()
 );
 
+// The COMPOSITION of the log pushdown gate and the parquet log-block decoder,
+// through a real merge. Closes m1 ISSUES I-13.
+//
+// Both halves were already pinned, separately: `log_block_decoder_*` pins that a
+// builder reaches (or does not reach) the decoder, and
+// `parquet_log_block_applies_the_installed_row_filter` pins that a builder which
+// DOES arrive actually filters rows. Nothing pinned that a **non-PK** predicate
+// leaves log records intact **through the merge** — the two halves composed only
+// by inspection, which is how the original coverage came to be missing.
+//
+// ## Why this fixture, and why it is not vacuous
+//
+// I-13's warning is that a careless fixture here "would read as composition
+// coverage while asserting nothing". The property that makes this one discriminate
+// is that **the merge notices the loss of the log records**, and notices it in the
+// VALUES rather than the row count:
+//
+// | | `key` | base | parquet log block | merged truth |
+// |---|---|---|---|---|
+// | | `k1` | `v1`, num 1 | → `v1_upd`, num **11** | `v1_upd`, 11 |
+// | | `k2` | `v2`, num 2 | → `v2_upd`, num **22** | `v2_upd`, 22 |
+// | | `k3` | `v3`, num 3 | (untouched) | `v3`, 3 |
+// | | `k4` | `v4`, num 4 | DELETE block | (absent) |
+//
+// The predicate is `num < 10`, on a data column, so `mor_pk_safe = false`:
+//
+// * **Gate working** — the filter reaches neither the base read (its gate is
+//   `!has_log_files() || mor_pk_safe`, and this slice has log files) nor the log
+//   blocks. Everything is read, the merge applies, and the answer is the merged
+//   truth above.
+// * **Gate leaking** — `num = 11` and `num = 22` both FAIL `num < 10`, so both log
+//   records are filtered out of their parquet blocks before the merge ever sees
+//   them. The merge then has only base rows, and k1/k2 silently **revert to their
+//   base versions**: `v1`/1 and `v2`/2.
+//
+// Both outcomes have **exactly 3 rows**. A test asserting only the row count — or
+// only the keys — passes either way. That is why this case asserts the `value` and
+// `num` of every surviving row: the reversion is the only observable, and it is an
+// observable precisely because the log records carry values the base does not.
+fg_case_test!(
+    harness_parquet_log_block_non_pk_filter_leaves_log_records_intact_through_the_merge,
+    FgReaderCase {
+        name: "parquet_log_block_non_pk_filter_composes_with_the_merge",
+        fixture: QuickstartTripsTable::MorLayoutParquetLogBlock,
+        partition: "",
+        base_file: "9c161c05-86e5-46cc-85ab-14ce5326cfb0-0_0-79-130_20260607061232259.parquet",
+        log_files: &[
+            ".9c161c05-86e5-46cc-85ab-14ce5326cfb0-0_20260607061234788.log.1_0-93-156",
+            ".9c161c05-86e5-46cc-85ab-14ce5326cfb0-0_20260607061236403.log.1_0-107-185",
+            ".9c161c05-86e5-46cc-85ab-14ce5326cfb0-0_20260607061238120.log.1_0-121-217",
+        ],
+        expect_output_columns: Some(&["key", "ts", "value", "num"]),
+        row_filter: Some(RowFilterSpec {
+            column: "num",
+            predicate: FilterPredicate::Lt("10"),
+            // A data-column predicate is NOT pk-safe: `num` is mutable across
+            // upserts, so filtering a log block by it drops updates.
+            mor_pk_safe: false,
+        }),
+        expected: Expected::Rows {
+            sort_key: "key",
+            columns: &["key", "ts", "value", "num"],
+            // The UPDATED values. `v1`/1 or `v2`/2 here means a log record was
+            // dropped by a filter the gate should have withheld.
+            rows: &[
+                &["k1", "100", "v1_upd", "11"],
+                &["k2", "100", "v2_upd", "22"],
+                &["k3", "100", "v3", "3"],
+            ],
+        },
+        ..Default::default()
+    }
+);
+
 fg_case_test!(
     harness_parquet_log_blocks_merge,
     FgReaderCase {
