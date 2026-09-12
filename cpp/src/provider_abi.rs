@@ -293,19 +293,70 @@ impl CApiBaseFileDataProvider {
             log::error!("[hudi-provider-abi] null vtable; falling back to no provider");
             return None;
         }
-        // Copy the vtable by value; storage behind `vtable` need not outlive us.
-        let vtable = unsafe { *vtable };
-        if vtable.abi_version != HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION {
+
+        // ── Inspect BEFORE copying. Both steps are load-bearing. ──────────────
+        //
+        // `HudiBaseFileDataProviderVTable`'s two members are typed
+        // `extern "C" fn`, which Rust treats as NON-NULLABLE. Copying the struct
+        // by value out of a C pointer therefore MATERIALISES an invalid value if
+        // the caller passed a zeroed vtable — undefined behaviour before any
+        // check we could write runs. (The compiler knows: `mem::zeroed()` on this
+        // type is a hard error.) So the members are read as raw ADDRESSES through
+        // `addr_of!`, checked, and only then is the struct copied.
+        //
+        // A zeroed vtable is not hypothetical: it is what
+        // `HudiBaseFileDataProviderVTable vt = {0};`, a `memset`, a `calloc`, or a
+        // header predating a field all produce, and the C header lets a caller
+        // leave a member unset.
+        //
+        // SAFETY: `vtable` is non-null and valid for this call. `addr_of!` forms
+        // the field pointers without creating a reference to an invalid value,
+        // and `read_unaligned::<usize>` reads each fn slot as a plain address —
+        // it is never called.
+        let (version, try_addr, destroy_addr) = unsafe {
+            (
+                std::ptr::addr_of!((*vtable).abi_version).read_unaligned(),
+                std::ptr::addr_of!((*vtable).try_base_file)
+                    .cast::<usize>()
+                    .read_unaligned(),
+                std::ptr::addr_of!((*vtable).destroy)
+                    .cast::<usize>()
+                    .read_unaligned(),
+            )
+        };
+
+        // EXACT equality, deliberately — not `>=`, not `>`.
+        //
+        // The guard's job is to refuse a vtable whose LAYOUT is unknown, and an
+        // OLDER version is as unknown as a newer one. `>` in particular accepts
+        // version 0, the zeroed case above. Pinned in BOTH directions by
+        // `version_mismatch_yields_no_provider`; only the high side was tested
+        // until review round 7, which is why `!=` could be relaxed to `>` and
+        // still pass the whole suite.
+        if version != HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION {
             // Do not touch `ctx` or call `destroy` — a mismatched vtable's
             // `destroy` cannot be trusted. Degrade to no provider and leak `ctx`
             // (rare, and safer than calling an unknown-layout function pointer).
             log::error!(
-                "[hudi-provider-abi] vtable abi_version {} != expected {}; falling back to no provider",
-                vtable.abi_version,
+                "[hudi-provider-abi] vtable abi_version {version} != expected {}; \
+                 falling back to no provider",
                 HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION
             );
             return None;
         }
+        if try_addr == 0 || destroy_addr == 0 {
+            log::error!(
+                "[hudi-provider-abi] vtable has a NULL member (try_base_file={try_addr:#x}, \
+                 destroy={destroy_addr:#x}); falling back to no provider rather than \
+                 calling address 0"
+            );
+            return None;
+        }
+
+        // Only now is it sound to copy: both members are known non-null, so the
+        // `extern "C" fn` fields are valid values. Storage behind `vtable` need
+        // not outlive us.
+        let vtable = unsafe { *vtable };
         Some(Self { vtable, ctx })
     }
 
@@ -445,14 +496,22 @@ impl BaseFileDataProvider for CApiBaseFileDataProvider {
         // returns 0 (the "0 means success" C idiom) is the one way they will not —
         // so say so once per attempt rather than leaving an unexplained fallback
         // rate. See the doc on `HudiBaseFileDataResult`.
-        if c_res.outcome != outcome_code {
+        // ONE direction only: the field says SERVED while the return value does not.
+        //
+        // That is the "return 0 on success" trap — the provider believes it served
+        // the file and is being declined. The opposite pairing (returned SERVED,
+        // field left alone) is CONFORMING, because the field is advisory and
+        // `HudiBaseFileDataResult::empty()` pre-initialises it to NOT_SERVED; a
+        // symmetric `!=` warned on every served base file of every correct
+        // provider, which is how review round 7 found it.
+        if c_res.outcome == HUDI_PROVIDER_OUTCOME_SERVED
+            && outcome_code != HUDI_PROVIDER_OUTCOME_SERVED
+        {
             log::warn!(
-                "[hudi-provider-abi] provider returned {outcome_code} but set \
-                 out->outcome = {}; the RETURN VALUE is authoritative. If the \
-                 provider believes it served this file, it must RETURN \
-                 HUDI_PROVIDER_OUTCOME_SERVED ({HUDI_PROVIDER_OUTCOME_SERVED}), \
-                 not 0",
-                c_res.outcome
+                "[hudi-provider-abi] provider set out->outcome = SERVED but RETURNED \
+                 {outcome_code}, so this file is being DECLINED. The return value is \
+                 authoritative: return HUDI_PROVIDER_OUTCOME_SERVED \
+                 ({HUDI_PROVIDER_OUTCOME_SERVED}), not 0"
             );
         }
         if outcome_code != HUDI_PROVIDER_OUTCOME_SERVED {
@@ -589,7 +648,13 @@ mod tests {
         out.stats = HudiBaseFileProviderStats {
             files_served: (stub.outcome == HUDI_PROVIDER_OUTCOME_SERVED) as u64,
             storage_fallbacks: (stub.outcome != HUDI_PROVIDER_OUTCOME_SERVED) as u64,
+            // All THREE drain counters non-zero, and distinct. The zeroing below
+            // is what stops a provider double-counting them, and with only
+            // `rows_served` set two of the three assignments could be deleted
+            // without any test noticing (review round 7).
             rows_served: 3,
+            bytes_served: 5,
+            batches_received: 7,
             ..Default::default()
         };
         if stub.outcome == HUDI_PROVIDER_OUTCOME_SERVED && !stub.serve_without_stream {
@@ -629,15 +694,24 @@ mod tests {
         unsafe { hudi_base_file_data_provider_new(&vtable, Box::into_raw(stub) as *mut c_void) }
     }
 
+    /// MULTI-BYTE UTF-8 on purpose, here and in the whole-struct request test.
+    ///
+    /// `HudiStrSlice` is a pointer and a BYTE length with no NUL, and every
+    /// string in the request crosses as one. An ASCII-only fixture cannot tell a
+    /// byte length from a character count — both sides agree on every value it
+    /// can express — so a `len` taken from `chars().count()`, or a C consumer
+    /// that reads the slice as if it were NUL-terminated or single-byte, passes.
+    /// Partition values are user data (`city=münchen`) and object keys are
+    /// arbitrary, so this is the real input shape, not an exotic one.
     fn sample_request<'a>(
         schema: &'a Arc<Schema>,
         fields: &'a [String],
     ) -> BaseFileDataRequest<'a> {
         BaseFileDataRequest {
-            file_uri: "s3://bucket/table/part/base.parquet",
+            file_uri: "s3://bucket/table/city=münchen/基準.parquet",
             projected_schema: schema,
             can_push_predicate: true,
-            partition_path: "year=2024/month=01",
+            partition_path: "city=münchen/month=01",
             partition_fields: fields,
             data_schema: None,
         }
@@ -703,14 +777,23 @@ mod tests {
             // because the C side is its only reader. A test standing in for that
             // reader has to reconstruct the same way a C consumer does.
             //
+            // CHECKED, not `from_utf8_unchecked`: `len` is a BYTE length, and the
+            // fixtures are multi-byte on purpose, so a wrong `len` slices through
+            // a UTF-8 boundary. Unchecked, that is UB and the mutant that
+            // introduces it takes the test binary down with a double panic
+            // instead of failing an assertion. Checked, it names the field.
+            //
             // SAFETY: the adapter builds each slice from a `&str` it owns for the
             // whole synchronous call.
             fn slice_to_string(s: &HudiStrSlice) -> String {
                 if s.ptr.is_null() {
                     return String::new();
                 }
-                unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(s.ptr, s.len)) }
-                    .to_string()
+                let bytes = unsafe { std::slice::from_raw_parts(s.ptr, s.len) };
+                match std::str::from_utf8(bytes) {
+                    Ok(s) => s.to_string(),
+                    Err(e) => format!("<INVALID UTF-8 ACROSS THE ABI: {e}; len={}>", s.len),
+                }
             }
             let fields = if req.partition_fields.is_null() {
                 Vec::new()
@@ -789,15 +872,16 @@ mod tests {
             Field::new("ts", DataType::Int64, true),
             Field::new("city", DataType::Utf8, true),
         ]));
-        let fields = vec!["city".to_string(), "ts".to_string()];
+        let fields = vec!["città".to_string(), "ts".to_string()];
         let (served, _stats) = provider
             .try_base_file(BaseFileDataRequest {
-                file_uri: "s3://bucket/table/city=sf/base.parquet",
+                // Multi-byte UTF-8 in every string slice — see `sample_request`.
+                file_uri: "s3://bucket/table/città=sf/基準.parquet",
                 projected_schema: &schema,
                 // FALSE — the value the narrowing produces, and the one a
                 // hard-wired marshaller would get wrong.
                 can_push_predicate: false,
-                partition_path: "city=sf/ts=2024",
+                partition_path: "città=sf/ts=2024",
                 partition_fields: &fields,
                 data_schema: Some(&data_schema),
             })
@@ -813,10 +897,10 @@ mod tests {
         assert_eq!(
             seen,
             SeenCRequest {
-                file_uri: "s3://bucket/table/city=sf/base.parquet".to_string(),
+                file_uri: "s3://bucket/table/città=sf/基準.parquet".to_string(),
                 can_push_predicate: false,
-                partition_path: "city=sf/ts=2024".to_string(),
-                partition_fields: vec!["city".to_string(), "ts".to_string()],
+                partition_path: "città=sf/ts=2024".to_string(),
+                partition_fields: vec!["città".to_string(), "ts".to_string()],
                 partition_fields_len: 2,
                 // The PER-FILE intersection, not the table's data schema. These
                 // two are deliberately different here, because that is the only
@@ -988,14 +1072,23 @@ mod tests {
             sample_batch(),
             "batch survives the C round-trip"
         );
-        assert_eq!(stats.files_served, 1);
-        // The stub deliberately mis-reports a drain counter (rows_served: 3). On
-        // the served path hudi-core owns the drain counters — `served_batch_stream` (crates/core)
-        // fills them as it consumes the stream — so provider-abi zeroes whatever
-        // the provider claimed, preventing a double-count. Setup counters stay.
+        // The stub deliberately mis-reports ALL THREE drain counters
+        // (rows_served: 3, bytes_served: 5, batches_received: 7). On the served
+        // path hudi-core owns them — `served_batch_stream` (crates/core) fills
+        // them as it consumes the stream — so provider-abi zeroes whatever the
+        // provider claimed, preventing a double-count. Setup counters stay.
+        //
+        // Asserted as a WHOLE STRUCT, not field by field: a field list only pins
+        // the fields someone remembered to list, and review round 7 found that
+        // two of the three zeroing assignments could be deleted with the suite
+        // still green because this test named only `rows_served`.
         assert_eq!(
-            stats.rows_served, 0,
-            "served-path drain counters are zeroed to avoid double-counting"
+            stats,
+            BaseFileProviderStats {
+                files_served: 1,
+                ..Default::default()
+            },
+            "the served file is counted; every drain counter is zeroed"
         );
 
         drop(provider);
@@ -1034,19 +1127,18 @@ mod tests {
             "an unimportable stream must degrade to a storage read, not a partial serve"
         );
         // The stub set files_served: 1 alongside its SERVED outcome; since the
-        // stream was unusable, that has to be walked back.
+        // stream was unusable that has to be walked back, the attempt counted as
+        // a storage fallback instead, and all three drain counters (which the
+        // stub mis-reports as 3/5/7) zeroed — nothing was served. Whole struct,
+        // for the same reason as `served_outcome_roundtrips_batches`.
         assert_eq!(
-            stats.files_served, 0,
-            "a failed import must not stay counted as a served file"
+            stats,
+            BaseFileProviderStats {
+                storage_fallbacks: 1,
+                ..Default::default()
+            },
+            "a failed import is reclassified as a fallback with no drain counters"
         );
-        assert_eq!(
-            stats.storage_fallbacks, 1,
-            "a failed import must be counted as a storage fallback"
-        );
-        // Drain counters are hudi-core's on the served path and meaningless here.
-        assert_eq!(stats.rows_served, 0, "no rows were served");
-        assert_eq!(stats.bytes_materialized, 0, "no bytes were materialized");
-        assert_eq!(stats.batches_received, 0, "no batches were received");
 
         drop(provider);
         assert_eq!(
@@ -1090,8 +1182,228 @@ mod tests {
             &counter,
             HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION + 1,
         );
-        assert_eq!(handle, 0, "incompatible version must not produce a handle");
+        assert_eq!(handle, 0, "a NEWER version must not produce a handle");
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // And an OLDER one. Only the high side was tested until review round 7,
+        // which is why `!=` could be relaxed to `>` and pass the whole suite —
+        // accepting version 0, i.e. `HudiBaseFileDataProviderVTable vt = {0};`, a
+        // `memset`, a `calloc`, or a header predating the version field. Rust
+        // types the members as non-nullable `extern "C" fn`, so a zeroed vtable's
+        // first call would jump to address 0.
+        let handle = make_handle(
+            HUDI_PROVIDER_OUTCOME_SERVED,
+            &counter,
+            HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION - 1,
+        );
+        assert_eq!(
+            handle, 0,
+            "an OLDER version must not produce a handle either — an unknown \
+             layout is unknown in both directions"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    /// Captures `log` records so a guard can be asserted on what it DID, not on
+    /// what the optimiser happened to make of its absence.
+    ///
+    /// Needed because `Option<CApiBaseFileDataProvider>` niches `None` into one
+    /// of the two non-nullable `extern "C" fn` members. Whichever member the
+    /// niche lands on, a vtable with THAT member null collapses to `None` with or
+    /// without the guard — so deleting half the guard is invisible to any
+    /// assertion on the returned handle (review round 7 measured exactly that:
+    /// narrowing `try_addr == 0 || destroy_addr == 0` to `try_addr == 0` survived
+    /// the whole suite). The emitted diagnostic is the one observable the niche
+    /// does not forge.
+    struct CapturingLogger;
+
+    static CAPTURED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    /// Held for the duration of a capture-asserting test, so two of them cannot
+    /// interleave in the shared buffer.
+    static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            CAPTURED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(record.args().to_string());
+        }
+        fn flush(&self) {}
+    }
+
+    /// Installs the capturing logger once per test binary and returns the
+    /// serialising guard. `set_logger` may only succeed once per process, so an
+    /// `Err` here means something else claimed the global logger and the capture
+    /// assertions would silently pass on an empty buffer — fail loudly instead.
+    fn capture_logs() -> std::sync::MutexGuard<'static, ()> {
+        static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            *INSTALLED.get_or_init(|| {
+                log::set_logger(&CapturingLogger).is_ok() && {
+                    log::set_max_level(log::LevelFilter::Trace);
+                    true
+                }
+            }),
+            "another logger owns the global slot; log assertions cannot be trusted"
+        );
+        CAPTURED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        guard
+    }
+
+    fn captured_containing(needle: &str) -> Vec<String> {
+        CAPTURED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|m| m.contains(needle))
+            .cloned()
+            .collect()
+    }
+
+    /// A vtable built as BYTES, never as a Rust value.
+    ///
+    /// `mem::zeroed::<HudiBaseFileDataProviderVTable>()` is a hard error
+    /// precisely because the members are non-nullable `extern "C" fn` — which is
+    /// the whole reason `from_raw` must inspect through `addr_of!` rather than
+    /// copy first. A fixture that could be constructed in safe Rust would not be
+    /// testing what actually happens when C hands us a `{0}` vtable.
+    #[repr(C, align(8))]
+    struct RawVtable([u8; std::mem::size_of::<HudiBaseFileDataProviderVTable>()]);
+
+    fn raw_vtable(version: u32, try_addr: usize, destroy_addr: usize) -> RawVtable {
+        let mut raw = RawVtable([0u8; std::mem::size_of::<HudiBaseFileDataProviderVTable>()]);
+        let put = |raw: &mut RawVtable, off: usize, bytes: &[u8]| {
+            raw.0[off..off + bytes.len()].copy_from_slice(bytes);
+        };
+        put(
+            &mut raw,
+            std::mem::offset_of!(HudiBaseFileDataProviderVTable, abi_version),
+            &version.to_ne_bytes(),
+        );
+        put(
+            &mut raw,
+            std::mem::offset_of!(HudiBaseFileDataProviderVTable, try_base_file),
+            &try_addr.to_ne_bytes(),
+        );
+        put(
+            &mut raw,
+            std::mem::offset_of!(HudiBaseFileDataProviderVTable, destroy),
+            &destroy_addr.to_ne_bytes(),
+        );
+        raw
+    }
+
+    /// SAFETY: `RawVtable` is 8-aligned and exactly the struct's size, and
+    /// `from_raw` only READS through the pointer — it never materialises the
+    /// struct or calls a member until both addresses are known non-null.
+    fn handle_from_raw_vtable(raw: &RawVtable, ctx: *mut c_void) -> u64 {
+        unsafe {
+            hudi_base_file_data_provider_new(
+                std::ptr::from_ref(raw).cast::<HudiBaseFileDataProviderVTable>(),
+                ctx,
+            )
+        }
+    }
+
+    /// A vtable whose members are NULL must be refused before anything calls one.
+    ///
+    /// The C header lets a caller leave a member unset, and Rust types both as
+    /// non-nullable `extern "C" fn` — so `.is_null()` does not exist on them and
+    /// no code downstream of `from_raw` can check. This is the only place it CAN
+    /// be checked, and the consequence of not checking is a jump to address 0 on
+    /// a tokio blocking-pool thread, taking the executor process down.
+    ///
+    /// Every case carries the RIGHT abi_version, so the version guard cannot be
+    /// what rejects any of them.
+    ///
+    /// The PARTIALLY-null cases are the load-bearing ones, and review round 7
+    /// shipped this test with only the all-zero case — which passes with the null
+    /// guard deleted, for a reason that has nothing to do with the guard.
+    /// `Option<CApiBaseFileDataProvider>` niches `None` into the non-null
+    /// `extern "C" fn` field, so a `Some` built from an all-zero vtable is
+    /// bit-identical to `None` and the handle comes back 0 anyway. That is the UB
+    /// the guard exists to prevent, observed doing something convenient — and
+    /// what it does is a function of the optimiser, not of the contract. Fill one
+    /// member and the niche is occupied, so the mutant really does hand back a
+    /// live handle over a vtable with a null member in it.
+    #[test]
+    fn a_null_vtable_member_yields_no_provider() {
+        let good_try = stub_try
+            as extern "C" fn(
+                *mut c_void,
+                *const HudiBaseFileDataRequest,
+                *mut HudiBaseFileDataResult,
+            ) -> c_int as usize;
+        let good_destroy = stub_destroy as extern "C" fn(*mut c_void) as usize;
+
+        for (case, try_addr, destroy_addr) in [
+            ("both members null", 0, 0),
+            ("destroy null", good_try, 0),
+            ("try_base_file null", 0, good_destroy),
+        ] {
+            let _capture = capture_logs();
+            let raw = raw_vtable(
+                HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+                try_addr,
+                destroy_addr,
+            );
+            assert_eq!(
+                handle_from_raw_vtable(&raw, std::ptr::null_mut()),
+                0,
+                "{case}: a vtable with a NULL member must be refused, not stored \
+                 and later called at address 0"
+            );
+            // And refused BY THE GUARD. A handle of 0 alone does not prove that:
+            // see the note on `CapturingLogger` — the niche produces the same 0
+            // for the member it occupies whether the guard ran or not, so each
+            // half of the condition is pinned here by the diagnostic it emits.
+            assert_eq!(
+                captured_containing("vtable has a NULL member").len(),
+                1,
+                "{case}: the null-member guard must be what refused this vtable"
+            );
+        }
+    }
+
+    /// The fixture itself has to be capable of producing a live handle, or the
+    /// three refusals above prove nothing about the null members — they could be
+    /// refusals of a malformed fixture. Same bytes, both members filled.
+    #[test]
+    fn the_raw_vtable_fixture_yields_a_provider_when_no_member_is_null() {
+        let raw = raw_vtable(
+            HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+            stub_try
+                as extern "C" fn(
+                    *mut c_void,
+                    *const HudiBaseFileDataRequest,
+                    *mut HudiBaseFileDataResult,
+                ) -> c_int as usize,
+            stub_destroy as extern "C" fn(*mut c_void) as usize,
+        );
+        let counter = AtomicUsize::new(0);
+        let ctx = Box::into_raw(Box::new(StubCtx {
+            batches: vec![sample_batch()],
+            outcome: HUDI_PROVIDER_OUTCOME_NOT_SERVED,
+            serve_without_stream: false,
+            destroy_counter: &counter as *const AtomicUsize,
+        })) as *mut c_void;
+
+        let handle = handle_from_raw_vtable(&raw, ctx);
+        assert_ne!(handle, 0, "a fully-populated vtable must produce a handle");
+        // And the members really are the stub's: freeing the handle reaches
+        // `stub_destroy` through the bytes above, so `ctx` is released rather
+        // than leaked.
+        unsafe { hudi_base_file_data_provider_free(handle) };
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "the byte-built vtable's destroy member is the real one"
+        );
     }
 
     #[test]

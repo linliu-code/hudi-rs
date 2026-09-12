@@ -232,8 +232,6 @@ impl PushedFilter {
     /// named: `base_read_pushdown_is_safe()` short-circuits to `true` on any split
     /// with no log files, so the primary-key gate never runs on a CoW or base-only
     /// slice, which is precisely where a disarmed guard would over-drop.
-    /// direction for the callers of this, and
-    /// [`Self::references_only_primary_keys`] rejects malformed plans outright.
     pub fn referenced_columns(&self) -> Vec<String> {
         self.referenced_field_indices()
             .into_iter()

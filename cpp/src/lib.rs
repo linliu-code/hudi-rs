@@ -1122,6 +1122,28 @@ impl HoodieFileGroupReader {
             self.reader_context.merge_mode.as_str(),
         );
 
+        // C3 — tokio re-entry guard. `block_on` panics if called from within a
+        // tokio runtime thread, and a panic unwinding across the FFI boundary is
+        // UB. This entry point is meant to be called from a non-async C++ thread;
+        // if a caller ever drives it from inside a tokio runtime, surface a loud
+        // error here instead of letting `block_on` panic across FFI.
+        //
+        // FIRST, before the reader is built — the order `get_closable_iterator`
+        // already uses, and the same reasoning the stats claim below spells out:
+        // a call that is going to be REFUSED should do nothing on the way to
+        // refusing it. Building first constructs a core reader (and an extra
+        // strong reference to the injected provider) only to drop it, on a path
+        // where the provider's `destroy` may then run on this thread for a read
+        // that never happened.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(
+                "read_record_batch must not be called from within a tokio runtime: \
+                 it uses block_on on OBJECT_STORE_RUNTIME, which panics on re-entry \
+                 (call it from a plain C++/native thread instead)"
+                    .to_string(),
+            );
+        }
+
         // ENG-42276 / ENG-42866 — the row_filter_builder + mor_pk_safe live
         // on reader_context (set at FFI entry, see new_file_group_reader_with_context).
         // The FG reader gate at make_base_file_batches and the parquet log
@@ -1160,22 +1182,8 @@ impl HoodieFileGroupReader {
         // reader is the shape every caller uses; the alternative trades a
         // correct streaming path for a repeated-eager-read case that has none.
 
-        // C3 — tokio re-entry guard. `block_on` panics if called from within a
-        // tokio runtime thread, and a panic unwinding across the FFI boundary is
-        // UB. This entry point is meant to be called from a non-async C++ thread;
-        // if a caller ever drives it from inside a tokio runtime, surface a loud
-        // error here instead of letting `block_on` panic across FFI.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(
-                "read_record_batch must not be called from within a tokio runtime: \
-                 it uses block_on on OBJECT_STORE_RUNTIME, which panics on re-entry \
-                 (call it from a plain C++/native thread instead)"
-                    .to_string(),
-            );
-        }
-
-        // Claimed AFTER the re-entry guard, matching `get_closable_iterator`. This
-        // is a SET-ONCE cell: claiming it before a call that may be REFUSED binds
+        // Claimed after the re-entry guard above, matching `get_closable_iterator`.
+        // This is a SET-ONCE cell: claiming it before a call that may be REFUSED binds
         // it permanently to a slot nothing will ever write, and a later successful
         // call then reports a wall of zeros for a read that really was served —
         // the exact failure mode the counters exist to eliminate.

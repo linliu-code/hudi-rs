@@ -67,7 +67,7 @@ use std::sync::Arc;
 ///   complete picture. A provider that fills them anyway would be double-counted
 ///   on the eager path, so leaving them zero is part of the contract (the C-ABI
 ///   adapter enforces it for C providers by zeroing them on the served path).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BaseFileProviderStats {
     /// Base files served by the provider.
     pub files_served: u64,

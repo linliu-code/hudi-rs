@@ -386,6 +386,56 @@ fn served_batch_stream(
     .boxed()
 }
 
+/// Why a served stream's schema is not the one the provider was asked for, or
+/// `None` if it matches.
+///
+/// Compares field NAMES and DATA TYPES positionally. Deliberately ignores
+/// nullability and schema/field metadata: a provider that widens a non-null
+/// column to nullable, or that carries extra key-value metadata through its own
+/// transport, is still serving the right data, and declining it would cost a
+/// re-read for nothing. A name, a position, a type or a count is the shape the
+/// read is about to interpret the buffers as, so any of those differing means
+/// the batches are not what was asked for.
+///
+/// Types are compared EXACTLY, dictionary encoding included: `Dictionary(Int32,
+/// Utf8)` where `Utf8` was requested is a different physical layout, and the
+/// caller asked for a schema rather than for something convertible to one.
+fn served_schema_mismatch(
+    served: &arrow_schema::Schema,
+    wanted: &arrow_schema::Schema,
+) -> Option<String> {
+    if served.fields().len() != wanted.fields().len() {
+        return Some(format!(
+            "served {} field(s), wanted {}",
+            served.fields().len(),
+            wanted.fields().len()
+        ));
+    }
+    for (i, (got, want)) in served
+        .fields()
+        .iter()
+        .zip(wanted.fields().iter())
+        .enumerate()
+    {
+        if got.name() != want.name() {
+            return Some(format!(
+                "field {i} is named '{}', wanted '{}'",
+                got.name(),
+                want.name()
+            ));
+        }
+        if got.data_type() != want.data_type() {
+            return Some(format!(
+                "field {i} ('{}') has type {:?}, wanted {:?}",
+                want.name(),
+                got.data_type(),
+                want.data_type()
+            ));
+        }
+    }
+    None
+}
+
 /// `schema` without the internal row-position column.
 ///
 /// The column belongs to the base read and the position buffer; it is not the
@@ -1294,7 +1344,7 @@ impl HoodieFileGroupReader {
                 .map(|u| u.to_string())
                 .unwrap_or_else(|_| path.clone());
             let partition_fields = self.partition_fields();
-            let (outcome, stats) = provider
+            let (outcome, mut stats) = provider
                 .try_base_file(BaseFileDataRequest {
                     file_uri: &file_uri,
                     projected_schema: &intersection,
@@ -1304,6 +1354,47 @@ impl HoodieFileGroupReader {
                     data_schema: self.schema_handler.data_schema.as_ref(),
                 })
                 .await;
+
+            // A served stream is TRUSTED for values and CHECKED for shape.
+            //
+            // `project_batch_to_schema` resolves the served batch against
+            // `base_read_schema` BY NAME, and null-fills a name it does not find —
+            // which is right for a column genuinely absent from an older file, and
+            // is exactly what makes a wrong serve invisible. Every field in
+            // `intersection` was read out of THIS file's footer, so all of them
+            // are present; a provider that renames, reorders, retypes or drops one
+            // is not serving an evolved file, it is serving the wrong bytes, and
+            // without this check the read succeeds with a column of nulls where
+            // the data was.
+            //
+            // Declining is the safe degradation and matches the unimportable-stream
+            // path in `cpp/src/provider_abi.rs`: the attempt is reclassified from a
+            // serve to a storage fallback and the object-store read below produces
+            // the right answer. The cost of a false decline is one re-read; the
+            // cost of a false accept is silent data loss.
+            let outcome = match outcome {
+                Some(served) => {
+                    match served_schema_mismatch(served.schema().as_ref(), &intersection) {
+                        None => Some(served),
+                        Some(why) => {
+                            log::error!(
+                                "[HoodieFileGroupReader] base-file provider served \
+                                 '{path}' at the WRONG schema and is being declined: \
+                                 {why}. Falling back to the object-store read. A served \
+                                 stream must match `projected_schema` field for field, \
+                                 in order"
+                            );
+                            // Release the stream before the fallback read starts.
+                            drop(served);
+                            stats.files_served = stats.files_served.saturating_sub(1);
+                            stats.storage_fallbacks += 1;
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
             // Seed the shared slot with the setup counters on BOTH outcomes: a
             // fallback still reports its discover/connect timings, and
             // `storage_fallbacks` is the counter that makes a silent
@@ -4418,6 +4509,136 @@ mod tests {
             "materialized bytes counted on drain, within a sane range: {}",
             s.bytes_materialized
         );
+    }
+
+    /// A served stream whose schema is not the one the provider was asked for is
+    /// DECLINED, and the read falls back to object storage.
+    ///
+    /// This is the one provider mistake that is otherwise invisible.
+    /// `project_batch_to_schema` resolves by NAME and null-fills a name it cannot
+    /// find, because that is the correct behaviour for a column genuinely absent
+    /// from an older base file. A provider that renames, reorders, retypes or
+    /// drops a column therefore does not fail — it produces a successful read with
+    /// nulls where the data was, on the production FFI path, with no error and no
+    /// counter moving.
+    ///
+    /// Each case is driven end to end rather than against
+    /// `served_schema_mismatch` directly: a unit test of the comparator would
+    /// still pass with the call site deleted, which is the mutation that matters.
+    /// The parquet file holds 1, 2 and every stub serves 7, 8, so "fell back"
+    /// and "was served" are distinguishable in the OUTPUT, not just in a counter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_served_stream_at_the_wrong_schema_is_declined_not_null_filled() {
+        use arrow_array::{Int32Array, Int64Array};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let wrong: Vec<(&str, RecordBatch)> = vec![
+            (
+                "renamed column",
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new(
+                        "ident",
+                        DataType::Int32,
+                        true,
+                    )])),
+                    vec![Arc::new(Int32Array::from(vec![7, 8]))],
+                )
+                .unwrap(),
+            ),
+            (
+                "retyped column",
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+                    vec![Arc::new(Int64Array::from(vec![7i64, 8]))],
+                )
+                .unwrap(),
+            ),
+            (
+                "extra column",
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("id", DataType::Int32, true),
+                        Field::new("extra", DataType::Int32, true),
+                    ])),
+                    vec![
+                        Arc::new(Int32Array::from(vec![7, 8])),
+                        Arc::new(Int32Array::from(vec![70, 80])),
+                    ],
+                )
+                .unwrap(),
+            ),
+        ];
+
+        for (case, served) in wrong {
+            let tmp = tempfile::tempdir().unwrap();
+            let (schema, on_disk) = id_batch(vec![1, 2]);
+            let base_name = "f1-0_0-1-1_001.parquet";
+            write_parquet_file(tmp.path(), base_name, &on_disk);
+
+            let provider = StubDataProvider::serving(vec![served]);
+            let mut reader =
+                reader_with_provider(tmp.path(), base_name, schema.clone(), provider.clone()).await;
+            let live = reader.base_file_provider_live_stats();
+
+            let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+            assert!(
+                provider.seen().is_some(),
+                "{case}: fixture check — the provider must have been offered the file, \
+                 or the decline below is a decline of nothing"
+            );
+            assert_eq!(
+                id_values(&out),
+                vec![1, 2],
+                "{case}: the FILE's rows must reach the caller. Seeing [7, 8] means the \
+                 wrong-shaped serve was accepted; seeing nulls means it was accepted and \
+                 null-filled"
+            );
+            let s = live.lock().unwrap();
+            assert_eq!(
+                s.files_served, 0,
+                "{case}: a declined serve must not stay counted as a served file"
+            );
+            assert_eq!(
+                s.storage_fallbacks, 1,
+                "{case}: and must be counted as the storage fallback it became, or the \
+                 decline is silent to an operator"
+            );
+            assert_eq!(
+                (s.rows_served, s.batches_received),
+                (0, 0),
+                "{case}: nothing was drained from the declined stream"
+            );
+        }
+    }
+
+    /// The control for the test above: the SAME fixture, with the schema the
+    /// provider was actually asked for, is served.
+    ///
+    /// Without it, `served_schema_mismatch` returning `Some` unconditionally — or
+    /// the call site declining every serve — passes every assertion above while
+    /// disabling the provider path entirely.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_served_stream_at_the_right_schema_is_still_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::serving(vec![id_batch(vec![7, 8]).1]);
+        let mut reader = reader_with_provider(tmp.path(), base_name, schema, provider).await;
+        let live = reader.base_file_provider_live_stats();
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            id_values(&out),
+            vec![7, 8],
+            "a matching schema is served — the PROVIDER's rows reach the caller"
+        );
+        let s = live.lock().unwrap();
+        assert_eq!(s.files_served, 1);
+        assert_eq!(s.storage_fallbacks, 0);
     }
 
     /// `read()` snapshots the shared slot into `read_stats` once the merge has
