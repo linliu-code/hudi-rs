@@ -5111,6 +5111,71 @@ mod tests {
         );
     }
 
+    /// **The producer STOPS when the consumer drops the stream.**
+    ///
+    /// `served_batch_stream`'s doc rests on this in three places — "dropping the
+    /// returned stream drops the receiver, the next `blocking_send` fails, and
+    /// the producer returns", the bound on how far ahead it may run, and the
+    /// claim that a cancelled read costs at most two wasted batches. Nothing
+    /// pinned it: `a_served_reader_runs_two_batches_ahead_and_no_further` drops
+    /// the stream and then asserts nothing about what happens next.
+    ///
+    /// So `if tx.blocking_send(projected).is_err() || was_err` → `&& was_err`
+    /// compiled, tripped no lint, and passed every test — while turning a
+    /// cancelled query into a hot loop that pulls the provider to exhaustion
+    /// (the whole base file, for a read nobody is reading) and re-polls a reader
+    /// that has already returned an error, which for an FFI `ArrowArrayStream` is
+    /// use-after-error on a C object.
+    ///
+    /// The probe serves far more batches than the read-ahead, so "it stopped" and
+    /// "it ran out" are distinguishable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dropped_stream_stops_the_producer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let threads = Arc::new(StdMutex::new(Vec::new()));
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), base_name, schema).await;
+        reader.base_file_provider = Some(Arc::new(ProbeProvider {
+            batches: 500,
+            threads: threads.clone(),
+            block_on_each_next: false,
+        }));
+
+        let mut batches = reader.base_file_source().await.unwrap().batches;
+        let _first = batches.next().await.expect("a first batch").expect("ok");
+        drop(batches);
+
+        // Let the producer notice. It is parked in `blocking_send`, so the drop
+        // of the receiver is what wakes it.
+        let pulled = || threads.lock().unwrap().len();
+        let mut settled = pulled();
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let now = pulled();
+            if now == settled {
+                break;
+            }
+            settled = now;
+        }
+        let after_settling = pulled();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        assert_eq!(
+            pulled(),
+            after_settling,
+            "the producer must STOP once the consumer drops the stream — it is \
+             still pulling, so a cancelled read is draining the whole served file"
+        );
+        assert!(
+            after_settling < 500,
+            "and it must stop EARLY, not merely finish: {after_settling} of 500 \
+             batches pulled for a read that took one"
+        );
+    }
+
     /// **The served reader is released BEFORE the provider's `destroy(ctx)`.**
     ///
     /// `a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`

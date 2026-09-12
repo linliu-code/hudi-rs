@@ -644,8 +644,16 @@ mod tests {
             partition_path: String,
             partition_fields: Vec<String>,
             partition_fields_len: usize,
-            projected_schema_is_null: bool,
-            data_schema_is_null: bool,
+            // The schemas' CONTENT, not just their null-ness. Round 5 showed that
+            // `is_null()` alone leaves a mutation alive:
+            // `FFI_ArrowSchema::try_from(req.data_schema.unwrap_or(req.projected_schema)…)`
+            // compiles, keeps the pointer non-null, and hands the only real
+            // provider the TABLE's schema where the per-file intersection belongs
+            // — reinstating matrix row 6's corruption one layer below where row 6
+            // pins it. The fixture's two schemas differ, so content tells them
+            // apart and `is_null()` cannot.
+            projected_schema: Option<Schema>,
+            data_schema: Option<Schema>,
         }
         static SEEN: StdMutex<Option<SeenCRequest>> = StdMutex::new(None);
 
@@ -683,14 +691,23 @@ mod tests {
                 .map(slice_to_string)
                 .collect()
             };
+            // SAFETY: both pointers, when non-null, are exports the adapter built
+            // and keeps alive for the whole synchronous call.
+            let import = |p: *const FFI_ArrowSchema| -> Option<Schema> {
+                if p.is_null() {
+                    None
+                } else {
+                    Some(Schema::try_from(unsafe { &*p }).expect("a valid exported schema"))
+                }
+            };
             *SEEN.lock().unwrap() = Some(SeenCRequest {
                 file_uri: slice_to_string(&req.file_uri),
                 can_push_predicate: req.can_push_predicate,
                 partition_path: slice_to_string(&req.partition_path),
                 partition_fields: fields,
                 partition_fields_len: req.partition_fields_len,
-                projected_schema_is_null: req.projected_schema.is_null(),
-                data_schema_is_null: req.data_schema.is_null(),
+                projected_schema: import(req.projected_schema),
+                data_schema: import(req.data_schema),
             });
             // SAFETY: a fresh out-parameter supplied by the adapter.
             unsafe { &mut *out }.stats = HudiBaseFileProviderStats {
@@ -741,11 +758,16 @@ mod tests {
                 partition_path: "city=sf/ts=2024".to_string(),
                 partition_fields: vec!["city".to_string(), "ts".to_string()],
                 partition_fields_len: 2,
-                projected_schema_is_null: false,
-                data_schema_is_null: false,
+                // The PER-FILE intersection, not the table's data schema. These
+                // two are deliberately different here, because that is the only
+                // way the assertion can tell them apart.
+                projected_schema: Some((*schema).clone()),
+                data_schema: Some((*data_schema).clone()),
             },
-            "every field must cross the boundary unaltered — a provider has \
-             nothing else to act on"
+            "every field must cross the boundary unaltered, CONTENT included — a \
+             provider has nothing else to act on, and handing it the table's \
+             schema where the file's intersection belongs is silent corruption \
+             on a mislabelled file"
         );
     }
 
