@@ -17,9 +17,9 @@
 """Enforces one authority for the project version. Invoked by check-version-single-source.sh.
 
 With --fix, rewrites the intra-workspace dependency requirements to the authority instead of
-reporting them, which is what `make version-sync` runs after a bump. The other two rules are
-never auto-fixed: a stray hardcode and a lost derivation both need a human to decide what the
-site should read instead.
+reporting them, which is what `make version-sync` runs after a bump. The other rules are
+never auto-fixed: a second authority, a stray hardcode and a lost derivation all need a human
+to decide what the site should read instead.
 """
 
 from __future__ import annotations
@@ -33,11 +33,23 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # Files that are allowed to contain a literal of the project's own version. Everything else
 # must derive it. Cargo.lock is generated and cargo keeps it in step by itself.
+#
+# Cargo.toml is exempt from the SWEEP because a manifest is full of legitimate version literals
+# -- every third-party requirement is one -- so sweeping it would be all false positives. The two
+# fields in a manifest that CAN carry a second copy of the project's own version are therefore
+# checked structurally instead, by rule 0 (the member's own `[package] version`) and rule 1 (an
+# intra-workspace dependency requirement). A literal parked anywhere else in a manifest, such as
+# under `[package.metadata]`, is deliberately NOT a failure: it is inert to cargo and to every
+# artifact this project publishes, and a rule broad enough to catch it would have to guess which
+# of a manifest's many versions is the project's own.
 LITERAL_ALLOWED_SUFFIXES = ("Cargo.toml", "Cargo.lock")
 
-# Prose is exempt: crates/jni/README.md records the versions of carriers that were actually
-# published, which are history and must NOT be rewritten by a bump.
-SWEEP_SKIP_SUFFIXES = (".md",)
+# One prose file is exempt: crates/jni/README.md records the versions of carriers that were
+# actually published, which are history and must NOT be rewritten by a bump. The exemption is
+# named rather than extended to `*.md`, because a blanket suffix rule would let a pinned version
+# in ANY document rot silently -- documentation that tells a reader to install the wrong version
+# is the same defect as a stale literal in a script, just slower to notice.
+SWEEP_SKIP_FILES = ("crates/jni/README.md",)
 
 # Sites that used to carry a hardcoded copy and must now visibly derive one. Rule 2 catches a
 # re-hardcode; this catches the other way a derivation can be lost -- being deleted outright.
@@ -141,6 +153,51 @@ def dep_entries(text: str):
         i += 1
 
 
+def workspace_members() -> list[str]:
+    """Returns the manifest path of every member of the root workspace.
+
+    Reads and expands `[workspace] members` from the root manifest rather than shelling out to
+    `cargo metadata`, for the same reason the dependency parsing is hand-rolled: this has to run
+    wherever a contributor or a CI runner has a python3, without requiring a cargo on PATH or a
+    resolvable dependency graph.
+
+    Members are what rule 0 governs. A manifest OUTSIDE the member list -- `demo/apps/*` -- carries
+    its own unrelated version on purpose and is none of this checker's business: it is not part of
+    this workspace and nothing published from here derives from it.
+    """
+    text = (ROOT / "Cargo.toml").read_text()
+    block = re.search(r"^\[workspace\]\s*$(.*?)(?=^\[)", text, re.M | re.S)
+    if not block:
+        raise SystemExit("Cargo.toml has no [workspace] section, so rule 0 cannot know what the "
+                         "members are. This checker assumes a workspace root.")
+    listing = re.search(r"members\s*=\s*\[(.*?)\]", block.group(1), re.S)
+    if not listing:
+        raise SystemExit("[workspace] has no `members` list, so rule 0 cannot know what to check.")
+    manifests: list[str] = []
+    for pattern in re.findall(r'"([^"]+)"', listing.group(1)):
+        for d in sorted(ROOT.glob(pattern)):
+            manifest = d / "Cargo.toml"
+            if manifest.is_file():
+                manifests.append(str(manifest.relative_to(ROOT)))
+    return manifests
+
+
+def package_version_key(text: str) -> str | None:
+    """Returns the raw `version` line from a manifest's own `[package]` section, or None."""
+    section = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        m = ARRAY_SECTION.match(stripped) or SECTION.match(stripped)
+        if m:
+            section = m.group(1)
+            continue
+        if section != "package":
+            continue
+        if stripped.startswith("version.workspace") or stripped.startswith("version"):
+            return stripped
+    return None
+
+
 def authority() -> str:
     script = ROOT / ".github/scripts/workspace-version.sh"
     try:
@@ -178,6 +235,32 @@ def main() -> int:
     checked_deps = 0
 
     print(f"authority: [workspace.package] version = {want}  (Cargo.toml)")
+
+    # ---- Rule 0: every workspace member INHERITS the authority; none declares its own. ----
+    # Without this, the authority is not single: a member can set a literal `version` in its
+    # own `[package]`, publish under that number, and every other rule still passes -- rule 1 reads
+    # dependency requirements, and the rule 2 sweep exempts Cargo.toml entirely. That is the exact
+    # shape this milestone exists to make impossible, so it is checked rather than assumed.
+    members = workspace_members()
+    for rel in members:
+        key = package_version_key((ROOT / rel).read_text())
+        if key is None:
+            failures.append(
+                f"{rel}: workspace member has no `version` key in [package] -- it must read "
+                f"`version.workspace = true` so the authority stays single"
+            )
+        elif not key.startswith("version.workspace"):
+            failures.append(
+                f"{rel}: workspace member declares its own version (`{key}`) instead of "
+                f"`version.workspace = true` -- that is a SECOND authority; the version belongs "
+                f"in [workspace.package] in the root Cargo.toml and nowhere else"
+            )
+
+    if not members:
+        failures.append(
+            "found NO workspace members at all -- rule 0 asserted nothing, which means this "
+            "checker is broken rather than the tree being clean"
+        )
 
     # ---- Rule 1: every intra-workspace path dependency requests exactly the authority. ----
     # Read structurally with a TOML parser rather than by line, so a dependency written across
@@ -218,7 +301,7 @@ def main() -> int:
 
     # ---- Rule 2: nothing else carries a copy of a project version. ----
     for rel in tracked_files():
-        if rel.endswith(LITERAL_ALLOWED_SUFFIXES) or rel.endswith(SWEEP_SKIP_SUFFIXES):
+        if rel.endswith(LITERAL_ALLOWED_SUFFIXES) or rel in SWEEP_SKIP_FILES:
             continue
         path = ROOT / rel
         if not path.is_file():
@@ -251,8 +334,9 @@ def main() -> int:
 
     # Absence is not success: say what was examined, so an empty result set cannot be mistaken
     # for a clean one.
-    print(f"checked: {checked_deps} intra-workspace dependency requirement(s), "
-          f"{len(tracked_files())} tracked file(s) swept, {len(MUST_DERIVE)} derivation site(s)")
+    print(f"checked: {len(members)} workspace member(s), {checked_deps} intra-workspace "
+          f"dependency requirement(s), {len(tracked_files())} tracked file(s) swept, "
+          f"{len(MUST_DERIVE)} derivation site(s)")
 
     if checked_deps == 0:
         failures.append(
