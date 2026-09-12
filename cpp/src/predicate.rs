@@ -220,7 +220,18 @@ impl PushedFilter {
     /// field-index order. Any decision about what the predicate can misread must
     /// key on this; [`Self::columns`] would widen it to the whole scan.
     ///
-    /// An unresolvable field index is skipped — a wider result is the conservative
+    /// An unresolvable field index is SKIPPED, which narrows the result — so a
+    /// predicate whose column cannot be resolved does not arm the repair guard for
+    /// that column. That would be the unsafe direction if anything downstream still
+    /// pushed the predicate.
+    ///
+    /// Nothing does. `build_row_filter` refuses the same unresolvable plan outright,
+    /// so no filter is installed and there is nothing for a disarmed guard to
+    /// misread. That is the compensating control — NOT
+    /// `references_only_primary_keys`, which an earlier version of this comment
+    /// named: `base_read_pushdown_is_safe()` short-circuits to `true` on any split
+    /// with no log files, so the primary-key gate never runs on a CoW or base-only
+    /// slice, which is precisely where a disarmed guard would over-drop.
     /// direction for the callers of this, and
     /// [`Self::references_only_primary_keys`] rejects malformed plans outright.
     pub fn referenced_columns(&self) -> Vec<String> {

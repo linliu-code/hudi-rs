@@ -1418,8 +1418,16 @@ impl HoodieFileGroupReader {
     /// Copy the shared provider slot into [`Self::read_stats`].
     ///
     /// Called by [`Self::read`], where the stream is exhausted and the drain
-    /// counters are therefore final. `None` stays `None` when no provider ever
-    /// ran, so `base_file_provider: Some(all zeroes)` cannot be confused with
+    /// counters are therefore final. `None` stays `None` when no provider was
+    /// INJECTED — which is what the guard below actually tests, and is weaker
+    /// than "never ran": a provider injected on a position-merge split (skipped
+    /// at the seam) or a log-only file group (which returns before the seam) is
+    /// never offered a file, and this writes `Some(all zeroes)` for it. So
+    /// all-zeroes distinguishes "no provider injected" from "a provider was
+    /// injected", not from "a provider ran". A consumer that needs the stronger
+    /// distinction should read `files_served + storage_fallbacks`, which is the
+    /// count of files actually OFFERED. `base_file_provider: Some(all zeroes)`
+    /// cannot be confused with
     /// "no provider injected".
     fn snapshot_provider_stats(&mut self) {
         if self.base_file_provider.is_none() {
@@ -4107,12 +4115,15 @@ mod tests {
 
     #[test]
     fn builder_routes_repair_risk_columns_into_reader_context() {
+        // NO `with_row_filter_builder` here, deliberately. `build()`'s decision to
+        // clone the context is a disjunction, and a sibling call would satisfy it
+        // independently — leaving the `repair_risk_columns` disjunct pinned by
+        // nothing, so deleting it from that condition would pass this test.
         let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
         let reader = HoodieFileGroupReader::builder()
             .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
             .with_storage(storage)
             .with_input_split(dummy_input_split())
-            .with_row_filter_builder(make_row_filter_builder())
             .with_repair_risk_columns(vec!["ts".to_string()])
             .build()
             .unwrap();
@@ -5150,15 +5161,26 @@ mod tests {
 
         // Let the producer notice. It is parked in `blocking_send`, so the drop
         // of the receiver is what wakes it.
+        // THREE consecutive stable samples, not one. The producer calls `next()`
+        // before `blocking_send`, so a blocking-pool thread starved for a single
+        // 10ms window would look settled and then legitimately pull once more —
+        // a false FAILURE under load. (Not a false pass: the `< 500` assertion
+        // below is what excludes "it finished".)
         let pulled = || threads.lock().unwrap().len();
         let mut settled = pulled();
+        let mut stable = 0;
         for _ in 0..200 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             let now = pulled();
             if now == settled {
-                break;
+                stable += 1;
+                if stable >= 3 {
+                    break;
+                }
+            } else {
+                stable = 0;
+                settled = now;
             }
-            settled = now;
         }
         let after_settling = pulled();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;

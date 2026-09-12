@@ -1159,18 +1159,6 @@ impl HoodieFileGroupReader {
         // would shadow it, reporting zeros for the stream. One read per FFI
         // reader is the shape every caller uses; the alternative trades a
         // correct streaming path for a repeated-eager-read case that has none.
-        if self
-            .base_file_provider_stats
-            .set(hudi_dep::ffi_support::base_file_provider_live_stats(
-                &reader,
-            ))
-            .is_err()
-        {
-            log::debug!(
-                "[hudi-rs-reader] read_record_batch called again on one reader; \
-                 base_file_provider_stats keeps reporting the first read"
-            );
-        }
 
         // C3 — tokio re-entry guard. `block_on` panics if called from within a
         // tokio runtime thread, and a panic unwinding across the FFI boundary is
@@ -1183,6 +1171,24 @@ impl HoodieFileGroupReader {
                  it uses block_on on OBJECT_STORE_RUNTIME, which panics on re-entry \
                  (call it from a plain C++/native thread instead)"
                     .to_string(),
+            );
+        }
+
+        // Claimed AFTER the re-entry guard, matching `get_closable_iterator`. This
+        // is a SET-ONCE cell: claiming it before a call that may be REFUSED binds
+        // it permanently to a slot nothing will ever write, and a later successful
+        // call then reports a wall of zeros for a read that really was served —
+        // the exact failure mode the counters exist to eliminate.
+        if self
+            .base_file_provider_stats
+            .set(hudi_dep::ffi_support::base_file_provider_live_stats(
+                &reader,
+            ))
+            .is_err()
+        {
+            log::debug!(
+                "[hudi-rs-reader] read_record_batch called again on one reader; \
+                 base_file_provider_stats keeps reporting the first read"
             );
         }
 

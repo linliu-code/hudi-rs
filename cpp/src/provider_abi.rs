@@ -169,9 +169,24 @@ impl From<HudiBaseFileProviderStats> for BaseFileProviderStats {
     }
 }
 
-/// Out-parameter the provider fills. When `outcome == HUDI_PROVIDER_OUTCOME_SERVED`,
-/// `stream` holds a valid Arrow C stream of the projected batches; otherwise
-/// `outcome == HUDI_PROVIDER_OUTCOME_NOT_SERVED` and `stream` is left empty.
+/// Out-parameter the provider fills.
+///
+/// ⚠️ **The FUNCTION'S RETURN VALUE is authoritative, not this `outcome` field.**
+/// hudi-rs branches on what `try_base_file` returns and treats `out->outcome` as
+/// advisory only; the field exists because the ABI is frozen at version 1.
+///
+/// That distinction bites in one specific way, which is why it is stated here
+/// rather than left implicit. `HUDI_PROVIDER_OUTCOME_NOT_SERVED` is `0`, and
+/// "return 0 on success" is the dominant C idiom — so a provider that fills
+/// `out->stream`, sets `out->outcome = HUDI_PROVIDER_OUTCOME_SERVED`, and then
+/// returns `0` is DECLINED on every file, silently, while its own counters say
+/// it served them. Return `HUDI_PROVIDER_OUTCOME_SERVED` (`1`).
+///
+/// hudi-rs logs loudly when the two disagree, so the mistake is diagnosable from
+/// one read's logs rather than from a fallback rate nobody can explain.
+///
+/// When served, `stream` holds a valid Arrow C stream of the projected batches;
+/// otherwise `stream` is left empty.
 /// `stats` is filled either way (a file that was not served still reports its
 /// timings).
 #[repr(C)]
@@ -425,6 +440,21 @@ impl BaseFileDataProvider for CApiBaseFileDataProvider {
         };
 
         let mut stats: BaseFileProviderStats = c_res.stats.into();
+        // The return value decides; `c_res.outcome` is advisory. They should agree,
+        // and a provider that fills the stream, sets the field to SERVED and then
+        // returns 0 (the "0 means success" C idiom) is the one way they will not —
+        // so say so once per attempt rather than leaving an unexplained fallback
+        // rate. See the doc on `HudiBaseFileDataResult`.
+        if c_res.outcome != outcome_code {
+            log::warn!(
+                "[hudi-provider-abi] provider returned {outcome_code} but set \
+                 out->outcome = {}; the RETURN VALUE is authoritative. If the \
+                 provider believes it served this file, it must RETURN \
+                 HUDI_PROVIDER_OUTCOME_SERVED ({HUDI_PROVIDER_OUTCOME_SERVED}), \
+                 not 0",
+                c_res.outcome
+            );
+        }
         if outcome_code != HUDI_PROVIDER_OUTCOME_SERVED {
             return (None, stats);
         }
@@ -654,6 +684,9 @@ mod tests {
             // apart and `is_null()` cannot.
             projected_schema: Option<Schema>,
             data_schema: Option<Schema>,
+            /// Any schema that failed to import, as a message. Captured rather
+            /// than unwrapped — see the import closure below.
+            import_errors: Vec<String>,
         }
         static SEEN: StdMutex<Option<SeenCRequest>> = StdMutex::new(None);
 
@@ -693,21 +726,32 @@ mod tests {
             };
             // SAFETY: both pointers, when non-null, are exports the adapter built
             // and keeps alive for the whole synchronous call.
-            let import = |p: *const FFI_ArrowSchema| -> Option<Schema> {
+            // The import's error is CAPTURED, never unwrapped: this is an
+            // `extern "C" fn`, and since Rust 1.81 an unwind out of one ABORTS the
+            // process. A `.expect()` here would take down the whole test binary —
+            // every other result in the run — instead of failing one test.
+            let import = |p: *const FFI_ArrowSchema| -> Result<Option<Schema>, String> {
                 if p.is_null() {
-                    None
+                    Ok(None)
                 } else {
-                    Some(Schema::try_from(unsafe { &*p }).expect("a valid exported schema"))
+                    Schema::try_from(unsafe { &*p })
+                        .map(Some)
+                        .map_err(|e| e.to_string())
                 }
             };
+            let (projected, data) = (import(req.projected_schema), import(req.data_schema));
             *SEEN.lock().unwrap() = Some(SeenCRequest {
                 file_uri: slice_to_string(&req.file_uri),
                 can_push_predicate: req.can_push_predicate,
                 partition_path: slice_to_string(&req.partition_path),
                 partition_fields: fields,
                 partition_fields_len: req.partition_fields_len,
-                projected_schema: import(req.projected_schema),
-                data_schema: import(req.data_schema),
+                projected_schema: projected.clone().unwrap_or(None),
+                data_schema: data.clone().unwrap_or(None),
+                import_errors: [projected.err(), data.err()]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
             });
             // SAFETY: a fresh out-parameter supplied by the adapter.
             unsafe { &mut *out }.stats = HudiBaseFileProviderStats {
@@ -728,10 +772,21 @@ mod tests {
         let handle = unsafe { hudi_base_file_data_provider_new(&vtable, std::ptr::null_mut()) };
         let provider = unsafe { take_provider_from_handle(handle) }.expect("provider");
 
-        let schema: Arc<Schema> =
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        // NOT all-nullable and NOT metadata-free. `Field`'s `PartialEq` compares
+        // name, type, nullability AND metadata, so a fixture exercising only the
+        // nullable/empty state would pass a marshaller that forced
+        // `nullable = true` or dropped field metadata.
+        let schema: Arc<Schema> = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("ts", DataType::Int64, true).with_metadata(
+                [("unit".to_string(), "micros".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+        ]));
         let data_schema: Arc<Schema> = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, true),
+            Field::new("id", DataType::Int32, false),
+            Field::new("ts", DataType::Int64, true),
             Field::new("city", DataType::Utf8, true),
         ]));
         let fields = vec!["city".to_string(), "ts".to_string()];
@@ -750,6 +805,11 @@ mod tests {
         assert!(served.is_none(), "the capture stub declines");
 
         let seen = SEEN.lock().unwrap().take().expect("the C side was called");
+        assert!(
+            seen.import_errors.is_empty(),
+            "both schemas must import cleanly on the C side: {:?}",
+            seen.import_errors
+        );
         assert_eq!(
             seen,
             SeenCRequest {
@@ -763,12 +823,92 @@ mod tests {
                 // way the assertion can tell them apart.
                 projected_schema: Some((*schema).clone()),
                 data_schema: Some((*data_schema).clone()),
+                import_errors: Vec::new(),
             },
             "every field must cross the boundary unaltered, CONTENT included — a \
              provider has nothing else to act on, and handing it the table's \
              schema where the file's intersection belongs is silent corruption \
              on a mislabelled file"
         );
+    }
+
+    /// EVERY STATS FIELD survives the C boundary INBOUND, in the right slot.
+    ///
+    /// The outbound half of this crossing — `to_ffi_base_file_provider_stats` in
+    /// `cpp/src/lib.rs` — is pinned field-for-field with ten distinct values by
+    /// `base_file_provider_stats_maps_all_fields`. The INBOUND half, the `From`
+    /// impl above, had no such test: it was asserted only incidentally, by
+    /// whatever the stubs happened to set. No stub in this repository sets
+    /// `local_served` or `remote_served` at all, and three more fields are zeroed
+    /// on the served path before anything can look at them.
+    ///
+    /// So swapping two adjacent `u64` lines —
+    /// `local_served: s.remote_served, remote_served: s.local_served` — compiled,
+    /// tripped no lint, and passed the entire suite. `files_served ==
+    /// local_served + remote_served` still reconciles and the sum is unchanged,
+    /// so nothing downstream notices; every dashboard fed by the Gluten metrics
+    /// bridge just reports the inverse of the one signal the provider seam exists
+    /// to produce — is this split being served locally or over the network.
+    ///
+    /// Ten DISTINCT non-zero values, on a NOT_SERVED outcome so the served path's
+    /// deliberate zeroing of the three drain counters cannot mask them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_stats_field_survives_the_c_boundary_inbound() {
+        extern "C" fn all_distinct(
+            _ctx: *mut c_void,
+            _req: *const HudiBaseFileDataRequest,
+            out: *mut HudiBaseFileDataResult,
+        ) -> c_int {
+            // SAFETY: a fresh out-parameter supplied by the adapter.
+            unsafe { &mut *out }.stats = HudiBaseFileProviderStats {
+                files_served: 1,
+                storage_fallbacks: 2,
+                local_served: 3,
+                remote_served: 4,
+                rows_served: 5,
+                bytes_served: 6,
+                batches_received: 7,
+                discover_wall_nanos: 8,
+                connect_wall_nanos: 9,
+                fetch_wall_nanos: 10,
+            };
+            HUDI_PROVIDER_OUTCOME_NOT_SERVED
+        }
+        extern "C" fn noop_destroy(_ctx: *mut c_void) {}
+
+        let vtable = HudiBaseFileDataProviderVTable {
+            abi_version: HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+            try_base_file: all_distinct,
+            destroy: noop_destroy,
+        };
+        let handle = unsafe { hudi_base_file_data_provider_new(&vtable, std::ptr::null_mut()) };
+        let provider = unsafe { take_provider_from_handle(handle) }.expect("provider");
+
+        let schema: Arc<Schema> =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let fields: Vec<String> = Vec::new();
+        let (served, stats) = provider
+            .try_base_file(sample_request(&schema, &fields))
+            .await;
+        assert!(served.is_none(), "NOT_SERVED, so nothing is served");
+
+        // Field for field, against the literals above — not against a re-read of
+        // the source struct, which would pass under any permutation of it.
+        assert_eq!(stats.files_served, 1, "files_served");
+        assert_eq!(stats.storage_fallbacks, 2, "storage_fallbacks");
+        assert_eq!(stats.local_served, 3, "local_served");
+        assert_eq!(stats.remote_served, 4, "remote_served");
+        assert_eq!(stats.rows_served, 5, "rows_served");
+        assert_eq!(
+            stats.bytes_materialized, 6,
+            "the wire's `bytes_served` lands in hudi-core's `bytes_materialized` \
+             — a deliberate rename, and the one field where a straight
+             name-for-name copy would be wrong"
+        );
+        assert_eq!(stats.batches_received, 7, "batches_received");
+        assert_eq!(stats.discover_wall_nanos, 8, "discover_wall_nanos");
+        assert_eq!(stats.connect_wall_nanos, 9, "connect_wall_nanos");
+        assert_eq!(stats.fetch_wall_nanos, 10, "fetch_wall_nanos");
     }
 
     /// `data_schema: None` must arrive as a NULL pointer, not as a dangling one.
