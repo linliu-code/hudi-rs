@@ -38,18 +38,16 @@ permissions:
   contents: read
 
 jobs:
-  # UPSTREAM ONLY. The allowlist this action checks against is ASF infrastructure policy and is
-  # enforced only on ASF-hosted repositories; on this fork the action reports, but nothing acts
-  # on the report. It is also red here BY CONSTRUCTION and permanently so: the internal-only
-  # jni-native.yml uses `aws-actions/configure-aws-credentials@v4` to assume the org's publisher
-  # role, an action the ASF will not allowlist and which that workflow cannot do without.
-  #
-  # The file is kept, unmodified apart from this condition, rather than deleted: its value is
-  # for code on its way UPSTREAM, where the failure mode it guards ("Startup failure", no logs,
-  # no check reported, PR looks green) is real. Deleting it would have made an inconvenient red
-  # disappear and silently dropped a capability; this states the reason in the file instead.
+  # Runs EVERYWHERE, including on this fork. It was previously guarded upstream-only on the
+  # grounds that it was red here "by construction" -- that was wrong, and the correction is worth
+  # recording. The ASF allowlist matches action refs EXACTLY (apache/infrastructure-actions,
+  # allowlist-check/check_asf_allowlist.py: owners actions/github/apache are trusted outright,
+  # everything else must fnmatch an approved pattern). It DOES carry
+  # aws-actions/configure-aws-credentials -- at five pinned v6.2.x SHAs. The only offender in this
+  # tree was the floating `@v4` tag, which matches none of them. Pinning that one ref to an
+  # approved SHA takes the tree to zero offenders, so the check can run here and be green, which
+  # is strictly better than a permanently skipped check nobody ever sees execute.
   asf-allowlist-check:
-    if: github.repository == 'apache/hudi-rs'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
