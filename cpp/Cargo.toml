@@ -53,6 +53,10 @@ log = { version = "0.4" }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 hudi-test = { path = "../crates/test", version = "0.6.0-dev" }
+# The parquet schema cache is PROCESS-WIDE, so the test that clears it has to be
+# serialised against the rest of this binary. Already a workspace dependency and
+# already used by hudi-core for the same reason — no new crate in the lock file.
+serial_test = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [build-dependencies]

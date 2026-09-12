@@ -252,7 +252,7 @@ static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Identity of a built store: the part of `base_url` the store is bound to,
-/// plus the options it reads, in a stable order.
+/// plus a HASH of the options it reads, taken in a stable order.
 ///
 /// The URL part is everything up to the path, plus whatever leading path
 /// segments `parse_url_opts` consumes rather than hands back as the object
@@ -280,7 +280,26 @@ static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
 /// only the ones the store's builder recognises: `parse_url_opts` drops every
 /// other key, so keying on them would split one store into an entry per
 /// distinct unrelated property.
+///
+/// The option values are hashed, not interpolated. The map holds cloud
+/// credentials (`aws_secret_access_key` and friends), and a key that embeds them
+/// verbatim is one `log::debug!`, one `Debug` derive or one panic message away
+/// from printing them. Nothing does that today — the key is a process-local
+/// `HashMap` key, never logged or serialised — which is a property of every
+/// current caller rather than of this function.
+///
+/// `parquet_schema_cache::cache_key`, one module over, makes exactly this
+/// argument and has done since #143; the two sat a screen apart and disagreed
+/// (ISSUES OI-7). They agree now.
+///
+/// Hashing does not change reuse behaviour: equal filtered option lists still
+/// produce equal keys, and unequal ones still (barring a 64-bit collision) produce
+/// unequal ones. The sort is what makes it well-defined at all — a `HashMap` has
+/// no stable iteration order, so two `Storage`s built from equal maps must be
+/// brought to a canonical order before being hashed. The URL part stays readable,
+/// so a key is still diagnosable.
 fn object_store_cache_key(base_url: &Url, options: &HashMap<String, String>) -> String {
+    use std::hash::{Hash, Hasher};
     let parsed = ObjectStoreScheme::parse(base_url).ok();
     let url_part = match &parsed {
         Some((_, path)) => {
@@ -320,7 +339,9 @@ fn object_store_cache_key(base_url: &Url, options: &HashMap<String, String>) -> 
         })
         .collect();
     opts.sort();
-    format!("{url_part}|{opts:?}")
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    opts.hash(&mut hasher);
+    format!("{url_part}|{:016x}", hasher.finish())
 }
 
 /// Whether the store `parse_url_opts` builds for `scheme` reads option `key`.
@@ -932,6 +953,42 @@ mod tests {
         assert_eq!(
             object_store_cache_key(&url, &a),
             object_store_cache_key(&url, &b)
+        );
+    }
+
+    #[test]
+    fn test_object_store_cache_key_does_not_embed_option_values() {
+        // The option map holds cloud credentials, so the key hashes its values
+        // rather than interpolating them. Nothing prints this key today; that is
+        // a property of every current caller, not of the key, and one `Debug`
+        // derive or panic message would change it.
+        //
+        // The sibling cache one module over (`parquet_schema_cache::cache_key`)
+        // has pinned exactly this since #143. The two sat a screen apart and
+        // disagreed until ISSUES OI-7.
+        let url = Url::parse("s3://example-bucket/path/").unwrap();
+        let secret = "AKIAIOSFODNN7EXAMPLE/wJalrXUtnFEMI";
+        let opts = HashMap::from([
+            ("aws_secret_access_key".to_string(), secret.to_string()),
+            ("region".to_string(), "us-west-2".to_string()),
+        ]);
+        let key = object_store_cache_key(&url, &opts);
+        assert!(
+            !key.contains(secret),
+            "a credential must not appear in a cache key: {key}"
+        );
+        // And not the innocuous values either — the rule is "no option VALUES",
+        // not "no values that look like secrets", because which ones are
+        // sensitive is not this function's judgement to make.
+        assert!(
+            !key.contains("us-west-2"),
+            "no option value belongs in the key: {key}"
+        );
+        // The bucket identity is not a secret and IS load-bearing for reuse, so
+        // it stays readable.
+        assert!(
+            key.starts_with("s3://example-bucket|"),
+            "scheme and host stay readable, so a key is still diagnosable: {key}"
         );
     }
 

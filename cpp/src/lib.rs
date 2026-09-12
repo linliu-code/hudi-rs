@@ -17,6 +17,7 @@
  * under the License.
  */
 pub mod blocking_merge_stream;
+pub mod cache_abi;
 pub mod context;
 pub mod provider_abi;
 mod util;
@@ -1603,7 +1604,7 @@ fn avro_json_to_arrow_schema(avro_json: &str) -> std::result::Result<arrow_schem
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The FFI mapping copies every `BaseFileProviderStats` field onto the FFI
@@ -2315,7 +2316,7 @@ mod tests {
     // bridge held the provider without injecting it, and a wall of zeros is
     // what the gap looked like, so both are asserted.
     // ════════════════════════════════════════════════════════════════════
-    mod provider_e2e {
+    pub(crate) mod provider_e2e {
         use super::*;
         use crate::provider_abi::{
             HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION, HUDI_PROVIDER_OUTCOME_NOT_SERVED,
@@ -2446,6 +2447,14 @@ mod tests {
         fn reader(table_path: &str, handle: u64) -> Box<HoodieFileGroupReader> {
             new_file_group_reader_with_context(base_only_context(table_path, handle))
                 .expect("build FFI reader")
+        }
+
+        /// One full provider-less read of `table_path`, for a test that needs the
+        /// SIDE EFFECTS of a real read rather than its rows — `cache_abi`'s, which
+        /// has to warm the parquet schema cache through the ordinary path rather
+        /// than by reaching into it.
+        pub(crate) fn read_once(table_path: &str) {
+            let _ = reader(table_path, 0).read_record_batch().expect("read");
         }
 
         /// Baseline: without a provider the file group reads its two rows off
