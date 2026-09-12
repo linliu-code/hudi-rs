@@ -71,10 +71,28 @@ typedef struct HudiBaseFileDataRequest {
   HudiStrSlice file_uri;
   /* Projected ("intersection") schema the read wants back. Never NULL.
    *
-   * Serve EXACTLY these fields, in this order, with these types. hudi-rs does
-   * not reconcile a served stream against this schema, so a field served under
-   * a different name or position is not detected: it is read as the field that
-   * sits there, or null-filled.
+   * Serve EXACTLY these fields, in this order, with these types. hudi-rs CHECKS
+   * a served stream against this schema and DECLINES a stream that differs --
+   * the file is then read from object storage instead, the attempt is counted as
+   * a storage fallback rather than a serve, and one error line per file names
+   * the first field that differed. A provider that gets the shape wrong is not
+   * silently tolerated, but neither does it fail the read: it simply delivers no
+   * benefit, at the cost of an error log per base file.
+   *
+   * Compared: the field COUNT, and each field's NAME and DATA TYPE, positionally.
+   * A type is compared exactly, dictionary encoding included -- Dictionary(Int32,
+   * Utf8) where Utf8 was asked for is a different physical layout.
+   *
+   * Deliberately NOT compared, so these are safe to differ: nullability, and
+   * field- or schema-level key-value metadata. A provider that widens a non-null
+   * column to nullable, or carries extra metadata through its own transport, is
+   * still serving the right data.
+   *
+   * Serving FEWER fields is NOT the lenient case it looks like. Every field here
+   * was read from THIS file's own footer, so none of them can be legitimately
+   * absent from a serve of this file; hudi-rs null-fills a column it cannot find
+   * by name, which is correct for a genuinely absent column and is exactly how a
+   * dropped one would become a column of nulls in a successful read.
    *
    * VALUES CONTRACT: serve the base file's PHYSICAL values, unaltered. Where
    * apache/hudi#18132 applies, a file's footer may LABEL a timestamp column with

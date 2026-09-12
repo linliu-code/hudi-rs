@@ -400,6 +400,23 @@ fn served_batch_stream(
 /// Types are compared EXACTLY, dictionary encoding included: `Dictionary(Int32,
 /// Utf8)` where `Utf8` was requested is a different physical layout, and the
 /// caller asked for a schema rather than for something convertible to one.
+///
+/// The field COUNT is compared with `!=`, in BOTH directions, and the `<`
+/// direction is the load-bearing one — which is not obvious here, so: `wanted` is
+/// the read's `intersection`, and every field in it was read out of THIS file's
+/// own footer. None of them can be legitimately absent from a serve of this file.
+/// A provider returning FEWER fields is therefore not an old file missing a
+/// column — the case `project_batch_to_schema`'s null-fill exists for — it is a
+/// provider serving the wrong bytes, and null-filling it is exactly the silent
+/// data loss this function prevents. Relaxing `!=` to `>` reads as a sensible
+/// tightening and reopens that path; mutation 25 in `MATRIX.md`, killed by
+/// `a_served_stream_that_drops_or_reorders_a_column_is_declined`.
+///
+/// The check is on the reader's DECLARED schema (`RecordBatchReader::schema()`),
+/// not on the batches it yields. That is sufficient on the C-ABI path, where the
+/// `ArrowArrayStream`'s declared schema governs the import and the batches cannot
+/// disagree with it. A Rust-native provider could declare one schema and yield
+/// another; nothing here catches that.
 fn served_schema_mismatch(
     served: &arrow_schema::Schema,
     wanted: &arrow_schema::Schema,
@@ -1384,10 +1401,20 @@ impl HoodieFileGroupReader {
                                  stream must match `projected_schema` field for field, \
                                  in order"
                             );
-                            // Release the stream before the fallback read starts.
                             drop(served);
+                            // The SAME reclassification `cpp/src/provider_abi.rs`
+                            // performs when a served stream cannot be imported —
+                            // including the drain counters, which that path zeroes
+                            // and this one did not. The trait is public, so a
+                            // Rust-native provider that fills them against contract
+                            // would otherwise have them folded into the live slot
+                            // by `record_provider_stats` below, attributed to a
+                            // file nothing ever drained.
                             stats.files_served = stats.files_served.saturating_sub(1);
                             stats.storage_fallbacks += 1;
+                            stats.rows_served = 0;
+                            stats.bytes_materialized = 0;
+                            stats.batches_received = 0;
                             None
                         }
                     }
@@ -4379,6 +4406,55 @@ mod tests {
         (schema, batch)
     }
 
+    /// A TWO-column fixture, because a one-column one cannot express the cases
+    /// that matter most.
+    ///
+    /// `id_batch` is one `id: int32`, and every provider test was built on it.
+    /// That makes three shape deviations inexpressible: a DROPPED field (dropping
+    /// the only column leaves a zero-field batch), a MIS-ORDERED pair, and any
+    /// mismatch at an index past 0 — so the comparison loop's body was only ever
+    /// entered at `i == 0`. Review round 8 built mutation 25 out of exactly that
+    /// gap: narrowing `served.fields().len() != wanted.fields().len()` to `>`
+    /// accepts a provider that drops a column, which is then null-filled, and all
+    /// 62 engine tests stayed green.
+    fn id_amount_batch(ids: Vec<i32>, amounts: Vec<i32>) -> (SchemaRef, RecordBatch) {
+        use arrow_array::Int32Array;
+        let schema: SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int32, true),
+            arrow_schema::Field::new("amount", arrow_schema::DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(amounts)),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    /// Column `idx` of a batch, as i32s, with nulls surfaced as `None` — because
+    /// "the provider's values" and "null-filled" have to be distinguishable, and
+    /// that distinction IS the finding.
+    fn i32_col(batch: &RecordBatch, idx: usize) -> Vec<Option<i32>> {
+        use arrow_array::Int32Array;
+        let col = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        (0..col.len())
+            .map(|i| {
+                if col.is_null(i) {
+                    None
+                } else {
+                    Some(col.value(i))
+                }
+            })
+            .collect()
+    }
+
     fn id_values(batch: &RecordBatch) -> Vec<i32> {
         use arrow_array::Int32Array;
         let col = batch
@@ -4582,10 +4658,12 @@ mod tests {
 
             let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
 
+            // Fixture check, not a backstop: if the provider were never offered
+            // the file, `storage_fallbacks == 1` below would fail first. It is here
+            // so THAT failure is diagnosable.
             assert!(
                 provider.seen().is_some(),
-                "{case}: fixture check — the provider must have been offered the file, \
-                 or the decline below is a decline of nothing"
+                "{case}: fixture check — the provider must have been offered the file"
             );
             assert_eq!(
                 id_values(&out),
@@ -4608,6 +4686,91 @@ mod tests {
                 (s.rows_served, s.batches_received),
                 (0, 0),
                 "{case}: nothing was drained from the declined stream"
+            );
+        }
+    }
+
+    /// A served stream that DROPS a column, or REORDERS two, is declined — the
+    /// two cases the one-column fixture could not express.
+    ///
+    /// Separate from its sibling above because it needs a two-column file, and
+    /// that is the whole point. Review round 8 built mutation 25 here: narrowing
+    /// the field-count guard from `!=` to `>` is one token, reads as a deliberate
+    /// relaxation ("serving FEWER fields is the benign case null-fill was designed
+    /// for"), and reopens the identical silent-data-loss path row 22 closed —
+    /// invisibly, because dropping the only column of a one-column fixture leaves
+    /// a zero-field batch, so the `served < wanted` direction was not merely
+    /// untested but unrepresentable.
+    ///
+    /// The argument the mutation misses is at the CALL SITE, not at the
+    /// comparator: every field in `intersection` was read from THIS file's footer,
+    /// so none of them can be legitimately absent from a serve of this file. A
+    /// provider that omits one is not serving an evolved file; it is serving the
+    /// wrong bytes. The comparator's own doc now says so.
+    ///
+    /// The reorder case also drives the comparison loop past `i == 0` for the
+    /// first time — every earlier case is detected at field 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_served_stream_that_drops_or_reorders_a_column_is_declined() {
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let dropped = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)])),
+            vec![Arc::new(Int32Array::from(vec![7, 8]))],
+        )
+        .unwrap();
+        // Both names present, both types right, the COUNT right — only the order
+        // differs. Nothing but a positional comparison catches this one.
+        let reordered = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("amount", DataType::Int32, true),
+                Field::new("id", DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![700, 800])),
+                Arc::new(Int32Array::from(vec![7, 8])),
+            ],
+        )
+        .unwrap();
+
+        for (case, served) in [("dropped column", dropped), ("reordered pair", reordered)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (schema, on_disk) = id_amount_batch(vec![1, 2], vec![100, 200]);
+            let base_name = "f1-0_0-1-1_001.parquet";
+            write_parquet_file(tmp.path(), base_name, &on_disk);
+
+            let provider = StubDataProvider::serving(vec![served]);
+            let mut reader =
+                reader_with_provider(tmp.path(), base_name, schema.clone(), provider.clone()).await;
+            let live = reader.base_file_provider_live_stats();
+
+            let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+            assert!(
+                provider.seen().is_some(),
+                "{case}: fixture check — the provider must have been offered the file"
+            );
+            assert_eq!(
+                i32_col(&out, 0),
+                vec![Some(1), Some(2)],
+                "{case}: the FILE's `id` must reach the caller, not the provider's [7, 8]"
+            );
+            // The column the provider omitted is the one that goes silently to
+            // nulls when the count guard is relaxed. Assert its VALUES, not just
+            // that a column exists.
+            assert_eq!(
+                i32_col(&out, 1),
+                vec![Some(100), Some(200)],
+                "{case}: the FILE's `amount` must reach the caller. [None, None] means the \
+                 wrong-shaped serve was accepted and the missing column null-filled — the \
+                 silent data loss this whole check exists to prevent"
+            );
+            let s = live.lock().unwrap();
+            assert_eq!(
+                (s.files_served, s.storage_fallbacks),
+                (0, 1),
+                "{case}: a declined serve is reclassified as the storage fallback it became"
             );
         }
     }

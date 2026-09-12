@@ -105,6 +105,16 @@ pub struct BaseFileProviderStats {
 }
 
 impl BaseFileProviderStats {
+    /// `files_served == local_served + remote_served` holds for a provider that
+    /// fills all three, but **NOT across a reclassified attempt**. Two paths walk
+    /// `files_served` back and increment `storage_fallbacks` when a provider says
+    /// SERVED and the stream turns out to be unusable — an unimportable C stream
+    /// (`cpp/src/provider_abi.rs`) or one whose schema is not the one that was
+    /// asked for (`base_file_source`) — and neither can know which of
+    /// `local_served`/`remote_served` to walk back with it. After either, the
+    /// identity is off by one. Do not reconcile against it; read
+    /// `files_served + storage_fallbacks` for attempts, which is exact.
+    ///
     /// Accumulate another set of counters into this one (per-base-file → per-read).
     pub fn merge(&mut self, other: &BaseFileProviderStats) {
         self.files_served += other.files_served;
@@ -129,7 +139,30 @@ pub struct BaseFileDataRequest<'a> {
     /// Absolute storage URI of the base file — the same URL the object-store read
     /// resolves to, and the identity a provider is expected to key the file by.
     pub file_uri: &'a str,
-    /// The projected ("intersection") schema the read wants back.
+    /// The projected ("intersection") schema the read wants back — one field per
+    /// column of the read's required schema that is actually PRESENT in this
+    /// file's footer, in the file's own order and carrying the file's own types
+    /// (see the Values contract on [`BaseFileDataProvider::try_base_file`] for why
+    /// the type may be a lie, and why you must serve it anyway).
+    ///
+    /// **This is CHECKED.** The served stream's declared schema is compared
+    /// against it — the field COUNT, and each field's NAME and DATA TYPE,
+    /// positionally — and a stream that differs is DECLINED: the base file is read
+    /// from object storage instead and the attempt is reclassified from a serve to
+    /// a storage fallback. Nullability and field/schema metadata are deliberately
+    /// NOT compared, so widening a non-null column to nullable, or carrying extra
+    /// metadata, is accepted.
+    ///
+    /// Serving FEWER fields is the dangerous direction, not the lenient one.
+    /// Batches are resolved against the read schema BY NAME and a name that is not
+    /// found is null-filled — correct for a column genuinely absent from an older
+    /// base file, and precisely how a dropped column becomes a column of nulls in
+    /// a read that reports success. Every field here came out of THIS file's
+    /// footer, so none of them can be legitimately absent from a serve of it.
+    ///
+    /// Mirrored in `cpp/src/provider_abi.rs`'s `HudiBaseFileDataRequest` and in
+    /// `cpp/include/hudi_base_file_data_provider.h`. Three mirrors of one
+    /// contract; round 8 found the C one saying the opposite of the code.
     pub projected_schema: &'a SchemaRef,
     /// Whether it is safe to apply a pushed predicate **to this file**. A provider
     /// that pushes a predicate must honor it: when `false`, serve unfiltered so a

@@ -97,6 +97,16 @@ pub struct HudiBaseFileDataRequest {
     pub file_uri: HudiStrSlice,
     /// Projected ("intersection") schema the read wants back, as an Arrow C
     /// schema. Never null.
+    ///
+    /// **Checked.** hudi-core compares a served stream against this schema —
+    /// field count, and each field's name and data type, positionally — and
+    /// DECLINES a stream that differs, falling back to the object-store read and
+    /// counting the attempt as a storage fallback. Nullability and field/schema
+    /// metadata are deliberately ignored. See
+    /// [`BaseFileDataRequest::projected_schema`] for why serving FEWER fields is
+    /// the dangerous direction rather than the lenient one, and
+    /// `cpp/include/hudi_base_file_data_provider.h` for the C-side wording —
+    /// three mirrors of one contract, as with `can_push_predicate` below.
     pub projected_schema: *const FFI_ArrowSchema,
     /// Whether a pushed predicate may be applied to this file. When false, the
     /// provider must serve unfiltered and let the post-merge filter apply it.
@@ -120,6 +130,11 @@ pub struct HudiBaseFileDataRequest {
     /// `cpp/include/hudi_base_file_data_provider.h` and with
     /// [`BaseFileDataRequest::can_push_predicate`] — three mirrors of one
     /// contract, and this one was the last to be updated.
+    ///
+    /// The SHAPE contract on `projected_schema` above has the same three mirrors,
+    /// and review round 8 found the C one had been updated alone — and updated to
+    /// state the opposite of what the code does. Editing any one of these six
+    /// means editing all three of its siblings.
     pub can_push_predicate: bool,
     /// Partition path of the split (e.g. `year=2024/month=01`).
     pub partition_path: HudiStrSlice,
@@ -1362,10 +1377,22 @@ mod tests {
             // see the note on `CapturingLogger` — the niche produces the same 0
             // for the member it occupies whether the guard ran or not, so each
             // half of the condition is pinned here by the diagnostic it emits.
+            //
+            // Matched on the ADDRESSES this case passed, not on the phrase alone:
+            // the buffer is shared with every other test in this binary, and a
+            // phrase match holds only because no other message happens to contain
+            // it — a property of wording rather than of the lock (review round 8).
+            let expected = format!("try_base_file={try_addr:#x}, destroy={destroy_addr:#x}");
+            let hits = captured_containing("vtable has a NULL member");
             assert_eq!(
-                captured_containing("vtable has a NULL member").len(),
+                hits.len(),
                 1,
-                "{case}: the null-member guard must be what refused this vtable"
+                "{case}: the null-member guard must be what refused this vtable, saw {hits:?}"
+            );
+            assert!(
+                hits[0].contains(&expected),
+                "{case}: the guard must name THIS vtable's members ({expected}), saw {:?}",
+                hits[0]
             );
         }
     }

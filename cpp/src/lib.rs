@@ -98,6 +98,19 @@ static LOGGER: OnceLock<()> = OnceLock::new();
 /// `RUST_LOG` when set and falls back to `info` only when it is absent, with no
 /// environment mutation.
 fn init_logger() {
+    // Not under `cfg(test)`. `log`'s logger slot is process-global and first-come:
+    // `provider_abi`'s tests install a capturing logger to assert on the
+    // diagnostics its guards emit, and those assertions are worthless if this
+    // races them for the slot. `try_init()` fails silently, so whichever runs
+    // first simply wins — and this one is reached from
+    // `new_file_group_reader_with_context`, which several tests in this same
+    // binary call. They were green only because libtest dispatches in sorted name
+    // order and `provider_abi::` sorts before `tests::`; renaming a test flipped
+    // it. Review round 8. The cdylib is unaffected — `cfg(test)` is the lib test
+    // binary only.
+    #[cfg(test)]
+    let _ = &LOGGER;
+    #[cfg(not(test))]
     LOGGER.get_or_init(|| {
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .try_init();
