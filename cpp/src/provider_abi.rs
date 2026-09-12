@@ -98,11 +98,28 @@ pub struct HudiBaseFileDataRequest {
     /// Projected ("intersection") schema the read wants back, as an Arrow C
     /// schema. Never null.
     pub projected_schema: *const FFI_ArrowSchema,
-    /// Whether a pushed predicate may be applied to this file: true when the split
-    /// has no log files, or the predicate is primary-key-safe (ENG-47506; was a
-    /// table-type check, so this is now true for a MOR slice with no log files
-    /// where it previously was not). When false, the provider must serve
-    /// unfiltered.
+    /// Whether a pushed predicate may be applied to this file. When false, the
+    /// provider must serve unfiltered and let the post-merge filter apply it.
+    ///
+    /// PER FILE, not per split, and not a table property — it is exactly the
+    /// decision hudi-rs's own parquet `RowFilter` pushdown got for this same file,
+    /// and TWO independent gates must both pass:
+    ///
+    /// 1. the merge-safety gate — no log files on the split, or a
+    ///    primary-key-safe predicate (ENG-47506; was a table-type check, so this
+    ///    is now true for a MOR slice with no log files where it previously was
+    ///    not); and
+    /// 2. the repair gate — this file's footer does not label a predicate column
+    ///    in a way the apache/hudi#18132 logical-type repair reinterprets on read.
+    ///
+    /// Gate 2 is decided from the file's own footer, so the SAME read can hand
+    /// true for one base file and false for the next. A provider that caches the
+    /// answer across the files of a split is wrong, and drops rows that match.
+    ///
+    /// This doc must stay in step with
+    /// `cpp/include/hudi_base_file_data_provider.h` and with
+    /// [`BaseFileDataRequest::can_push_predicate`] — three mirrors of one
+    /// contract, and this one was the last to be updated.
     pub can_push_predicate: bool,
     /// Partition path of the split (e.g. `year=2024/month=01`).
     pub partition_path: HudiStrSlice,
@@ -414,7 +431,7 @@ impl BaseFileDataProvider for CApiBaseFileDataProvider {
         match Self::served_reader(&mut c_res) {
             Some(reader) => {
                 // On the served path the drain counters are hudi-core's to fill:
-                // the CountingBatchReader tallies rows/bytes/batches as the stream
+                // the `served_batch_stream` (crates/core) tallies rows/bytes/batches as the stream
                 // is consumed and merges them into the live stats slot. Zero
                 // whatever the provider reported for them here, so a provider that
                 // (against the contract) also populated these cannot cause a
@@ -596,6 +613,191 @@ mod tests {
         }
     }
 
+    /// EVERY FIELD of the request survives the C boundary, with the values the
+    /// core seam put in it.
+    ///
+    /// Nothing else in this repository dereferences `HudiBaseFileDataRequest`.
+    /// `stub_try` above takes it as `_req`; `cpp/src/lib.rs`'s end-to-end stub
+    /// reads `projected_schema` and nothing more. So the seven tests that pin
+    /// `can_push_predicate` in `reader_v2::engine` all assert against the CORE
+    /// struct, and its transport to the only provider that exists outside tests
+    /// — the C++ one, reached through this adapter and only this adapter — was
+    /// asserted nowhere.
+    ///
+    /// That is not a theoretical gap. `let can_push_predicate = true;` one line
+    /// above compiles, passes all eight rows of the mutation matrix and the whole
+    /// suite, and tells a real provider it may push a predicate the core just
+    /// withdrew — which is this branch's entire deliverable, defeated end to end.
+    ///
+    /// `can_push_predicate` is driven from **false** here on purpose:
+    /// `sample_request`'s default is `true`, so a fixture that took the default
+    /// could not tell a faithful copy from a hard-wired one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_request_field_survives_the_c_boundary() {
+        use std::sync::Mutex as StdMutex;
+
+        /// What the C side actually received, reconstructed from the raw request.
+        #[derive(Debug, PartialEq)]
+        struct SeenCRequest {
+            file_uri: String,
+            can_push_predicate: bool,
+            partition_path: String,
+            partition_fields: Vec<String>,
+            partition_fields_len: usize,
+            projected_schema_is_null: bool,
+            data_schema_is_null: bool,
+        }
+        static SEEN: StdMutex<Option<SeenCRequest>> = StdMutex::new(None);
+
+        extern "C" fn capture_try(
+            _ctx: *mut c_void,
+            req: *const HudiBaseFileDataRequest,
+            out: *mut HudiBaseFileDataResult,
+        ) -> c_int {
+            // SAFETY: the adapter guarantees `req` points at a live
+            // `HudiBaseFileDataRequest` for the whole synchronous call, and its
+            // slices borrow data owned by the calling closure.
+            let req = unsafe { &*req };
+            // `HudiStrSlice` is write-only in Rust (`from_str` and nothing else),
+            // because the C side is its only reader. A test standing in for that
+            // reader has to reconstruct the same way a C consumer does.
+            //
+            // SAFETY: the adapter builds each slice from a `&str` it owns for the
+            // whole synchronous call.
+            fn slice_to_string(s: &HudiStrSlice) -> String {
+                if s.ptr.is_null() {
+                    return String::new();
+                }
+                unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(s.ptr, s.len)) }
+                    .to_string()
+            }
+            let fields = if req.partition_fields.is_null() {
+                Vec::new()
+            } else {
+                // SAFETY: `partition_fields_len` is the adapter's own count for
+                // the array it just built.
+                unsafe {
+                    std::slice::from_raw_parts(req.partition_fields, req.partition_fields_len)
+                }
+                .iter()
+                .map(slice_to_string)
+                .collect()
+            };
+            *SEEN.lock().unwrap() = Some(SeenCRequest {
+                file_uri: slice_to_string(&req.file_uri),
+                can_push_predicate: req.can_push_predicate,
+                partition_path: slice_to_string(&req.partition_path),
+                partition_fields: fields,
+                partition_fields_len: req.partition_fields_len,
+                projected_schema_is_null: req.projected_schema.is_null(),
+                data_schema_is_null: req.data_schema.is_null(),
+            });
+            // SAFETY: a fresh out-parameter supplied by the adapter.
+            unsafe { &mut *out }.stats = HudiBaseFileProviderStats {
+                storage_fallbacks: 1,
+                ..Default::default()
+            };
+            HUDI_PROVIDER_OUTCOME_NOT_SERVED
+        }
+
+        extern "C" fn capture_destroy(_ctx: *mut c_void) {}
+
+        *SEEN.lock().unwrap() = None;
+        let vtable = HudiBaseFileDataProviderVTable {
+            abi_version: HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+            try_base_file: capture_try,
+            destroy: capture_destroy,
+        };
+        let handle = unsafe { hudi_base_file_data_provider_new(&vtable, std::ptr::null_mut()) };
+        let provider = unsafe { take_provider_from_handle(handle) }.expect("provider");
+
+        let schema: Arc<Schema> =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let data_schema: Arc<Schema> = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("city", DataType::Utf8, true),
+        ]));
+        let fields = vec!["city".to_string(), "ts".to_string()];
+        let (served, _stats) = provider
+            .try_base_file(BaseFileDataRequest {
+                file_uri: "s3://bucket/table/city=sf/base.parquet",
+                projected_schema: &schema,
+                // FALSE — the value the narrowing produces, and the one a
+                // hard-wired marshaller would get wrong.
+                can_push_predicate: false,
+                partition_path: "city=sf/ts=2024",
+                partition_fields: &fields,
+                data_schema: Some(&data_schema),
+            })
+            .await;
+        assert!(served.is_none(), "the capture stub declines");
+
+        let seen = SEEN.lock().unwrap().take().expect("the C side was called");
+        assert_eq!(
+            seen,
+            SeenCRequest {
+                file_uri: "s3://bucket/table/city=sf/base.parquet".to_string(),
+                can_push_predicate: false,
+                partition_path: "city=sf/ts=2024".to_string(),
+                partition_fields: vec!["city".to_string(), "ts".to_string()],
+                partition_fields_len: 2,
+                projected_schema_is_null: false,
+                data_schema_is_null: false,
+            },
+            "every field must cross the boundary unaltered — a provider has \
+             nothing else to act on"
+        );
+    }
+
+    /// `data_schema: None` must arrive as a NULL pointer, not as a dangling one.
+    ///
+    /// The header documents null as the legal spelling for "unavailable", and a
+    /// provider is entitled to branch on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_absent_data_schema_arrives_as_null() {
+        use std::sync::Mutex as StdMutex;
+        static SAW_NULL: StdMutex<Option<bool>> = StdMutex::new(None);
+
+        extern "C" fn null_probe(
+            _ctx: *mut c_void,
+            req: *const HudiBaseFileDataRequest,
+            out: *mut HudiBaseFileDataResult,
+        ) -> c_int {
+            // SAFETY: as in `capture_try` above.
+            *SAW_NULL.lock().unwrap() = Some(unsafe { &*req }.data_schema.is_null());
+            // SAFETY: a fresh out-parameter supplied by the adapter.
+            unsafe { &mut *out }.stats = HudiBaseFileProviderStats {
+                storage_fallbacks: 1,
+                ..Default::default()
+            };
+            HUDI_PROVIDER_OUTCOME_NOT_SERVED
+        }
+        extern "C" fn null_destroy(_ctx: *mut c_void) {}
+
+        *SAW_NULL.lock().unwrap() = None;
+        let vtable = HudiBaseFileDataProviderVTable {
+            abi_version: HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+            try_base_file: null_probe,
+            destroy: null_destroy,
+        };
+        let handle = unsafe { hudi_base_file_data_provider_new(&vtable, std::ptr::null_mut()) };
+        let provider = unsafe { take_provider_from_handle(handle) }.expect("provider");
+
+        let schema: Arc<Schema> =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let fields: Vec<String> = Vec::new();
+        let _ = provider
+            .try_base_file(sample_request(&schema, &fields))
+            .await;
+
+        assert_eq!(
+            SAW_NULL.lock().unwrap().take(),
+            Some(true),
+            "an absent data schema must arrive as NULL, which is what the header \
+             tells a provider to test for"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn served_outcome_roundtrips_batches() {
         let counter = AtomicUsize::new(0);
@@ -626,7 +828,7 @@ mod tests {
         );
         assert_eq!(stats.files_served, 1);
         // The stub deliberately mis-reports a drain counter (rows_served: 3). On
-        // the served path hudi-core owns the drain counters — CountingBatchReader
+        // the served path hudi-core owns the drain counters — `served_batch_stream` (crates/core)
         // fills them as it consumes the stream — so provider-abi zeroes whatever
         // the provider claimed, preventing a double-count. Setup counters stay.
         assert_eq!(

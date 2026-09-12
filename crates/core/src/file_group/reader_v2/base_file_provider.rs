@@ -167,9 +167,13 @@ pub struct BaseFileDataRequest<'a> {
     // reads. A served file gets no such hint and returns every row, which is
     // correct but not identical work — the one qualification on "a served file
     // and a read file are indistinguishable downstream" elsewhere in this file.
-    // Inert today: `key_predicate` is `None` at every construction site in this
-    // tree, including the FFI bridge. Widening the seam is a deliberate decision
-    // for whoever needs it, not an oversight.
+    // Inert today, but NOT because the predicate is never set: it is `None` at
+    // every site that can inject a provider (the C++ bridge), while
+    // `crates/jvm-ffi/src/file_group_v2.rs` builds one from `req.lookup_keys` and
+    // `crates/core/src/metadata/table/v2_reader.rs` sets one for metadata-table
+    // lookups — neither of which injects a provider. So widening this seam is
+    // REQUIRED before either of those paths ever does, and is a deliberate
+    // decision for whoever needs it rather than an oversight.
 }
 
 /// A pluggable source that may serve a base file instead of the object-store

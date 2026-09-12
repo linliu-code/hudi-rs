@@ -4171,6 +4171,7 @@ mod tests {
         can_push_predicate: bool,
         partition_path: String,
         partition_fields: Vec<String>,
+        data_schema: Option<SchemaRef>,
     }
 
     impl StubDataProvider {
@@ -4223,6 +4224,7 @@ mod tests {
                 can_push_predicate: req.can_push_predicate,
                 partition_path: req.partition_path.to_string(),
                 partition_fields: req.partition_fields.to_vec(),
+                data_schema: req.data_schema.cloned(),
             });
             match &self.serve {
                 Some(batches) => {
@@ -4600,6 +4602,13 @@ mod tests {
             reader_with_provider(tmp.path(), base_name, schema.clone(), provider.clone()).await;
         // Partition fields are read off the table config, so set one and prove it
         // is parsed rather than passed through verbatim (note the stray space).
+        //
+        // The partition PATH is set non-empty on purpose. It used to be `""`, and
+        // the assertion below then read `partition_path == ""` — which
+        // `partition_path: ""` hard-wired at the seam satisfies exactly as well.
+        // The path is the only input a provider has for reconstructing partition
+        // columns, so a provider handed an empty one emits null partition values
+        // into batches presented at the projected schema.
         {
             let ctx = Arc::get_mut(&mut reader.reader_context).expect("sole owner in test");
             ctx.table_config.insert(
@@ -4607,14 +4616,32 @@ mod tests {
                 "city, ts".to_string(),
             );
         }
+        reader.input_split = InputSplit::new(
+            Some(base_name.to_string()),
+            None,
+            Vec::new(),
+            "city=sf/ts=2024".to_string(),
+        );
+        // A data schema DISTINCT from the projected one, so the assertion below
+        // cannot pass by both being `None` — which is how the fixture stood when
+        // the assertion was first written, making it vacuous.
+        let data_schema: SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int32, true),
+            arrow_schema::Field::new("city", arrow_schema::DataType::Utf8, true),
+        ]));
+        reader.schema_handler.data_schema = Some(data_schema.clone());
         let expected_gate = reader.base_read_pushdown_is_safe();
+        let expected_uri = join_url_segments(&reader.storage.base_url, &[base_name])
+            .map(|u| u.to_string())
+            .expect("the fixture's base url joins");
         let _ = reader.base_file_source().await.unwrap();
 
         let seen = provider.seen().expect("provider called");
-        assert!(
-            seen.file_uri.ends_with(base_name),
-            "request must carry the base file's own URI, got {}",
-            seen.file_uri
+        assert_eq!(
+            seen.file_uri, expected_uri,
+            "request must carry the base file's ABSOLUTE URI. `ends_with(base_name)` \
+             was the old assertion and a table-RELATIVE path satisfies it just as \
+             well — but a provider keys the file by this string"
         );
         assert_eq!(
             seen.projected_schema, schema,
@@ -4634,8 +4661,17 @@ mod tests {
             "partition fields must be split and trimmed"
         );
         assert_eq!(
-            seen.partition_path, "",
-            "the split's partition path is passed through as-is"
+            seen.partition_path, "city=sf/ts=2024",
+            "the split's partition path is passed through as-is — it is the only \
+             input a provider has for reconstructing partition columns"
+        );
+        assert_eq!(
+            seen.data_schema.as_ref(),
+            Some(&data_schema),
+            "and the table's data schema, which is how a provider resolves those \
+             partition columns' TYPES. Asserted against the fixture's own schema, \
+             not against the reader's field — comparing the reader to itself would \
+             pass under `data_schema: None` at the seam"
         );
     }
 
@@ -5096,14 +5132,19 @@ mod tests {
     /// records whether the provider had already gone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_served_readers_release_runs_before_the_providers_destroy() {
-        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
         /// Set when the provider is dropped — i.e. when `destroy(ctx)` would run.
+        ///
+        /// `SeqCst` throughout, not `Relaxed`: the assertion below reads one flag
+        /// having polled on another, and under the mutation this test exists to
+        /// kill the two stores happen in the opposite order. With `Relaxed` the
+        /// read can land between them and report GREEN on the mutation.
         #[derive(Clone)]
         struct ProviderGone(Arc<AtomicBool>);
         impl Drop for ProviderGone {
             fn drop(&mut self) {
-                self.0.store(true, Relaxed);
+                self.0.store(true, SeqCst);
             }
         }
 
@@ -5114,11 +5155,15 @@ mod tests {
             remaining: usize,
             provider_gone: Arc<AtomicBool>,
             saw_provider_gone: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
         }
         impl Drop for ReleaseProbe {
             fn drop(&mut self) {
+                // Record the observation BEFORE announcing that we ran, so a
+                // waiter that sees `dropped` is guaranteed to see the value too.
                 self.saw_provider_gone
-                    .store(self.provider_gone.load(Relaxed), Relaxed);
+                    .store(self.provider_gone.load(SeqCst), SeqCst);
+                self.dropped.store(true, SeqCst);
             }
         }
         impl Iterator for ReleaseProbe {
@@ -5140,6 +5185,7 @@ mod tests {
         struct ReleaseOrderProvider {
             gone: ProviderGone,
             saw_provider_gone: Arc<AtomicBool>,
+            probe_dropped: Arc<AtomicBool>,
         }
         #[async_trait::async_trait]
         impl crate::file_group::reader_v2::base_file_provider::BaseFileDataProvider
@@ -5158,6 +5204,7 @@ mod tests {
                         remaining: 2,
                         provider_gone: self.gone.0.clone(),
                         saw_provider_gone: self.saw_provider_gone.clone(),
+                        dropped: self.probe_dropped.clone(),
                     })),
                     BaseFileProviderStats {
                         files_served: 1,
@@ -5174,10 +5221,12 @@ mod tests {
 
         let provider_gone = Arc::new(AtomicBool::new(false));
         let saw_provider_gone = Arc::new(AtomicBool::new(false));
+        let probe_dropped = Arc::new(AtomicBool::new(false));
         let mut reader = test_file_group_reader_for_base_file(tmp.path(), base_name, schema).await;
         reader.base_file_provider = Some(Arc::new(ReleaseOrderProvider {
             gone: ProviderGone(provider_gone.clone()),
             saw_provider_gone: saw_provider_gone.clone(),
+            probe_dropped: probe_dropped.clone(),
         }));
 
         let source = reader.base_file_source().await.unwrap();
@@ -5185,21 +5234,30 @@ mod tests {
         let out = drain_base_source(source).await;
         assert_eq!(out.num_rows(), 0, "the probe serves empty batches");
 
-        // The producer task ends after the last batch is taken; poll rather than
-        // sleep a guessed interval.
+        // Poll on the PROBE's flag, not the provider's. Under the mutation this
+        // test exists to kill, the provider is released FIRST, so waiting on
+        // `provider_gone` would let the assertion run before the probe had made
+        // its observation — and read a default `false`, i.e. report GREEN on the
+        // mutation. The probe's flag is set after its observation, so seeing it
+        // guarantees the value is there.
         for _ in 0..200 {
-            if provider_gone.load(Relaxed) {
+            if probe_dropped.load(SeqCst) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(
-            provider_gone.load(Relaxed),
-            "fixture check: the provider must have been released by now, or the \
-             assertion below has not been exercised"
+            probe_dropped.load(SeqCst),
+            "fixture check: the served reader must have been released by now, or \
+             the assertion below has not been exercised at all"
         );
         assert!(
-            !saw_provider_gone.load(Relaxed),
+            provider_gone.load(SeqCst),
+            "fixture check: and the provider too, or the ordering below is not \
+             the one this test is about"
+        );
+        assert!(
+            !saw_provider_gone.load(SeqCst),
             "the served reader was released AFTER the provider — a C stream's \
              release callback would be reading a ctx that destroy() already \
              freed. ServedReader's field order is what prevents this; check that \
