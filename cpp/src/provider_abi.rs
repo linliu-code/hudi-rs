@@ -529,22 +529,41 @@ impl BaseFileDataProvider for CApiBaseFileDataProvider {
                  ({HUDI_PROVIDER_OUTCOME_SERVED}), not 0"
             );
         }
+        // The drain counters are hudi-core's to fill on EVERY path, so they are
+        // zeroed ONCE, here, above the outcome test — not per branch.
+        //
+        // `served_batch_stream` (crates/core) tallies rows/bytes/batches as it
+        // consumes the stream and merges them into the live slot, so a provider
+        // that populated them too would be double-counted. On a NOT_SERVED
+        // outcome nothing is consumed at all, and the counters had been passed
+        // through verbatim there — a provider that filled them yielded
+        // `rows_served > 0` alongside `files_served == 0`, which is not a
+        // double-count but is a reading no operator can make sense of (OI-3).
+        // Setup counters are the provider's and are kept.
+        stats.rows_served = 0;
+        stats.bytes_materialized = 0;
+        stats.batches_received = 0;
+
         if outcome_code != HUDI_PROVIDER_OUTCOME_SERVED {
+            if outcome_code != HUDI_PROVIDER_OUTCOME_NOT_SERVED {
+                // A code we have no meaning for. Treat it as not-served, which is
+                // the safe reading, and reclassify the counters the way the
+                // failed-import path does — because that is what happened: the
+                // provider may well have set `files_served`, and this file is
+                // about to be read from object storage.
+                log::warn!(
+                    "[hudi-provider-abi] provider returned {outcome_code}, which is neither \
+                     HUDI_PROVIDER_OUTCOME_SERVED ({HUDI_PROVIDER_OUTCOME_SERVED}) nor \
+                     HUDI_PROVIDER_OUTCOME_NOT_SERVED ({HUDI_PROVIDER_OUTCOME_NOT_SERVED}); \
+                     treating it as NOT_SERVED and reading from storage"
+                );
+                stats.files_served = stats.files_served.saturating_sub(1);
+                stats.storage_fallbacks += 1;
+            }
             return (None, stats);
         }
         match Self::served_reader(&mut c_res) {
-            Some(reader) => {
-                // On the served path the drain counters are hudi-core's to fill:
-                // the `served_batch_stream` (crates/core) tallies rows/bytes/batches as the stream
-                // is consumed and merges them into the live stats slot. Zero
-                // whatever the provider reported for them here, so a provider that
-                // (against the contract) also populated these cannot cause a
-                // double-count. Setup counters are kept.
-                stats.rows_served = 0;
-                stats.bytes_materialized = 0;
-                stats.batches_received = 0;
-                (Some(reader), stats)
-            }
+            Some(reader) => (Some(reader), stats),
             None => {
                 // The provider claimed SERVED but its stream could not be
                 // imported, so the read below actually goes to object storage.
@@ -555,9 +574,6 @@ impl BaseFileDataProvider for CApiBaseFileDataProvider {
                 // set `files_served` at all.
                 stats.files_served = stats.files_served.saturating_sub(1);
                 stats.storage_fallbacks += 1;
-                stats.rows_served = 0;
-                stats.bytes_materialized = 0;
-                stats.batches_received = 0;
                 (None, stats)
             }
         }
@@ -949,10 +965,66 @@ mod tests {
     /// bridge just reports the inverse of the one signal the provider seam exists
     /// to produce — is this split being served locally or over the network.
     ///
-    /// Ten DISTINCT non-zero values, on a NOT_SERVED outcome so the served path's
-    /// deliberate zeroing of the three drain counters cannot mask them.
+    /// Ten DISTINCT non-zero values, asserted against the `From` impl DIRECTLY.
+    ///
+    /// Directly, because `try_base_file` is no longer able to show these three:
+    /// the drain counters are zeroed on every outcome now (OI-3), so driving this
+    /// through a call would re-hide `rows_served`, `bytes_served` and
+    /// `batches_received` behind the policy — which is what made the swap
+    /// invisible in the first place. The mapping and the policy are two claims and
+    /// they get two tests: this one, and
+    /// `the_drain_counters_are_zeroed_on_every_outcome` below.
+    #[test]
+    fn every_stats_field_survives_the_c_boundary_inbound() {
+        let wire = HudiBaseFileProviderStats {
+            files_served: 1,
+            storage_fallbacks: 2,
+            local_served: 3,
+            remote_served: 4,
+            rows_served: 5,
+            bytes_served: 6,
+            batches_received: 7,
+            discover_wall_nanos: 8,
+            connect_wall_nanos: 9,
+            fetch_wall_nanos: 10,
+        };
+        let stats: BaseFileProviderStats = wire.into();
+
+        // Whole struct, against literals — not against a re-read of the source,
+        // which would pass under any permutation of it.
+        assert_eq!(
+            stats,
+            BaseFileProviderStats {
+                files_served: 1,
+                storage_fallbacks: 2,
+                local_served: 3,
+                remote_served: 4,
+                rows_served: 5,
+                // The wire keeps the name `bytes_served`; hudi-core's field is
+                // `bytes_materialized`. A deliberate rename, and the one field
+                // where a straight name-for-name copy would be wrong.
+                bytes_materialized: 6,
+                batches_received: 7,
+                discover_wall_nanos: 8,
+                connect_wall_nanos: 9,
+                fetch_wall_nanos: 10,
+            },
+            "every wire field must land in its own slot — swapping two adjacent \
+             u64 lines compiles, trips no lint, and inverts the one operational \
+             signal the provider seam exists to produce"
+        );
+    }
+
+    /// The drain counters are hudi-core's on EVERY outcome, not just the served
+    /// one — and a provider that fills them anyway is ignored on all of them.
+    ///
+    /// The NOT_SERVED path used to pass them through verbatim, so a misbehaving
+    /// provider produced `rows_served > 0` alongside `files_served == 0`: not a
+    /// double-count, but a reading no operator can make sense of (OI-3). Setup
+    /// counters are the provider's and must survive, which is what stops the fix
+    /// from being "zero everything".
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn every_stats_field_survives_the_c_boundary_inbound() {
+    async fn the_drain_counters_are_zeroed_on_every_outcome() {
         extern "C" fn all_distinct(
             _ctx: *mut c_void,
             _req: *const HudiBaseFileDataRequest,
@@ -960,10 +1032,11 @@ mod tests {
         ) -> c_int {
             // SAFETY: a fresh out-parameter supplied by the adapter.
             unsafe { &mut *out }.stats = HudiBaseFileProviderStats {
-                files_served: 1,
+                files_served: 0,
                 storage_fallbacks: 2,
                 local_served: 3,
                 remote_served: 4,
+                // All three drain counters filled, against contract.
                 rows_served: 5,
                 bytes_served: 6,
                 batches_received: 7,
@@ -991,23 +1064,82 @@ mod tests {
             .await;
         assert!(served.is_none(), "NOT_SERVED, so nothing is served");
 
-        // Field for field, against the literals above — not against a re-read of
-        // the source struct, which would pass under any permutation of it.
-        assert_eq!(stats.files_served, 1, "files_served");
-        assert_eq!(stats.storage_fallbacks, 2, "storage_fallbacks");
-        assert_eq!(stats.local_served, 3, "local_served");
-        assert_eq!(stats.remote_served, 4, "remote_served");
-        assert_eq!(stats.rows_served, 5, "rows_served");
         assert_eq!(
-            stats.bytes_materialized, 6,
-            "the wire's `bytes_served` lands in hudi-core's `bytes_materialized` \
-             — a deliberate rename, and the one field where a straight
-             name-for-name copy would be wrong"
+            stats,
+            BaseFileProviderStats {
+                // Zeroed: hudi-core's, and nothing was drained.
+                rows_served: 0,
+                bytes_materialized: 0,
+                batches_received: 0,
+                // Kept: the provider's own, and the whole point of not just
+                // zeroing the struct.
+                storage_fallbacks: 2,
+                local_served: 3,
+                remote_served: 4,
+                discover_wall_nanos: 8,
+                connect_wall_nanos: 9,
+                fetch_wall_nanos: 10,
+                files_served: 0,
+            },
+            "drain counters zeroed on a NOT_SERVED outcome; setup counters kept"
         );
-        assert_eq!(stats.batches_received, 7, "batches_received");
-        assert_eq!(stats.discover_wall_nanos, 8, "discover_wall_nanos");
-        assert_eq!(stats.connect_wall_nanos, 9, "connect_wall_nanos");
-        assert_eq!(stats.fetch_wall_nanos, 10, "fetch_wall_nanos");
+    }
+
+    /// An outcome code that is neither SERVED nor NOT_SERVED is treated as
+    /// not-served AND reclassified, rather than passed through as-is.
+    ///
+    /// A provider returning a code we have no meaning for has told us nothing we
+    /// can act on, so the file goes to object storage — and the counters have to
+    /// say so, because the provider may well have incremented `files_served` on
+    /// its way to returning garbage. The failed-import path one screen down
+    /// already reclassified; this one returned early and did not (OI-3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unknown_outcome_code_is_declined_and_reclassified() {
+        extern "C" fn garbage_outcome(
+            _ctx: *mut c_void,
+            _req: *const HudiBaseFileDataRequest,
+            out: *mut HudiBaseFileDataResult,
+        ) -> c_int {
+            // SAFETY: a fresh out-parameter supplied by the adapter.
+            unsafe { &mut *out }.stats = HudiBaseFileProviderStats {
+                // It counted a serve on its way to returning nonsense.
+                files_served: 1,
+                discover_wall_nanos: 8,
+                ..Default::default()
+            };
+            -7
+        }
+        extern "C" fn noop_destroy(_ctx: *mut c_void) {}
+
+        let vtable = HudiBaseFileDataProviderVTable {
+            abi_version: HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+            try_base_file: garbage_outcome,
+            destroy: noop_destroy,
+        };
+        let handle = unsafe { hudi_base_file_data_provider_new(&vtable, std::ptr::null_mut()) };
+        let provider = unsafe { take_provider_from_handle(handle) }.expect("provider");
+
+        let schema: Arc<Schema> =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let fields: Vec<String> = Vec::new();
+        let (served, stats) = provider
+            .try_base_file(sample_request(&schema, &fields))
+            .await;
+        assert!(
+            served.is_none(),
+            "an unknown code must not be read as SERVED"
+        );
+        assert_eq!(
+            stats,
+            BaseFileProviderStats {
+                files_served: 0,
+                storage_fallbacks: 1,
+                discover_wall_nanos: 8,
+                ..Default::default()
+            },
+            "the claimed serve is walked back and counted as the storage fallback \
+             it became — the same reclassification a failed import gets"
+        );
     }
 
     /// `data_schema: None` must arrive as a NULL pointer, not as a dangling one.
