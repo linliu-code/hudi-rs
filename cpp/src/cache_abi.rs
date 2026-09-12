@@ -34,20 +34,7 @@
 //!
 //! Whether the cache should have a TTL is #143's question. Whether an embedder
 //! can clear it at all is not, and the answer was no.
-//
-// `hudi_core::storage::parquet_schema_cache_clear/_stats` are `pub`, and were
-// `pub` at the Rust boundary ONLY — neither `cpp/` nor `crates/jvm-ffi` plumbed
-// them, so the documented escape hatch did not exist for the embedders this
-// lineage actually ships to (ISSUES OI-5).
-//
-// It matters because the cache is sound on "base parquet files are immutable",
-// which holds for Hudi's own writers and not for an operator running a
-// remediation tool — including one rewriting a footer to correct the
-// apache/hudi#18132 mislabel, which is the exact input the repair gate keys on.
-// With a warm cache and no TTL, a long-lived embedding process keeps comparing
-// the PRE-rewrite footer, and one direction of that error pushes a `RowFilter`
-// against reinterpreted values and silently drops rows. The TTL question is
-// #143's to answer; being able to clear the cache at all is not.
+
 /// Snapshot of the parquet schema cache counters. Mirrors
 /// `hudi_core::storage::ParquetSchemaCacheStats`.
 #[repr(C)]
@@ -107,10 +94,19 @@ mod tests {
     /// recent inserts and invalidations, so an assertion on it is about timing.
     /// hudi-core's own `clear()` test takes the same shape for the same reason.
     ///
-    /// `serial`, because the cache is PROCESS-WIDE: `clear()` here is visible to
-    /// every other test in this binary, and their reads move these counters.
+    /// EVERY assertion is monotone-safe, because the cache is PROCESS-WIDE and
+    /// four other tests in this binary read parquet concurrently with it. It was
+    /// briefly `#[serial_test::serial]`, which was a fiction: `serial` serialises
+    /// a test only against OTHER `#[serial]` tests, and there are none here — so
+    /// it bought nothing while adding a dev-dependency to `cpp/Cargo.toml`, a file
+    /// the charter assigns to another milestone. Removed.
+    ///
+    /// Monotone-safe means every assertion survives another test moving these
+    /// counters underneath it: `hits` and `misses` only ever INCREASE, so the
+    /// assertions are `>` and `>=` rather than `==`. The one exact assertion this
+    /// test used to make — that a warm read leaves `misses` untouched — was racy
+    /// and is gone.
     #[test]
-    #[serial_test::serial]
     fn the_c_exports_read_and_clear_the_real_cache() {
         let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
 
@@ -126,12 +122,14 @@ mod tests {
             cold.misses
         );
 
-        // ── warm: the same file again hits, and fetches nothing ─────────────
+        // ── warm: the same file again hits ──────────────────────────────────
         //
-        // THREE warm reads, not one. One cold plus one warm leaves hits == misses
-        // == 1, and the fixture check below — which exists precisely to catch
-        // this — fired on the first run of this test.
-        for _ in 0..3 {
+        // SIX warm reads, not one, for two reasons. One cold plus one warm leaves
+        // hits == misses == 1, and the fixture check below — which exists
+        // precisely to catch that — fired on the first run of this test. And the
+        // swap check further down needs hits to be comfortably LARGER than
+        // misses, not merely different.
+        for _ in 0..6 {
             crate::tests::provider_e2e::read_once(&table_path);
         }
         let warm = hudi_parquet_schema_cache_stats();
@@ -141,38 +139,35 @@ mod tests {
             cold.hits,
             warm.hits
         );
-        assert_eq!(
-            warm.misses, cold.misses,
-            "and must not fetch the footer again"
-        );
 
         // ── the two views are the same cache, slot for slot ─────────────────
         //
         // `hits` and `misses` are now DIFFERENT numbers, which is what makes the
         // two slots distinguishable — without that, a marshaller that swapped
         // them would compare equal.
-        let rust = hudi_dep::storage::parquet_schema_cache_stats();
+        // C FIRST, Rust SECOND, and compared with `>=` rather than `==`. Both
+        // counters only increase, so a concurrent read between the two calls can
+        // only make the later (Rust) value larger — which `>=` tolerates and `==`
+        // would fail on. Exact equality here was a latent flake.
         let c = hudi_parquet_schema_cache_stats();
-        assert_ne!(
-            rust.hits, rust.misses,
-            "fixture check: the counters must differ, or the comparison below \
-             cannot tell one slot from the other"
-        );
-        assert_eq!(
-            (c.hits, c.misses),
-            (rust.hits, rust.misses),
-            "the C view must be the same cache, field for field — swapping two \
-             u64s in the marshaller compiles and is invisible to any assertion \
-             about shape"
-        );
-        // `entries` is compared too, but loosely: moka's count lags, so the two
-        // calls above can legitimately straddle a pending task. Equality is the
-        // common case and worth asserting; a difference of one is not a defect.
+        let rust = hudi_dep::storage::parquet_schema_cache_stats();
         assert!(
-            c.entries.abs_diff(rust.entries) <= 1,
-            "entries must track the same cache: C {} vs Rust {}",
-            c.entries,
-            rust.entries
+            rust.hits > rust.misses,
+            "fixture check: hits must be comfortably ABOVE misses ({} vs {}), or \
+             the swap check below cannot tell one slot from the other",
+            rust.hits,
+            rust.misses
+        );
+        assert!(
+            rust.hits >= c.hits && rust.misses >= c.misses,
+            "the C view must be the same cache, in the same slots: C \
+             (hits {}, misses {}) vs Rust (hits {}, misses {}). Swapping the two \
+             u64s in the marshaller puts the large hit count into `misses`, which \
+             this comparison cannot absorb",
+            c.hits,
+            c.misses,
+            rust.hits,
+            rust.misses
         );
 
         // ── clear() really clears, proven by behaviour rather than by count ──

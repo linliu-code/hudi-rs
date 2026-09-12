@@ -560,6 +560,14 @@ impl BaseFileDataProvider for CApiBaseFileDataProvider {
                 stats.files_served = stats.files_served.saturating_sub(1);
                 stats.storage_fallbacks += 1;
             }
+            // NOTE — a plain NOT_SERVED is deliberately NOT reclassified here, and
+            // that asymmetry is a contract, not an oversight. A conforming
+            // provider that declines sets `storage_fallbacks` ITSELF (the header
+            // says so, and every stub does), so incrementing again would
+            // double-count the ordinary decline — by far the commonest outcome on
+            // this seam. The two branches above are for providers that told us
+            // something UNTRUE: a serve that could not be imported, and a code we
+            // have no meaning for. Neither can be trusted to have counted itself.
             return (None, stats);
         }
         match Self::served_reader(&mut c_res) {
@@ -1096,14 +1104,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unknown_outcome_code_is_declined_and_reclassified() {
         extern "C" fn garbage_outcome(
-            _ctx: *mut c_void,
+            ctx: *mut c_void,
             _req: *const HudiBaseFileDataRequest,
             out: *mut HudiBaseFileDataResult,
         ) -> c_int {
             // SAFETY: a fresh out-parameter supplied by the adapter.
+            // TWO shapes, chosen by the ctx pointer being null or not, because
+            // `saturating_sub(1)` on this branch is only load-bearing when
+            // `files_served` is already 0 — a provider that returns garbage
+            // without having claimed a serve. With only the `1` case,
+            // `stats.files_served -= 1` survives and panics in debug for the
+            // other one.
+            let claimed_a_serve = ctx.is_null();
             unsafe { &mut *out }.stats = HudiBaseFileProviderStats {
-                // It counted a serve on its way to returning nonsense.
-                files_served: 1,
+                files_served: u64::from(claimed_a_serve),
                 discover_wall_nanos: 8,
                 ..Default::default()
             };
@@ -1116,30 +1130,44 @@ mod tests {
             try_base_file: garbage_outcome,
             destroy: noop_destroy,
         };
-        let handle = unsafe { hudi_base_file_data_provider_new(&vtable, std::ptr::null_mut()) };
-        let provider = unsafe { take_provider_from_handle(handle) }.expect("provider");
+        // ctx null     -> the stub claims `files_served: 1` before returning garbage
+        // ctx non-null -> it claims nothing, which is where `saturating_sub` earns
+        //                 its keep: a plain `-= 1` panics in debug at 0, and with
+        //                 only the first case that mutation survives.
+        let mut somewhere = 0u8;
+        for (case, ctx) in [
+            ("claimed a serve", std::ptr::null_mut::<c_void>()),
+            (
+                "claimed nothing",
+                std::ptr::from_mut(&mut somewhere).cast::<c_void>(),
+            ),
+        ] {
+            let handle = unsafe { hudi_base_file_data_provider_new(&vtable, ctx) };
+            let provider = unsafe { take_provider_from_handle(handle) }.expect("provider");
 
-        let schema: Arc<Schema> =
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
-        let fields: Vec<String> = Vec::new();
-        let (served, stats) = provider
-            .try_base_file(sample_request(&schema, &fields))
-            .await;
-        assert!(
-            served.is_none(),
-            "an unknown code must not be read as SERVED"
-        );
-        assert_eq!(
-            stats,
-            BaseFileProviderStats {
-                files_served: 0,
-                storage_fallbacks: 1,
-                discover_wall_nanos: 8,
-                ..Default::default()
-            },
-            "the claimed serve is walked back and counted as the storage fallback \
-             it became — the same reclassification a failed import gets"
-        );
+            let schema: Arc<Schema> =
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+            let fields: Vec<String> = Vec::new();
+            let (served, stats) = provider
+                .try_base_file(sample_request(&schema, &fields))
+                .await;
+            assert!(
+                served.is_none(),
+                "{case}: an unknown code must not be read as SERVED"
+            );
+            assert_eq!(
+                stats,
+                BaseFileProviderStats {
+                    files_served: 0,
+                    storage_fallbacks: 1,
+                    discover_wall_nanos: 8,
+                    ..Default::default()
+                },
+                "{case}: whatever the provider claimed is walked back and counted \
+                 as the storage fallback it became — the same reclassification a \
+                 failed import gets"
+            );
+        }
     }
 
     /// `data_schema: None` must arrive as a NULL pointer, not as a dangling one.

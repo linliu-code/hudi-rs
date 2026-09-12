@@ -360,10 +360,16 @@ fn served_batch_stream(
         // `project_batch_to_schema` indexes columns. Silent truncation of a query
         // is the worst failure mode this seam has (ISSUES OI-2).
         //
-        // `AssertUnwindSafe` is sound here because nothing observes the closure's
-        // state after a panic: `served` is dropped by the unwind (reader first,
-        // then provider — the field order still holds), and the only thing touched
-        // afterwards is a channel clone made before the closure.
+        // `AssertUnwindSafe` is sound here, but not for the reason it first looks:
+        // state IS observed afterwards. The captured `stats` slot is the live one
+        // `base_file_provider_live_stats()` hands out, and the reader's owner reads
+        // it after the panic. It is safe because that slot is ADVISORY and is
+        // consistent at every point a panic can occur — each update is a complete
+        // `+=` under the guard with nothing fallible between them — and because
+        // lock poison is already tolerated below. A future edit that puts a
+        // fallible operation under that lock would invalidate this, and nothing
+        // would catch it. `served` itself is dropped by the unwind, reader before
+        // provider, because the field order still holds.
         let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             // Capture the WHOLE struct, not one field. Since edition 2021 a closure
             // captures disjoint fields, so a body that only ever names `served.reader`
@@ -400,13 +406,27 @@ fn served_batch_stream(
             }
         }));
         if let Err(payload) = drained {
-            // Best-effort: if the consumer has already gone away there is nobody
-            // to tell, which is the one case where losing the panic is correct.
+            // `blocking_send`, NOT `try_send`, and that is load-bearing.
+            //
+            // The channel has capacity ONE and the producer has usually just
+            // filled it, so `try_send` returns `Full` on the common path, the
+            // error is dropped, the channel closes and the consumer sees a clean
+            // end-of-stream — OI-2 reinstated verbatim, on any read whose consumer
+            // is a batch behind. That is not the rare case; it is the normal one
+            // for a fast provider feeding a busy engine. Review round 9 built it
+            // as mutation 36 and it survived the suite, because the only test
+            // consuming this path was `collect()`, the fastest consumer possible.
+            //
+            // Blocking here parks one blocking-pool thread until the consumer
+            // takes the error or goes away. Both terminate: the `Err` result
+            // drops the sender either way. `let _` because a consumer that has
+            // ALREADY gone away is the one case where losing the panic is
+            // correct — nobody is left to tell.
             let _ = panic_tx.blocking_send(Err(CoreError::ReadFileSliceError(format!(
                 "base-file provider stream PANICKED: {}. The read is failed rather \
                  than truncated — a panicking provider must not turn into a short \
                  result that reports success",
-                panic_message(&payload)
+                panic_message(&*payload)
             ))));
         }
     });
@@ -418,10 +438,17 @@ fn served_batch_stream(
 
 /// The human-readable half of a `catch_unwind` payload.
 ///
-/// `panic!("msg")` yields a `&'static str` and `panic!("{x}")` a `String`; any
-/// other payload type carries nothing we can render, and saying so is better than
-/// an empty message.
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+/// BOTH arms are load-bearing and each needs its own test. `panic!("literal")`
+/// yields a `&'static str` — and so do `unwrap()`, `expect(..)`, `assert!(..)`
+/// and arrow-rs's own panics in the FFI import path, i.e. exactly the payloads
+/// this seam exists for. `panic!("{x}")` yields a `String`. Any other payload
+/// type carries nothing renderable, and saying so beats an empty message.
+///
+/// Review round 9 deleted the `&'static str` arm as "two arms that do the same
+/// thing" and the suite stayed green, because the only stub panicked with a
+/// FORMATTED message. Every literal panic would have rendered as
+/// `<non-string panic payload>` — caught, but not diagnosable.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -1592,20 +1619,6 @@ impl HoodieFileGroupReader {
             .unwrap_or_default()
     }
 
-    /// Fold one provider attempt's setup counters into the shared slot.
-    ///
-    /// The single writer, so "no counter is recorded twice" is a property of this
-    /// function rather than an invariant spread across call sites. It holds
-    /// because a reader offers exactly one base file to the provider, so this
-    /// runs at most once per reader — asserted in debug builds via
-    /// [`Self::provider_stats_recorded`]. The condition it catches is real on
-    /// this lineage too: [`Self::base_file_source`] is reached from both
-    /// [`Self::open`] and [`Self::read`], so driving one reader through both (or
-    /// through `read()` twice) would silently double the setup counters.
-    ///
-    /// In release a second call accumulates rather than panicking: these are
-    /// diagnostic counters and must never fail a read. The lock poison is
-    /// swallowed for the same reason.
     /// Can an injected provider actually be used on the executor polling us?
     ///
     /// `served_batch_stream` moves the served reader onto `spawn_blocking`, which
@@ -1613,9 +1626,11 @@ impl HoodieFileGroupReader {
     /// inside a stream, decline the provider and read from object storage — the
     /// same degradation a wrong schema or an unimportable stream gets.
     ///
-    /// `log_once`-shaped by hand: this would otherwise fire per base file, and the
-    /// condition is a property of the caller's executor, which does not change
-    /// within a read.
+    /// Warns on EVERY declined file, deliberately. There is no once-guard: the
+    /// condition is a property of the caller's executor and cannot change within a
+    /// read, so one reader emits at most one of these — but a scan of N file
+    /// groups off-runtime emits N, which is the right volume for a misconfiguration
+    /// that silently costs the provider seam its entire benefit.
     fn provider_is_usable_here(&self, path: &str) -> bool {
         if tokio::runtime::Handle::try_current().is_ok() {
             return true;
@@ -1707,6 +1722,20 @@ impl HoodieFileGroupReader {
         *row_group_selector = None;
     }
 
+    /// Fold one provider attempt's setup counters into the shared slot.
+    ///
+    /// The single writer, so "no counter is recorded twice" is a property of this
+    /// function rather than an invariant spread across call sites. It holds
+    /// because a reader offers exactly one base file to the provider, so this
+    /// runs at most once per reader — asserted in debug builds via
+    /// [`Self::provider_stats_recorded`]. The condition it catches is real on
+    /// this lineage too: [`Self::base_file_source`] is reached from both
+    /// [`Self::open`] and [`Self::read`], so driving one reader through both (or
+    /// through `read()` twice) would silently double the setup counters.
+    ///
+    /// In release a second call accumulates rather than panicking: these are
+    /// diagnostic counters and must never fail a read. The lock poison is
+    /// swallowed for the same reason.
     fn record_provider_stats(&self, stats: &BaseFileProviderStats) {
         let already = self
             .provider_stats_recorded
@@ -4665,6 +4694,10 @@ mod tests {
         /// which is what arrow-rs does on a malformed `ArrowArray`/`ArrowSchema`
         /// — i.e. what a buggy C provider actually produces.
         panic_after_serving: bool,
+        /// Which PAYLOAD the panic carries: a bare literal (`&'static str`) or an
+        /// interpolated message (`String`). `panic_message` has an arm for each
+        /// and only one of them used to be reachable from a test.
+        panic_is_literal: bool,
         /// The request fields of the last call.
         seen: StdMutex<Option<SeenRequest>>,
     }
@@ -4687,6 +4720,7 @@ mod tests {
                 serve: Some(batches),
                 fail_after_serving: false,
                 panic_after_serving: false,
+                panic_is_literal: false,
                 seen: StdMutex::new(None),
             })
         }
@@ -4697,16 +4731,32 @@ mod tests {
                 serve: Some(batches),
                 fail_after_serving: true,
                 panic_after_serving: false,
+                panic_is_literal: false,
                 seen: StdMutex::new(None),
             })
         }
 
-        /// Serves `batches`, then PANICS instead of ending the stream cleanly.
+        /// Serves `batches`, then PANICS with an interpolated message (a `String`
+        /// payload) instead of ending the stream cleanly.
         fn serving_then_panicking(batches: Vec<RecordBatch>) -> Arc<Self> {
             Arc::new(Self {
                 serve: Some(batches),
                 fail_after_serving: false,
                 panic_after_serving: true,
+                panic_is_literal: false,
+                seen: StdMutex::new(None),
+            })
+        }
+
+        /// As [`Self::serving_then_panicking`], but the panic is a bare LITERAL —
+        /// a `&'static str` payload, which is what `unwrap`, `expect`, `assert!`
+        /// and arrow-rs's FFI-import panics all produce.
+        fn serving_then_panicking_with_a_literal(batches: Vec<RecordBatch>) -> Arc<Self> {
+            Arc::new(Self {
+                serve: Some(batches),
+                fail_after_serving: false,
+                panic_after_serving: true,
+                panic_is_literal: true,
                 seen: StdMutex::new(None),
             })
         }
@@ -4716,6 +4766,7 @@ mod tests {
                 serve: None,
                 fail_after_serving: false,
                 panic_after_serving: false,
+                panic_is_literal: false,
                 seen: StdMutex::new(None),
             })
         }
@@ -4733,6 +4784,13 @@ mod tests {
     /// the test cannot pass on some unrelated panic.
     const STUB_MID_STREAM_PANIC: &str = "stub provider panicked mid-stream";
 
+    /// The message the LITERAL-payload variant raises. A separate constant
+    /// because the point is the payload TYPE: this one is raised as
+    /// `panic!("<literal>")`, which yields `&'static str`, where
+    /// [`STUB_MID_STREAM_PANIC`] is interpolated and yields `String`. The two
+    /// take different arms of `panic_message`, and one arm was pinned by nothing.
+    const STUB_LITERAL_PANIC: &str = "stub provider panicked with a literal";
+
     /// A `RecordBatchReader` that yields `items` and then panics.
     ///
     /// `RecordBatchIterator` cannot express this — its item type is a `Result`,
@@ -4742,6 +4800,10 @@ mod tests {
     struct PanickingReader {
         items: std::vec::IntoIter<RecordBatch>,
         schema: SchemaRef,
+        /// `true` raises a bare literal (`&'static str` payload), `false` an
+        /// interpolated message (`String`). The two exercise different arms of
+        /// `panic_message`.
+        literal: bool,
     }
 
     impl Iterator for PanickingReader {
@@ -4749,6 +4811,9 @@ mod tests {
         fn next(&mut self) -> Option<Self::Item> {
             match self.items.next() {
                 Some(b) => Some(Ok(b)),
+                // Deliberately NOT `panic!("{STUB_LITERAL_PANIC}")` — that would
+                // interpolate and yield a `String`, which is the other arm.
+                None if self.literal => panic!("stub provider panicked with a literal"),
                 None => panic!("{STUB_MID_STREAM_PANIC}"),
             }
         }
@@ -4797,6 +4862,7 @@ mod tests {
                             Box::new(PanickingReader {
                                 items: batches.clone().into_iter(),
                                 schema,
+                                literal: self.panic_is_literal,
                             })
                         } else {
                             Box::new(arrow_array::RecordBatchIterator::new(
@@ -5263,6 +5329,103 @@ mod tests {
             msg.contains("PANICKED"),
             "and must be distinguishable from a mid-stream Err, which is a \
              different provider defect: {msg}"
+        );
+    }
+
+    /// The panic reaches a SLOW consumer — one that is a batch behind when the
+    /// panic fires.
+    ///
+    /// The sibling test above consumes with `collect()`, the fastest consumer
+    /// possible, so the depth-1 channel is always empty by the time the producer
+    /// reports its panic. That makes the DELIVERY of the report untested: review
+    /// round 9 changed `blocking_send` to `try_send` — one token, and the obvious
+    /// edit for anyone who dislikes parking a blocking-pool thread on the way out
+    /// of a panic — and the whole suite stayed green. With the buffer full,
+    /// `try_send` returns `Full`, the error is dropped, the channel closes, and
+    /// the consumer sees a clean end-of-stream: OI-2 reinstated verbatim, on
+    /// every read whose consumer is a batch behind.
+    ///
+    /// So this consumer deliberately does not poll until the producer has had
+    /// time to fill the buffer, and then drains slowly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_consumer_still_receives_the_panic() {
+        use futures::StreamExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        // Several batches, so the producer is well ahead of this consumer.
+        let served: Vec<RecordBatch> = [vec![7], vec![8], vec![9]]
+            .into_iter()
+            .map(|v| id_batch(v).1)
+            .collect();
+        let provider = StubDataProvider::serving_then_panicking(served);
+        let mut reader = reader_with_provider(tmp.path(), base_name, schema, provider).await;
+
+        let BaseSource { mut batches, .. } = reader.base_file_source().await.unwrap();
+
+        // Do not poll yet: let the producer fill the depth-1 channel, block on
+        // the next send, run out of batches and panic with the buffer FULL.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let mut items: Vec<Result<RecordBatch>> = Vec::new();
+        while let Some(item) = batches.next().await {
+            items.push(item);
+            // Stay behind the producer for the whole drain.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let errs: Vec<&CoreError> = items.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert_eq!(
+            errs.len(),
+            1,
+            "the panic must reach even a consumer that is a batch behind — a \
+             stream that simply ENDS here is a short result reporting success, \
+             and the consumer has no way to know it lost rows"
+        );
+        assert!(
+            format!("{}", errs[0]).contains(STUB_MID_STREAM_PANIC),
+            "and must still name the panic: {}",
+            errs[0]
+        );
+    }
+
+    /// A panic carrying a LITERAL payload is rendered, not swallowed into
+    /// `<non-string panic payload>`.
+    ///
+    /// `panic_message` has two arms. `panic!("{x}")` yields a `String`; a bare
+    /// `panic!("literal")` yields a `&'static str` — and so do `unwrap()`,
+    /// `expect(..)`, `assert!(..)` and arrow-rs's own panics on importing a
+    /// malformed `ArrowArray`, which is the case this whole seam exists for.
+    ///
+    /// Only the `String` arm was reachable from a test, because the one stub
+    /// interpolated its message. Review round 9 deleted the `&'static str` arm as
+    /// redundant and the suite stayed green — every literal panic would have
+    /// arrived caught but unreadable, which is half the fix.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_literal_panic_payload_is_still_rendered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider =
+            StubDataProvider::serving_then_panicking_with_a_literal(vec![id_batch(vec![7]).1]);
+        let mut reader = reader_with_provider(tmp.path(), base_name, schema, provider).await;
+
+        let BaseSource { batches, .. } = reader.base_file_source().await.unwrap();
+        let items: Vec<Result<RecordBatch>> = batches.collect().await;
+
+        let errs: Vec<&CoreError> = items.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert_eq!(errs.len(), 1, "the literal panic must still fail the read");
+        let msg = format!("{}", errs[0]);
+        assert!(
+            msg.contains(STUB_LITERAL_PANIC),
+            "a `&'static str` payload must be RENDERED, not reported as an \
+             unrecognised payload — a caught panic nobody can read is half a \
+             fix: {msg}"
         );
     }
 
