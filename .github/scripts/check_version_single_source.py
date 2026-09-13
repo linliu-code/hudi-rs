@@ -49,7 +49,13 @@ LITERAL_ALLOWED_SUFFIXES = ("Cargo.toml", "Cargo.lock")
 # named rather than extended to `*.md`, because a blanket suffix rule would let a pinned version
 # in ANY document rot silently -- documentation that tells a reader to install the wrong version
 # is the same defect as a stale literal in a script, just slower to notice.
-SWEEP_SKIP_FILES = ("crates/jni/README.md",)
+SWEEP_SKIP_FILES = (
+    "crates/jni/README.md",
+    # Release-process prose: its bump-rule sentence quotes three example versions (the
+    # current dev version and the minor/major bumps of it) that are meant to stay as written
+    # after every real bump. Upstream #749/#759 added the sentence; it is not a version site.
+    "release/README.md",
+)
 
 # Sites that used to carry a hardcoded copy and must now visibly derive one. Rule 2 catches a
 # re-hardcode; this catches the other way a derivation can be lost -- being deleted outright.
