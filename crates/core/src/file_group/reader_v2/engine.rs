@@ -7396,6 +7396,15 @@ mod tests {
     async fn base_file_source_pays_for_the_prefix_before_it_returns() {
         use std::sync::atomic::Ordering::Relaxed;
 
+        const FIXTURE_ROWS: u64 = 3;
+        assert!(
+            (BASE_READ_INITIAL_PREFETCH_BATCHES as u64) < FIXTURE_ROWS,
+            "this test only discriminates while the prefetch depth is BELOW the \
+             fixture's row-group count: at or above it the whole file is prefetched \
+             and 'before it returns' asserts nothing. Widen three_row_groups() if \
+             the constant grows."
+        );
+
         let (tmp, base_name, schema) = three_row_groups();
         let mut reader = test_file_group_reader_for_base_file(tmp.path(), &base_name, schema).await;
         let volume = reader.storage.read_volume();
@@ -7583,14 +7592,39 @@ mod tests {
             }
         }
 
-        let med = |mut v: Vec<f64>| {
+        // Report SPREAD, not just a median. Seven medians with no dispersion let a
+        // reader take a 31 us delta on a 136 us baseline as a result when it may be
+        // noise; that is the reading this bench's first artifact invited.
+        /// median, min, max of one arm's samples for one quantity.
+        struct Spread {
+            med: f64,
+            min: f64,
+            max: f64,
+        }
+        /// One arm's three quantities.
+        struct Arm {
+            depth: usize,
+            open: Spread,
+            first: Spread,
+            total: Spread,
+        }
+        let stat = |mut v: Vec<f64>| -> Spread {
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            v[v.len() / 2]
+            Spread {
+                med: v[v.len() / 2],
+                min: v[0],
+                max: v[v.len() - 1],
+            }
         };
-        let rows: Vec<(usize, f64, f64, f64)> = depths
+        let rows: Vec<Arm> = depths
             .iter()
             .zip(samples)
-            .map(|(d, (o, f, t))| (*d, med(o), med(f), med(t)))
+            .map(|(d, (o, f, t))| Arm {
+                depth: *d,
+                open: stat(o),
+                first: stat(f),
+                total: stat(t),
+            })
             .collect();
 
         println!("\n=== ENG-48159 re-measurement on this tree's BoxStream shape ===");
@@ -7599,29 +7633,66 @@ mod tests {
              median of {REPS} reps, local object store"
         );
         println!(
-            "\n{:<8} {:>16} {:>18} {:>14}",
-            "depth", "open() us", "time-to-first us", "total us"
+            "\n{:<8} {:>24} {:>24} {:>26}",
+            "depth",
+            "open() us med[min-max]",
+            "t-to-first us med[min-max]",
+            "total us med[min-max]"
         );
-        for (d, o, f, t) in &rows {
-            println!("{d:<8} {o:>16.0} {f:>18.0} {t:>14.0}");
+        for a in &rows {
+            println!(
+                "{:<8} {:>12.0} [{:.0}-{:.0}] {:>12.0} [{:.0}-{:.0}] {:>13.0} [{:.0}-{:.0}]",
+                a.depth,
+                a.open.med,
+                a.open.min,
+                a.open.max,
+                a.first.med,
+                a.first.min,
+                a.first.max,
+                a.total.med,
+                a.total.min,
+                a.total.max
+            );
         }
-        let (_, o0, f0, t0) = rows[0];
-        let (d1, o1, f1, t1) = rows[1];
+        let (o0, f0, t0) = (&rows[0].open, &rows[0].first, &rows[0].total);
+        let (d1, o1, f1, t1) = (rows[1].depth, &rows[1].open, &rows[1].first, &rows[1].total);
+        let pct = |a: f64, b: f64| {
+            if b == 0.0 {
+                f64::NAN
+            } else {
+                100.0 * (a - b) / b
+            }
+        };
         println!(
-            "\ndepth {d1} vs depth 0:\n  open()           {:+.0} us  ({:+.1}%)\n  \
+            "\ndepth {d1} vs depth 0, on the MEDIANS:\n  open()           {:+.0} us  ({:+.1}%)\n  \
              time-to-first    {:+.0} us  ({:+.1}%)\n  total            {:+.0} us  ({:+.1}%)",
-            o1 - o0,
-            100.0 * (o1 - o0) / o0,
-            f1 - f0,
-            100.0 * (f1 - f0) / f0,
-            t1 - t0,
-            100.0 * (t1 - t0) / t0
+            o1.med - o0.med,
+            pct(o1.med, o0.med),
+            f1.med - f0.med,
+            pct(f1.med, f0.med),
+            t1.med - t0.med,
+            pct(t1.med, t0.med)
         );
         println!(
-            "\nThe claim this supports: cost MOVES from the consumer's first `next()` into\n\
-             `open()`. It is NOT a throughput win and must not be quoted as one -- total is\n\
-             expected to be a wash. On the FFI path the two sides are different threads,\n\
-             which is where the cluster-level win came from; that part is not measured here."
+            "\nWHAT THIS DOES AND DOES NOT SHOW -- read the spreads above before quoting a delta.\n\
+             \n\
+             Supported: work MOVES into `open()`. `open()` rises; the consumer's first `next()`\n\
+             falls to a VecDeque pop. It is NOT a throughput win -- `total` is a near-wash --\n\
+             and on the FFI path the two sides are different threads, which is where the\n\
+             cluster-level win came from. That part is NOT measured here.\n\
+             \n\
+             NOT supported, and do not write it down:\n\
+             * the depth-2 time-to-first figure is a RESOLUTION FLOOR, not a measurement --\n\
+               popping a VecDeque is below `as_micros()` granularity, so it reads 0 and the\n\
+               percentage is a division artifact;\n\
+             * the two deltas do NOT have to cancel. The prefetch pulls `depth` batches into\n\
+               `open()` and removes only the FIRST from `next()`, so `open()` should rise by\n\
+               roughly depth x one batch while first-next falls by one. Any arithmetic that\n\
+               makes them balance is coincidence at this sample size;\n\
+             * the residue in `total` is per-poll `chain` overhead across every row group,\n\
+               not a once-per-file allocation;\n\
+             * both arms read a page-cache-warm LOCAL file, so what moved here is DECODE.\n\
+               The object-store fetch this feature exists to move is not exercised."
         );
     }
 }
