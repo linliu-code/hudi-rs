@@ -5534,6 +5534,131 @@ mod tests {
         assert_eq!(live.lock().unwrap().files_served, 1);
     }
 
+    /// The three dimensions `served_schema_mismatch` DOCUMENTS and no fixture
+    /// could express: nullability and metadata are ignored, types are exact.
+    ///
+    /// Every served-shape fixture is built with `nullable: true`, no field or
+    /// schema metadata, and no dictionary types — so all three of the
+    /// comparator's stated contract claims were pinned by nothing. Review round
+    /// 10 built two mutations out of that and both survived the WHOLE workspace
+    /// suite:
+    ///
+    /// - adding `if got.is_nullable() != want.is_nullable() { … }`, which
+    ///   contradicts the doc and declines a provider that widens a non-null
+    ///   column — costing a full re-read of every such file for nothing;
+    /// - comparing a dictionary's VALUE type instead of the type exactly, which
+    ///   accepts `Dictionary(Int32, Utf8)` where `Utf8` was asked for. That one is
+    ///   in the wrong-results class: the doc calls it "a different physical
+    ///   layout", and it is the buffers `project_batch_to_schema` then
+    ///   reinterprets.
+    ///
+    /// This is row 25's lesson at one more remove, and round 9's again: the defect
+    /// is in what the fixture does not VARY, which is invisible in the assertion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_shape_check_ignores_nullability_and_metadata_but_not_dictionary_encoding() {
+        use arrow_array::{Int32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        // On disk: `id` is NOT NULL and `tag` is plain Utf8, so the footer — and
+        // therefore `intersection`, which the provider is handed — says so.
+        let on_disk_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("tag", DataType::Utf8, true),
+        ]));
+        let on_disk = RecordBatch::try_new(
+            on_disk_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        // ACCEPTED: `id` widened to nullable, and `tag` carrying field metadata
+        // the read never asked for. Both are explicitly ignored, so the provider's
+        // rows must reach the caller.
+        let mut with_meta = Field::new("tag", DataType::Utf8, true);
+        with_meta.set_metadata(
+            [("provider".to_string(), "irrelevant".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let widened = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                with_meta,
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7, 8])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .unwrap();
+
+        // DECLINED: `tag` dictionary-encoded where plain `Utf8` was asked for.
+        let dict: arrow_array::DictionaryArray<arrow_array::types::Int32Type> =
+            vec!["x", "y"].into_iter().collect();
+        let dictionary_encoded = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new(
+                    "tag",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    true,
+                ),
+            ])),
+            vec![Arc::new(Int32Array::from(vec![7, 8])), Arc::new(dict)],
+        )
+        .unwrap();
+
+        for (case, served, expect_served) in [
+            ("widened nullability + extra metadata", widened, true),
+            (
+                "dictionary-encoded where plain was asked for",
+                dictionary_encoded,
+                false,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let base_name = "f1-0_0-1-1_001.parquet";
+            write_parquet_file(tmp.path(), base_name, &on_disk);
+
+            let provider = StubDataProvider::serving(vec![served]);
+            let mut reader = reader_with_provider(
+                tmp.path(),
+                base_name,
+                on_disk_schema.clone(),
+                provider.clone(),
+            )
+            .await;
+            let live = reader.base_file_provider_live_stats();
+
+            let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+            let ids = i32_col(&out, 0);
+            let s = live.lock().unwrap();
+
+            if expect_served {
+                assert_eq!(
+                    ids,
+                    vec![Some(7), Some(8)],
+                    "{case}: must be SERVED — the comparator documents both as \
+                     ignored, and declining costs a full re-read of every such \
+                     file for nothing"
+                );
+                assert_eq!((s.files_served, s.storage_fallbacks), (1, 0), "{case}");
+            } else {
+                assert_eq!(
+                    ids,
+                    vec![Some(1), Some(2)],
+                    "{case}: must be DECLINED — a dictionary is a different \
+                     PHYSICAL layout from the one the read asked for, and it is \
+                     the buffers that get reinterpreted"
+                );
+                assert_eq!((s.files_served, s.storage_fallbacks), (0, 1), "{case}");
+            }
+        }
+    }
+
     /// The control for the test above: the SAME fixture, with the schema the
     /// provider was actually asked for, is served.
     ///
