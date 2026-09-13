@@ -297,6 +297,68 @@ impl BaseSource {
     }
 }
 
+/// [ENG-48159] Fetch up to `batches` items from `stream` **now**, then return a
+/// stream that serves those before pulling any more.
+///
+/// Called from `base_file_source()`, which is awaited inside
+/// [`HoodieFileGroupReader::open`] — and `open()` is what the FFI drives with
+/// `OBJECT_STORE_RUNTIME.block_on` on the thread Velox prepared the split on. So
+/// the prefix is paid for there rather than on the driver. See
+/// [`BASE_READ_INITIAL_PREFETCH_BATCHES`] for the measurement that motivates it.
+///
+/// **Awaited, never `block_on`-driven.** The caller is already inside
+/// `OBJECT_STORE_RUNTIME.block_on(reader.open())`; a `block_on` here would be a
+/// runtime re-entry panic, which across the cxx FFI boundary is UB. That is also
+/// why this is a free `async fn` over the stream rather than N calls to some
+/// synchronous adapter's `next()`.
+///
+/// **A short prefetch is never end-of-stream.** The buffer holds `Result`s, not
+/// batches, so a read error keeps its own position in the sequence and is
+/// delivered there. Two consequences, both load-bearing:
+/// - an error stops the prefetch but does **not** mark the stream done, so
+///   semantics past an error are unchanged from the unprefetched stream;
+/// - the only `None` the consumer can observe is `stream`'s own exhaustion.
+///
+/// A prefetch that gave up early and reported success would be a silent short
+/// read — every caller would see a valid, shorter table — which is the failure
+/// mode this shape makes unrepresentable rather than merely unlikely.
+///
+/// When the prefetch loop consumes the stream to its end it drops it rather than
+/// chaining it, so an exhausted stream is never polled again. Correctness does
+/// not rest on that (the sources here are terminal and idempotent), but it makes
+/// the contract local instead of inherited, and it is what
+/// `initial_prefetch_does_not_repoll_a_completed_stream` pins.
+///
+/// `batches == 0` yields a stream that serves `stream` and polls it not at all
+/// before the consumer asks, which is the intended way to disable this. (It is an
+/// empty buffer chained onto `stream`, not `stream` itself — observationally the
+/// same, and `initial_prefetch_depth_zero_matches_non_prefetched_stream` pins both
+/// halves.)
+async fn prefetch_initial_batches(mut stream: BaseBatchStream, batches: usize) -> BaseBatchStream {
+    use futures::StreamExt;
+    let mut prefetched: std::collections::VecDeque<Result<RecordBatch>> =
+        std::collections::VecDeque::with_capacity(batches);
+    let mut stream_done = false;
+    for _ in 0..batches {
+        match stream.next().await {
+            Some(Ok(batch)) => prefetched.push_back(Ok(batch)),
+            Some(Err(e)) => {
+                prefetched.push_back(Err(e));
+                break;
+            }
+            None => {
+                stream_done = true;
+                break;
+            }
+        }
+    }
+    if stream_done {
+        futures::stream::iter(prefetched).boxed()
+    } else {
+        futures::stream::iter(prefetched).chain(stream).boxed()
+    }
+}
+
 /// Adapt a provider's served base file into the stream the merge consumes.
 ///
 /// **One blocking task owns the reader for its whole life.** That is what keeps
@@ -362,65 +424,6 @@ impl BaseSource {
 /// 512-thread default, and the thread is parked on `blocking_send` for most of
 /// its life. A caller opening thousands of file groups at once against a serving
 /// provider would need to raise `max_blocking_threads`.
-/// [ENG-48159] Fetch up to `batches` items from `stream` **now**, then return a
-/// stream that serves those before pulling any more.
-///
-/// Called from `base_file_source()`, which is awaited inside
-/// [`HoodieFileGroupReader::open`] — and `open()` is what the FFI drives with
-/// `OBJECT_STORE_RUNTIME.block_on` on the thread Velox prepared the split on. So
-/// the prefix is paid for there rather than on the driver. See
-/// [`BASE_READ_INITIAL_PREFETCH_BATCHES`] for the measurement that motivates it.
-///
-/// **Awaited, never `block_on`-driven.** The caller is already inside
-/// `OBJECT_STORE_RUNTIME.block_on(reader.open())`; a `block_on` here would be a
-/// runtime re-entry panic, which across the cxx FFI boundary is UB. That is also
-/// why this is a free `async fn` over the stream rather than N calls to some
-/// synchronous adapter's `next()`.
-///
-/// **A short prefetch is never end-of-stream.** The buffer holds `Result`s, not
-/// batches, so a read error keeps its own position in the sequence and is
-/// delivered there. Two consequences, both load-bearing:
-/// - an error stops the prefetch but does **not** mark the stream done, so
-///   semantics past an error are unchanged from the unprefetched stream;
-/// - the only `None` the consumer can observe is `stream`'s own exhaustion.
-///
-/// A prefetch that gave up early and reported success would be a silent short
-/// read — every caller would see a valid, shorter table — which is the failure
-/// mode this shape makes unrepresentable rather than merely unlikely.
-///
-/// When the prefetch loop consumes the stream to its end it drops it rather than
-/// chaining it, so an exhausted stream is never polled again. Correctness does
-/// not rest on that (the sources here are terminal and idempotent), but it makes
-/// the contract local instead of inherited, and it is what
-/// `initial_prefetch_does_not_repoll_a_completed_stream` pins.
-///
-/// `batches == 0` yields `stream` unchanged and polls it not at all, which is the
-/// intended way to disable this.
-async fn prefetch_initial_batches(mut stream: BaseBatchStream, batches: usize) -> BaseBatchStream {
-    use futures::StreamExt;
-    let mut prefetched: std::collections::VecDeque<Result<RecordBatch>> =
-        std::collections::VecDeque::with_capacity(batches);
-    let mut stream_done = false;
-    for _ in 0..batches {
-        match stream.next().await {
-            Some(Ok(batch)) => prefetched.push_back(Ok(batch)),
-            Some(Err(e)) => {
-                prefetched.push_back(Err(e));
-                break;
-            }
-            None => {
-                stream_done = true;
-                break;
-            }
-        }
-    }
-    if stream_done {
-        futures::stream::iter(prefetched).boxed()
-    } else {
-        futures::stream::iter(prefetched).chain(stream).boxed()
-    }
-}
-
 fn served_batch_stream(
     reader: Box<dyn arrow_array::RecordBatchReader + Send>,
     evolve_to: SchemaRef,
@@ -877,8 +880,13 @@ impl HoodieFileGroupReader {
     /// Single-use, like [`Self::open_stream`]: takes the output converter and,
     /// for MOR, moves the record buffer into the returned stream.
     pub async fn open(&mut self) -> Result<FileGroupMergeStream> {
-        // Stage timing (perf harness): opening the base file. Only the open --
-        // the per-row-group decode is paid lazily, inside the merge.
+        // Stage timing (perf harness): opening the base file, PLUS the decode of
+        // the first BASE_READ_INITIAL_PREFETCH_BATCHES batches on the
+        // object-store leg -- ENG-48159 moved that prefix into this span
+        // deliberately. The rest of the per-row-group decode is still paid
+        // lazily, inside the merge. Worth stating because a before/after
+        // comparison across that change reads as the footer open regressing
+        // when the work has only MOVED; see `read_stats.rs`.
         let base = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
         self.init_record_iterators(base).await
     }
@@ -911,9 +919,12 @@ impl HoodieFileGroupReader {
     /// the same row sequence; this one just concatenates the chunks.
     /// Single-use, like [`Self::open_stream`].
     pub async fn read(&mut self) -> Result<RecordBatch> {
-        // Stage timing (perf harness): only the open, same as `open_stream` —
-        // the decode happens lazily while `collect_into_one_batch` drives the
-        // stream, so it lands in the merge loop rather than in `base_read_us`.
+        // Stage timing (perf harness): the open, same as `open_stream` — which
+        // since ENG-48159 also carries the decode of the first
+        // BASE_READ_INITIAL_PREFETCH_BATCHES batches (see `open`). The REST of
+        // the decode still happens lazily while `collect_into_one_batch` drives
+        // the stream, so it lands in the merge loop rather than in
+        // `base_read_us`.
         let base = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
         let batch = self
             .init_record_iterators(base)
@@ -1220,6 +1231,18 @@ impl HoodieFileGroupReader {
     /// that needs it as a single batch collapses it afterwards (`read()` does,
     /// via `collect_into_one_batch`) — that is a choice about chunking, not
     /// about what is safe to call from where.
+    ///
+    /// ⚠️ **Not quite fully lazy, since ENG-48159.** On the object-store leg this
+    /// function awaits the first [`BASE_READ_INITIAL_PREFETCH_BATCHES`] batches
+    /// before it returns — see that constant for why. Residency is unaffected (two
+    /// batches, not the file), but the timing is not: on the FFI path the prefix is
+    /// paid on the thread Velox prepared the split on, which is the point. On every
+    /// OTHER path — Rust `read()`/`open_stream()`, datafusion, python — there is no
+    /// preload thread, so it is pure reordering, and an **abandoned** read (a
+    /// `LIMIT`, an early `?`, or a MOR read whose log scan then fails in
+    /// `init_record_iterators`) now pays for up to two batches it discards where it
+    /// previously paid for none. Bounded and small, but it is a real behaviour
+    /// change on the majority path and this is the function every caller reads.
     ///
     /// Returns an empty stream when the input split has no base file (log-only
     /// file group), and when the instant range excludes this base file: the
@@ -7355,18 +7378,75 @@ mod tests {
         assert_eq!(drain_sizes(out).await.len(), 10);
     }
 
+    /// **The prefetch is actually WIRED INTO `base_file_source()`.**
+    ///
+    /// Every other test in this family calls `prefetch_initial_batches` directly,
+    /// which means deleting the single call site — i.e. deleting the feature from
+    /// the shipped read — leaves all of them green. That is the charter's trap 3
+    /// and `I-30` exactly: a surviving mutation hiding in the one dimension the
+    /// fixture holds constant. Found by this milestone's own Stage-3 code review
+    /// (`I-2`), which is where it belongs and not where it was.
+    ///
+    /// `rows_out` is incremented per batch inside the parquet stream's map
+    /// (`base_file/parquet.rs`), so it counts batches that were actually pulled.
+    /// The fixture is three row groups of one row, so at depth 2 exactly two rows
+    /// have been paid for before the consumer asks for anything — and **0** if the
+    /// call site is removed, because the object-store stream is lazy without it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn base_file_source_pays_for_the_prefix_before_it_returns() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (tmp, base_name, schema) = three_row_groups();
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), &base_name, schema).await;
+        let volume = reader.storage.read_volume();
+        assert_eq!(volume.rows_out.load(Relaxed), 0, "nothing read before open");
+
+        let source = reader.base_file_source().await.unwrap();
+
+        assert_eq!(
+            volume.rows_out.load(Relaxed),
+            BASE_READ_INITIAL_PREFETCH_BATCHES as u64,
+            "base_file_source must pay for BASE_READ_INITIAL_PREFETCH_BATCHES batches \
+             BEFORE handing the stream back — 0 here means the prefetch is not wired in"
+        );
+
+        // ...and the rest is still lazy and still complete: the prefix is served
+        // first and the remaining row group follows, three rows in file order.
+        let out = drain_base_source(source).await;
+        assert_eq!(out.num_rows(), 3, "the whole file still arrives");
+        assert_eq!(
+            id_values(&out),
+            vec![7, 8, 9],
+            "and in file order — the prefetched prefix is not reordered"
+        );
+        assert_eq!(
+            volume.rows_out.load(Relaxed),
+            3,
+            "exactly the file's rows were read, so the prefetch did not double-read"
+        );
+    }
+
     /// The constant this tree actually uses is a real, small depth. Pinned because
     /// `0` silently disables the feature and nothing else would fail.
+    ///
+    /// `const` blocks, so this is a COMPILE error rather than a test failure — the
+    /// value is known at compile time and `clippy::assertions_on_constants` (which
+    /// CI runs with `--all-targets -D warnings`) rejects a runtime `assert!` on it.
+    /// Compile-time is the better gate anyway.
     #[test]
     fn base_read_initial_prefetch_batches_is_enabled_and_bounded() {
-        assert!(
-            BASE_READ_INITIAL_PREFETCH_BATCHES > 0,
-            "0 disables ENG-48159's prefetch entirely"
-        );
-        assert!(
-            BASE_READ_INITIAL_PREFETCH_BATCHES <= 4,
-            "the prefetch must stay bounded and small, or it becomes the eager path"
-        );
+        const {
+            assert!(
+                BASE_READ_INITIAL_PREFETCH_BATCHES > 0,
+                "0 disables ENG-48159's prefetch entirely"
+            );
+        }
+        const {
+            assert!(
+                BASE_READ_INITIAL_PREFETCH_BATCHES <= 4,
+                "the prefetch must stay bounded and small, or it becomes the eager path"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
