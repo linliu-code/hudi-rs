@@ -7384,8 +7384,7 @@ mod tests {
     /// which means deleting the single call site — i.e. deleting the feature from
     /// the shipped read — leaves all of them green. That is the charter's trap 3
     /// and `I-30` exactly: a surviving mutation hiding in the one dimension the
-    /// fixture holds constant. Found by this milestone's own Stage-3 code review
-    /// (`I-2`), which is where it belongs and not where it was.
+    /// fixture holds constant. This test is the one that observes the call site.
     ///
     /// `rows_out` is incremented per batch inside the parquet stream's map
     /// (`base_file/parquet.rs`), so it counts batches that were actually pulled.
@@ -7564,14 +7563,12 @@ mod tests {
 
         let depths = [0usize, BASE_READ_INITIAL_PREFETCH_BATCHES];
 
-        // ⚠️ WARM-UP, then INTERLEAVE. Run 1 of this bench ran the arms blocked —
-        // seven reps at depth 0, then seven at depth 2 — and reported `total`
-        // -56.7% and `open()` 2.8% FASTER with the prefetch. The second is
-        // impossible (it does strictly more work), which is what exposed the
-        // first: the second arm was reading a page cache the first had just
-        // warmed. The raw artifact of that run is kept alongside this one.
-        // Two warm-up passes per arm, then alternate, so neither arm owns the
-        // cold cache.
+        // ⚠️ WARM-UP, then INTERLEAVE. Both are load-bearing. Blocked arms — all
+        // reps of one depth, then all of the other — let the second arm read a
+        // page cache the first just warmed, which is enough to invert the sign of
+        // every figure this bench prints, including making `open()` look FASTER
+        // with a prefetch that does strictly more work. Two warm-up passes per
+        // arm, then alternate, so neither arm owns the cold cache.
         for d in depths {
             for _ in 0..2 {
                 one_pass(&reader, base_name, schema.clone(), d).await;
