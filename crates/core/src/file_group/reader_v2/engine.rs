@@ -128,8 +128,14 @@ pub struct HoodieFileGroupReader {
     /// after the stream is exhausted. Wrapped in `Arc<Mutex<…>>` because the FFI
     /// path requires the iterator to be `Send` (it is boxed into an
     /// `FFI_ArrowArrayStream`); the lock is taken once per emitted chunk, so the
-    /// cost is negligible against the per-chunk merge work. The FFI path never
-    /// reads these stats back — only `read()`-based callers do.
+    /// cost is negligible against the per-chunk merge work.
+    ///
+    /// Both call shapes read these back, by different routes. `read()`-based
+    /// callers get them drained into [`Self::read_stats`]. The FFI path cannot
+    /// use that route — it drops this reader as soon as `open()` returns the
+    /// stream — so it clones the handle via [`Self::stream_stats_handle`]
+    /// before that drop and reads the shared sink after the stream drains
+    /// (`cpp/src/lib.rs` `stream_stat`).
     stream_stats: StreamStatsHandle,
 
     /// Valid block instants from log scanning.
@@ -2000,8 +2006,10 @@ impl HoodieFileGroupReader {
     /// Worth stating because the gap is silent and reads as data: a streaming
     /// read of a fixture with five deletes reports `num_deletes: 0` while
     /// returning exactly the same rows as the eager read that reports five. No
-    /// production caller reads these - only the test harness and the benchmark
-    /// do - but that is precisely where a zero would be believed.
+    /// production caller reads these *through this accessor* - only the test
+    /// harness and the benchmark do - but that is precisely where a zero would
+    /// be believed. Production streaming callers read the same counters off the
+    /// shared sink instead, via [`Self::stream_stats_handle`].
     pub fn read_stats(&self) -> &HoodieReadStats {
         &self.read_stats
     }
