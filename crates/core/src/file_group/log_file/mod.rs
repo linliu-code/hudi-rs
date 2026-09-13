@@ -48,8 +48,8 @@ pub mod scanner;
 /// `HoodieLogFile.getLogFileComparator`. Completion time is NOT used for ordering — only
 /// for slice association and committed-file filtering.
 ///
-/// The gold's 4th key, `suffix` — Java's `getSuffix()`, the optional `.cdc` marker — follows,
-/// so the ordering matches `getLogFileComparator` on all four of its keys.
+/// That 4th key, `suffix`, is Java's `getSuffix()` — the optional `.cdc` marker — so the ordering
+/// matches `getLogFileComparator` on all four of its keys.
 ///
 /// Two further keys, `extension` then `file_id`, follow those. They are **not** gold keys
 /// (Java compares neither). They exist so that **no two files with distinct `file_name()`
@@ -62,6 +62,12 @@ pub mod scanner;
 /// different field-sets can render one name and compare `Equal` while `cmp` says otherwise
 /// (`{file_id: "a", timestamp: "b_c"}` and `{file_id: "a_b", timestamp: "c"}`). Unreachable
 /// through `parse_file_name`, which splits on the first `_`, but the fields are `pub`.
+/// ⚠️ **Adding a field here is a breaking change for downstream struct-literal
+/// construction.** Every field is `pub` and the type is deliberately NOT
+/// `#[non_exhaustive]` — making it so now would forbid literal construction
+/// outright, which is a larger break than the one it prevents. `suffix` was added
+/// this way (m22); if you add another, say so in the commit message, because
+/// nothing in the type system will.
 #[derive(Clone, Debug)]
 pub struct LogFile {
     pub file_id: String,
@@ -806,6 +812,22 @@ mod tests {
         // A name that is ONLY the marker where the write token should be leaves an
         // empty token, which the existing emptiness check must still reject.
         assert!(LogFile::from_str(".file1_2.log.1_.cdc").is_err());
+
+        // ⚠️ A DOUBLE marker is accepted here and rejected by Java, whose group 10 is a
+        // single `(\.cdc)?`. Only one `.cdc` comes off, so the rest stays on the token.
+        // This is a consequence of hudi-rs never validating the write token against
+        // `\d+-\d+-\d+` — which predates the suffix and is unchanged by it — rather
+        // than of the stripping. Pinned so the gap is a recorded decision and not a
+        // surprise: tightening it means validating the token's shape, which would also
+        // reject names this reader accepts today.
+        let double = LogFile::from_str(".file1_2.log.1_1-1-1.cdc.cdc").unwrap();
+        assert_eq!(double.write_token, "1-1-1.cdc");
+        assert_eq!(double.suffix, ".cdc");
+        assert_eq!(
+            double.file_name(),
+            ".file1_2.log.1_1-1-1.cdc.cdc",
+            "still round-trips"
+        );
     }
 
     /// **Gold parity.** Java's own `TestFSUtils.testLogFilesComparisonWithCDCFile`,
@@ -862,7 +884,7 @@ mod tests {
         let plain = LogFile::from_str(".file-0_20250113230302428.log.1_0-188-387").unwrap();
         let cdc = LogFile::from_str(".file-0_20250113230302428.log.1_0-188-387.cdc").unwrap();
 
-        // They tie on every key the gold's first three, and on both of hudi-rs's own.
+        // They tie on all three of the gold's first keys, and on both of hudi-rs's own.
         assert_eq!(plain.timestamp, cdc.timestamp);
         assert_eq!(plain.version, cdc.version);
         assert_eq!(plain.write_token, cdc.write_token);
@@ -933,9 +955,10 @@ mod tests {
         );
 
         // ...and the write token still outranks the suffix, as in Java, which
-        // compares the token before it ever looks at the suffix. They must conflict:
-        // token-first says Less ("0-188-387" < "0-188-999"); suffix-first says
-        // Greater ("" > ... no) -- so give the LATER token the EARLIER suffix.
+        // compares the token before it ever looks at the suffix. The two keys must
+        // CONFLICT or the assertion is vacuous, so the pair below gives the EARLIER
+        // token the LATER suffix: token-first says Less ("0-188-387" < "0-188-999"),
+        // suffix-first says Greater (".cdc" > "").
         let later_token_earlier_suffix = LogFile {
             write_token: "0-188-999".to_string(),
             suffix: String::new(),
