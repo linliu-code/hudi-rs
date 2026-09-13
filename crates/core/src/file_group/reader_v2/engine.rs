@@ -7521,39 +7521,77 @@ mod tests {
         let reader =
             test_file_group_reader_for_base_file(tmp.path(), base_name, schema.clone()).await;
 
-        let mut rows = Vec::new();
-        for depth in [0usize, BASE_READ_INITIAL_PREFETCH_BATCHES] {
-            let (mut open_us, mut first_us, mut total_us) = (Vec::new(), Vec::new(), Vec::new());
-            for _ in 0..REPS {
-                let t0 = Instant::now();
-                let s = raw_stream(&reader, base_name, schema.clone()).await;
-                let mut s = prefetch_initial_batches(s, depth).await;
-                let open = t0.elapsed();
+        /// One timed pass at `depth`: (open us, time-to-first us, total us).
+        async fn one_pass(
+            reader: &HoodieFileGroupReader,
+            base_name: &str,
+            schema: SchemaRef,
+            depth: usize,
+        ) -> (f64, f64, f64) {
+            let t0 = Instant::now();
+            let s = raw_stream(reader, base_name, schema).await;
+            let mut s = prefetch_initial_batches(s, depth).await;
+            let open = t0.elapsed();
 
-                let t1 = Instant::now();
-                let first = futures::StreamExt::next(&mut s).await;
-                let ttfb = t1.elapsed();
-                assert!(first.is_some() && first.unwrap().is_ok());
+            let t1 = Instant::now();
+            let first = futures::StreamExt::next(&mut s).await;
+            let ttfb = t1.elapsed();
+            assert!(first.is_some() && first.unwrap().is_ok());
 
-                let t2 = Instant::now();
-                let mut n = 1usize;
-                while let Some(item) = futures::StreamExt::next(&mut s).await {
-                    item.unwrap();
-                    n += 1;
-                }
-                let rest = t2.elapsed();
-                assert!(n > 1, "the fixture must have several batches, got {n}");
-
-                open_us.push(open.as_micros() as f64);
-                first_us.push(ttfb.as_micros() as f64);
-                total_us.push((open + ttfb + rest).as_micros() as f64);
+            let t2 = Instant::now();
+            let mut n = 1usize;
+            while let Some(item) = futures::StreamExt::next(&mut s).await {
+                item.unwrap();
+                n += 1;
             }
-            let med = |mut v: Vec<f64>| {
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                v[v.len() / 2]
-            };
-            rows.push((depth, med(open_us), med(first_us), med(total_us)));
+            let rest = t2.elapsed();
+            assert!(n > 1, "the fixture must have several batches, got {n}");
+            (
+                open.as_micros() as f64,
+                ttfb.as_micros() as f64,
+                (open + ttfb + rest).as_micros() as f64,
+            )
         }
+
+        let depths = [0usize, BASE_READ_INITIAL_PREFETCH_BATCHES];
+
+        // ⚠️ WARM-UP, then INTERLEAVE. Run 1 of this bench ran the arms blocked —
+        // seven reps at depth 0, then seven at depth 2 — and reported `total`
+        // -56.7% and `open()` 2.8% FASTER with the prefetch. The second is
+        // impossible (it does strictly more work), which is what exposed the
+        // first: the second arm was reading a page cache the first had just
+        // warmed. The raw artifact of that run is kept alongside this one.
+        // Two warm-up passes per arm, then alternate, so neither arm owns the
+        // cold cache.
+        for d in depths {
+            for _ in 0..2 {
+                one_pass(&reader, base_name, schema.clone(), d).await;
+            }
+        }
+
+        let mut samples: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> =
+            depths.iter().map(|_| (vec![], vec![], vec![])).collect();
+        for rep in 0..REPS {
+            // Alternate which arm goes first each rep, so any residual ordering
+            // effect cancels instead of accumulating into one arm.
+            let order: Vec<usize> = if rep % 2 == 0 { vec![0, 1] } else { vec![1, 0] };
+            for i in order {
+                let (o, f, t) = one_pass(&reader, base_name, schema.clone(), depths[i]).await;
+                samples[i].0.push(o);
+                samples[i].1.push(f);
+                samples[i].2.push(t);
+            }
+        }
+
+        let med = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let rows: Vec<(usize, f64, f64, f64)> = depths
+            .iter()
+            .zip(samples)
+            .map(|(d, (o, f, t))| (*d, med(o), med(f), med(t)))
+            .collect();
 
         println!("\n=== ENG-48159 re-measurement on this tree's BoxStream shape ===");
         println!(
