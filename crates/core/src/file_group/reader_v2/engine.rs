@@ -611,7 +611,7 @@ impl HoodieFileGroupReader {
             reader_context.record_key_field(),
         );
         for (i, lf) in input_split.log_file_paths.iter().enumerate() {
-            log::debug!("  log_file[{i}]: {lf}");
+            log::trace!("  log_file[{i}]: {lf}");
         }
 
         // Mirrors Java lines 119-121:
@@ -864,7 +864,7 @@ impl HoodieFileGroupReader {
     ///        → FileGroupMergeStream::new_buffered(...)
     /// ```
     async fn init_record_iterators(&mut self, base: BaseSource) -> Result<FileGroupMergeStream> {
-        log::debug!(
+        log::trace!(
             "[HoodieFileGroupReader] initRecordIterators: partition={} base_file={} log_files={}",
             self.input_split.partition_path,
             self.input_split
@@ -878,7 +878,7 @@ impl HoodieFileGroupReader {
             schema: base_source_schema,
             batches: base_source,
         } = base;
-        log::debug!(
+        log::trace!(
             "[HoodieFileGroupReader] base file source: schema_cols={}",
             base_source_schema.fields().len(),
         );
@@ -891,7 +891,7 @@ impl HoodieFileGroupReader {
         // Step 2: If no records to merge (no log files), build an Eager
         // iterator that yields the base file batches directly.
         if self.input_split.is_base_only() {
-            log::debug!("[HoodieFileGroupReader] no log files → Eager iterator");
+            log::trace!("[HoodieFileGroupReader] no log files → Eager iterator");
 
             // The schema travels with the source, so it is known without
             // forcing a row-group decode. A log-only file group's source is
@@ -917,7 +917,7 @@ impl HoodieFileGroupReader {
 
         // Step 3: MOR path — load record buffer (scan log files + create buffer).
         // Mirrors Java: this.recordBuffer = recordBufferLoader.getRecordBuffer(...).getLeft();
-        log::debug!(
+        log::trace!(
             "[HoodieFileGroupReader] scanning {} log file(s) with latest_commit_time={}",
             self.input_split.log_file_paths.len(),
             self.reader_context.latest_commit_time,
@@ -995,7 +995,7 @@ impl HoodieFileGroupReader {
         // the iterator's rather than the buffer's because only its holder can
         // say when the base is exhausted, and because the base file is the one
         // part of the merge that has to be read rather than computed.
-        log::debug!("[HoodieFileGroupReader] returning Buffered iterator");
+        log::trace!("[HoodieFileGroupReader] returning Buffered iterator");
 
         // Step 6: Hand the buffer to a Buffered streaming iterator. The
         // iterator owns the buffer and drives `has_next/next` per chunk; it
@@ -1148,7 +1148,7 @@ impl HoodieFileGroupReader {
         };
 
         if self.buffered_record_converter.is_none() {
-            log::debug!(
+            log::trace!(
                 "[HoodieFileGroupReader] base_file_source: no bufferedRecordConverter set \
                  (batch-level read does not require per-record conversion)"
             );

@@ -166,7 +166,7 @@ pub fn forward_scan_pass1(
     let mut total_corrupt_blocks: u64 = 0;
     let mut total_rollbacks: u64 = 0;
 
-    log::debug!(
+    log::trace!(
         "[Pass1] forward_scan: {} total blocks, latest_instant_time={}, has_instant_range={}",
         all_blocks.len(),
         latest_instant_time,
@@ -289,7 +289,7 @@ pub fn forward_scan_pass1(
             continue;
         }
 
-        log::debug!(
+        log::trace!(
             "[Pass1] block #{total_log_blocks} passed all gates: type={:?} instant={instant_time}",
             block.block_type,
         );
@@ -406,7 +406,7 @@ pub fn forward_scan_pass1(
          rollbacks={total_rollbacks}",
     );
     for (instant, blocks) in &instant_to_blocks_map {
-        log::debug!(
+        log::trace!(
             "[Pass1]   instant={instant}: {} block(s) [{:?}]",
             blocks.len(),
             blocks
@@ -478,7 +478,7 @@ pub struct Pass2Result {
 /// removed from Pass 1, so it is made loud here rather than left to a
 /// `debug_assert!` that vanishes in the release build the JNI library ships.
 pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Result<Pass2Result> {
-    log::debug!(
+    log::trace!(
         "[Pass2] reverse_scan: {} instants to process (newest→oldest)",
         pass1.ordered_instants_list.len(),
     );
@@ -757,7 +757,7 @@ impl BaseHoodieLogRecordReader {
 
         self.valid_block_instants = pass2.valid_block_instants;
 
-        log::debug!(
+        log::trace!(
             "Pass 1+2 complete: {} blocks queued, {} valid instants",
             pass2.current_instant_log_blocks.len(),
             self.valid_block_instants.len()
@@ -766,7 +766,7 @@ impl BaseHoodieLogRecordReader {
         // Pass 3: Process queued blocks (oldest → newest via pop_back).
         // Mirrors Java: if (!currentInstantLogBlocks.isEmpty() && !skipProcessingBlocks) { ... }
         if !pass2.current_instant_log_blocks.is_empty() && !skip_processing_blocks {
-            log::debug!("Merging the final data blocks");
+            log::trace!("Merging the final data blocks");
             // Oldest first, matching the pop_back the deque was built for. Taking
             // the order up front is what lets the content be fetched a window at a
             // time: the fetch happens in async code and the merge under it is
@@ -1110,7 +1110,7 @@ impl BaseHoodieLogRecordReader {
             let block = &mut ordered[idx];
             *block_num += 1;
             let instant_time = block.instant_time().unwrap_or("unknown").to_string();
-            log::debug!(
+            log::trace!(
                 "[Pass3] block #{block_num}: type={:?} instant={instant_time}",
                 block.block_type,
             );
@@ -1157,7 +1157,7 @@ impl BaseHoodieLogRecordReader {
                         self.merge_upsert_us,
                         self.record_buffer.process_data_block(block)
                     )?;
-                    log::debug!(
+                    log::trace!(
                         "[Pass3] after processing data block #{block_num}: buffer size={}",
                         self.record_buffer.size(),
                     );
