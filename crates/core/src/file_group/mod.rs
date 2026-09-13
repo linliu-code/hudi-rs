@@ -534,6 +534,7 @@ mod tests {
             extension: "log".to_string(),
             version,
             write_token: "0-51-115".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         }
     }

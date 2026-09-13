@@ -99,11 +99,14 @@ impl InputSplit {
     /// matching the gold's own `(log|archive)` pattern.
     ///
     /// Note what does NOT make `extension` constant — `.cdc` filtering. A `.cdc` name
-    /// parses with `extension == "log"` like any other: `parse_file_name` splits on the
-    /// LAST `_`, so `.fid_ts.log.1_0-1-2.cdc` yields `write_token == "0-1-2.cdc"` and
-    /// the suffix lands in key 3, not key 4. [`Self::filter_cdc_log_files`] mirrors
-    /// `InputSplit.java:57` and is a separate concern. An earlier version of this
-    /// comment gave the filtering as the reason (review round 4).
+    /// parses with `extension == "log"` like any other, and since m22 its marker is
+    /// parsed into `LogFile::suffix`, so `.fid_ts.log.1_0-1-2.cdc` yields
+    /// `write_token == "0-1-2"` and the suffix lands in key 4, where the gold puts it.
+    /// (Before that it rode on the write token and landed in key 3.)
+    /// [`Self::filter_cdc_log_files`] mirrors `InputSplit.java:57` and is a separate
+    /// concern — it runs BEFORE this sort, so a snapshot read never orders a `.cdc`
+    /// name anyway. An earlier version of this comment gave the filtering as the
+    /// reason `extension` is constant (review round 4).
     ///
     /// Mirrors Java's `InputSplit` constructor which sorts via
     /// `HoodieLogFile.getLogFileComparator()`.
