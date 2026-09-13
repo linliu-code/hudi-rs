@@ -62,11 +62,12 @@ pub mod scanner;
 /// different field-sets can render one name and compare `Equal` while `cmp` says otherwise
 /// (`{file_id: "a", timestamp: "b_c"}` and `{file_id: "a_b", timestamp: "c"}`). Unreachable
 /// through `parse_file_name`, which splits on the first `_`, but the fields are `pub`.
+///
 /// ⚠️ **Adding a field here is a breaking change for downstream struct-literal
 /// construction.** Every field is `pub` and the type is deliberately NOT
 /// `#[non_exhaustive]` — making it so now would forbid literal construction
 /// outright, which is a larger break than the one it prevents. `suffix` was added
-/// this way (m22); if you add another, say so in the commit message, because
+/// this way in m22; if you add another, say so in its commit message, because
 /// nothing in the type system will.
 #[derive(Clone, Debug)]
 pub struct LogFile {
