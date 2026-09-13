@@ -7368,4 +7368,142 @@ mod tests {
             "the prefetch must stay bounded and small, or it becomes the eager path"
         );
     }
+
+    // ------------------------------------------------------------------
+    // ENG-48159 — the RE-MEASUREMENT required by m22's AC-2.
+    //
+    //   cargo test -p hudi-core --release --lib eng_48159_prefetch_bench \
+    //       -- --ignored --nocapture
+    //
+    // Release only; a debug build says nothing about production cost.
+    //
+    // ⚠️ READ THIS BEFORE QUOTING ANY NUMBER FROM IT.
+    //
+    // Internal's 1.82x is a TPC-DS 10 TB q88+q76 figure from a Velox cluster,
+    // measured against internal's SYNC-READER shape. It is not reproducible here
+    // and this bench does not try: there is no Velox driver, no preload thread, no
+    // TPC-DS data and no cluster. Quoting 1.82x for this tree would be carrying a
+    // performance claim across a different execution shape, which is what m22's
+    // AC-2 exists to stop.
+    //
+    // What IS measurable here is the MECHANISM the 1.82x is attributed to: the
+    // prefetch moves the cost of the first N batches off whoever consumes the
+    // stream and onto whoever awaits `base_file_source()`. On the FFI path those
+    // are different threads — `open()` is driven by
+    // `OBJECT_STORE_RUNTIME.block_on` on Velox's preload thread, and the stream is
+    // drained by the driver — so cost moved here is cost taken off the driver.
+    // Whether that buys 1.82x on a cluster is a cluster question.
+    //
+    // Both arms read the SAME real parquet file through the SAME object-store
+    // reader; the only difference is the prefetch depth.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "benchmark; run explicitly with --release --ignored --nocapture"]
+    async fn eng_48159_prefetch_bench() {
+        use std::time::Instant;
+
+        const ROWS: i32 = 400_000;
+        const ROWS_PER_GROUP: usize = 4_096;
+        const REPS: usize = 7;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, batch) = initial_prefetch_batch(0, ROWS);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file_in_row_groups(tmp.path(), base_name, &batch, ROWS_PER_GROUP);
+        let bytes = std::fs::metadata(tmp.path().join(base_name)).unwrap().len();
+
+        // Rebuild the object-store leg of `base_file_source()` exactly: the same
+        // reader, the same options, the same per-batch evolution map. Only the
+        // prefetch depth differs between the arms.
+        async fn raw_stream(
+            reader: &HoodieFileGroupReader,
+            base_name: &str,
+            evolve_to: SchemaRef,
+        ) -> BaseBatchStream {
+            let s = reader
+                .base_file_reader()
+                .unwrap()
+                .read_stream(
+                    base_name,
+                    base_read_options(None, None, None, None, false)
+                        .with_projection(evolve_to.fields().iter().map(|f| f.name())),
+                )
+                .await
+                .unwrap();
+            futures::StreamExt::map(s.into_stream(), move |b| match b {
+                Ok(batch) => {
+                    crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)
+                }
+                Err(e) => Err(CoreError::from(e)),
+            })
+            .boxed()
+        }
+
+        let reader =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, schema.clone()).await;
+
+        let mut rows = Vec::new();
+        for depth in [0usize, BASE_READ_INITIAL_PREFETCH_BATCHES] {
+            let (mut open_us, mut first_us, mut total_us) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..REPS {
+                let t0 = Instant::now();
+                let s = raw_stream(&reader, base_name, schema.clone()).await;
+                let mut s = prefetch_initial_batches(s, depth).await;
+                let open = t0.elapsed();
+
+                let t1 = Instant::now();
+                let first = futures::StreamExt::next(&mut s).await;
+                let ttfb = t1.elapsed();
+                assert!(first.is_some() && first.unwrap().is_ok());
+
+                let t2 = Instant::now();
+                let mut n = 1usize;
+                while let Some(item) = futures::StreamExt::next(&mut s).await {
+                    item.unwrap();
+                    n += 1;
+                }
+                let rest = t2.elapsed();
+                assert!(n > 1, "the fixture must have several batches, got {n}");
+
+                open_us.push(open.as_micros() as f64);
+                first_us.push(ttfb.as_micros() as f64);
+                total_us.push((open + ttfb + rest).as_micros() as f64);
+            }
+            let med = |mut v: Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            rows.push((depth, med(open_us), med(first_us), med(total_us)));
+        }
+
+        println!("\n=== ENG-48159 re-measurement on this tree's BoxStream shape ===");
+        println!(
+            "fixture: {ROWS} rows, {ROWS_PER_GROUP} rows/row-group, {bytes} bytes on disk, \
+             median of {REPS} reps, local object store"
+        );
+        println!(
+            "\n{:<8} {:>16} {:>18} {:>14}",
+            "depth", "open() us", "time-to-first us", "total us"
+        );
+        for (d, o, f, t) in &rows {
+            println!("{d:<8} {o:>16.0} {f:>18.0} {t:>14.0}");
+        }
+        let (_, o0, f0, t0) = rows[0];
+        let (d1, o1, f1, t1) = rows[1];
+        println!(
+            "\ndepth {d1} vs depth 0:\n  open()           {:+.0} us  ({:+.1}%)\n  \
+             time-to-first    {:+.0} us  ({:+.1}%)\n  total            {:+.0} us  ({:+.1}%)",
+            o1 - o0,
+            100.0 * (o1 - o0) / o0,
+            f1 - f0,
+            100.0 * (f1 - f0) / f0,
+            t1 - t0,
+            100.0 * (t1 - t0) / t0
+        );
+        println!(
+            "\nThe claim this supports: cost MOVES from the consumer's first `next()` into\n\
+             `open()`. It is NOT a throughput win and must not be quoted as one -- total is\n\
+             expected to be a wash. On the FFI path the two sides are different threads,\n\
+             which is where the cluster-level win came from; that part is not measured here."
+        );
+    }
 }
