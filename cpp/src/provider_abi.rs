@@ -48,6 +48,7 @@
 //! moving it onto a blocking-pool thread that carries no runtime context.
 
 use std::os::raw::{c_int, c_void};
+use std::sync::Arc;
 
 use arrow_array::RecordBatchReader;
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
@@ -273,11 +274,24 @@ pub struct HudiBaseFileDataProviderVTable {
     pub destroy: extern "C" fn(ctx: *mut c_void),
 }
 
-/// Owns the provider `ctx` and forwards trait calls through the vtable.
+/// The owned half: the vtable (by value — it is `Copy`) and the opaque `ctx`,
+/// released via `destroy` exactly once when the LAST holder goes away.
 ///
-/// Holds the vtable by value (it is `Copy`) and the opaque `ctx`. The `ctx` is
-/// released via `destroy` exactly once, on drop.
-pub struct CApiBaseFileDataProvider {
+/// This exists as a separate `Arc`-held type rather than as fields on
+/// [`CApiBaseFileDataProvider`] so that an **in-flight `try_base_file` call owns
+/// the `ctx` it is calling into**. The C call runs on a `spawn_blocking` thread
+/// and cannot be cancelled once started, while the future awaiting it can be
+/// dropped at any time (a `select!`, a timeout, a dropped `Stream`). With the
+/// `ctx` owned directly by the provider, that sequence ran `destroy(ctx)` while
+/// the C callback was still executing on it.
+///
+/// The stream side of the same hazard is handled the same way, one layer up:
+/// `served_batch_stream` moves a provider reference onto the task that owns the
+/// served reader. Together they make the vtable's lifetime contract —
+/// "`destroy` is called exactly once, after the last `try_base_file` has
+/// returned AND after every served `ArrowArrayStream` has been drained or
+/// released" — structural rather than a rule the caller has to obey.
+struct OwnedProviderCtx {
     vtable: HudiBaseFileDataProviderVTable,
     ctx: *mut c_void,
 }
@@ -285,9 +299,25 @@ pub struct CApiBaseFileDataProvider {
 // SAFETY: the ABI concurrency contract (documented on `HudiBaseFileDataProviderVTable`)
 // requires the C implementation to tolerate concurrent `try_base_file` calls on
 // the same `ctx`; the raw pointer is only ever passed back to the vtable, never
-// dereferenced on the Rust side. `destroy` runs once, on drop, after all calls.
-unsafe impl Send for CApiBaseFileDataProvider {}
-unsafe impl Sync for CApiBaseFileDataProvider {}
+// dereferenced on the Rust side. `destroy` runs once, when the last reference
+// drops, which is after every call that borrowed it has returned.
+unsafe impl Send for OwnedProviderCtx {}
+unsafe impl Sync for OwnedProviderCtx {}
+
+impl Drop for OwnedProviderCtx {
+    fn drop(&mut self) {
+        (self.vtable.destroy)(self.ctx);
+    }
+}
+
+/// Owns the provider `ctx` and forwards trait calls through the vtable.
+///
+/// `Send`/`Sync` are inherited from `Arc<OwnedProviderCtx>` rather than asserted
+/// here; the unsafe assertion lives on [`OwnedProviderCtx`], which is what
+/// actually holds the raw pointer.
+pub struct CApiBaseFileDataProvider {
+    inner: Arc<OwnedProviderCtx>,
+}
 
 impl CApiBaseFileDataProvider {
     /// Build an adapter from a raw vtable pointer and an owned `ctx`.
@@ -372,7 +402,9 @@ impl CApiBaseFileDataProvider {
         // `extern "C" fn` fields are valid values. Storage behind `vtable` need
         // not outlive us.
         let vtable = unsafe { *vtable };
-        Some(Self { vtable, ctx })
+        Some(Self {
+            inner: Arc::new(OwnedProviderCtx { vtable, ctx }),
+        })
     }
 
     /// Adapt a served result's Arrow C stream into a **lazy**
@@ -411,12 +443,6 @@ impl CApiBaseFileDataProvider {
                 None
             }
         }
-    }
-}
-
-impl Drop for CApiBaseFileDataProvider {
-    fn drop(&mut self) {
-        (self.vtable.destroy)(self.ctx);
     }
 }
 
@@ -459,8 +485,19 @@ impl BaseFileDataProvider for CApiBaseFileDataProvider {
         let partition_path = req.partition_path.to_string();
         let partition_fields: Vec<String> = req.partition_fields.to_vec();
         let can_push_predicate = req.can_push_predicate;
-        let vtable = self.vtable;
-        let ctx_addr = self.ctx as usize;
+
+        // A STRONG reference, moved into the closure — not a copied vtable and a
+        // `ctx` laundered through `usize`, which is what this used to be.
+        //
+        // `spawn_blocking` work cannot be cancelled once it has started, but the
+        // future awaiting it can be dropped at any moment. When the closure held
+        // no ownership, dropping that future and then the reader released the
+        // last reference, `destroy(ctx)` ran, and the still-running C call — and
+        // the `FFI_ArrowArrayStream::release` the same task goes on to invoke —
+        // touched freed memory. Owning `ctx` for the duration of the call closes
+        // that by construction. It also keeps pointer provenance intact, which
+        // the `as usize` round trip discarded purely to satisfy `Send`.
+        let owned = Arc::clone(&self.inner);
 
         // ── Cross the C boundary on a blocking-pool thread. The C call blocks
         //    on the provider's own runtime; doing that on an OBJECT_STORE_RUNTIME
@@ -485,9 +522,11 @@ impl BaseFileDataProvider for CApiBaseFileDataProvider {
             };
             let mut c_res = HudiBaseFileDataResult::empty();
             // SAFETY: `c_req` borrows only data owned by this closure, alive for
-            // the whole synchronous call; `c_res` is a fresh out-parameter.
-            let code = (vtable.try_base_file)(
-                ctx_addr as *mut c_void,
+            // the whole synchronous call; `c_res` is a fresh out-parameter. The
+            // `ctx` is kept alive for the duration by `owned`, which this closure
+            // holds a strong reference to, so `destroy` cannot run underneath it.
+            let code = (owned.vtable.try_base_file)(
+                owned.ctx,
                 &c_req as *const HudiBaseFileDataRequest,
                 &mut c_res as *mut HudiBaseFileDataResult,
             );
@@ -1607,6 +1646,104 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "free drops the provider once"
+        );
+    }
+
+    // ── The in-flight-call half of the vtable's lifetime contract. ────────────
+    //
+    // The stream half is pinned in `hudi-core`
+    // (`a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`).
+    // This is the other one: a call that has ENTERED C and not yet returned.
+    static CALL_ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static CALL_MAY_RETURN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static CALL_CTX_DESTROYED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Blocks inside C until the test releases it, so the test can observe the
+    /// window where a call is running and the caller has walked away.
+    extern "C" fn blocking_try(
+        _ctx: *mut c_void,
+        _req: *const HudiBaseFileDataRequest,
+        out: *mut HudiBaseFileDataResult,
+    ) -> c_int {
+        CALL_ENTERED.store(true, Ordering::SeqCst);
+        while !CALL_MAY_RETURN.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // SAFETY: `out` is the fresh out-parameter the adapter passed in.
+        unsafe { &mut *out }.stats = HudiBaseFileProviderStats {
+            storage_fallbacks: 1,
+            ..Default::default()
+        };
+        HUDI_PROVIDER_OUTCOME_NOT_SERVED
+    }
+
+    extern "C" fn counting_destroy(_ctx: *mut c_void) {
+        CALL_CTX_DESTROYED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Abandoning a read mid-call must not free the `ctx` the C call is using.
+    ///
+    /// `spawn_blocking` work cannot be cancelled once started, but the future
+    /// awaiting it can be dropped at any time — a `select!`, a timeout, a dropped
+    /// `Stream`. Before the `Arc<OwnedProviderCtx>` was threaded into the closure,
+    /// the closure captured only a `Copy` vtable and a `ctx` laundered through
+    /// `usize`, so dropping the future and then the provider ran `destroy(ctx)`
+    /// while the C callback was still executing on that very pointer.
+    ///
+    /// The assertion that matters is the FIRST one. The second only shows the
+    /// reference is released rather than leaked — without it this test would also
+    /// pass if `destroy` were never called at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_call_keeps_the_ctx_alive_until_the_c_call_returns() {
+        let vtable = HudiBaseFileDataProviderVTable {
+            abi_version: HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+            try_base_file: blocking_try,
+            destroy: counting_destroy,
+        };
+        // SAFETY: the vtable is valid for this call; `counting_destroy` ignores
+        // the `ctx`, so a null one is sound for this fixture.
+        let provider = unsafe { CApiBaseFileDataProvider::from_raw(&vtable, std::ptr::null_mut()) }
+            .expect("a well-formed vtable yields a provider");
+
+        let schema = sample_schema();
+        let fields: Vec<String> = Vec::new();
+
+        // Start the call, then ABANDON it: the timeout drops the future while
+        // `blocking_try` is still parked inside C.
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            provider.try_base_file(sample_request(&schema, &fields)),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the fixture must still be inside C");
+        assert!(
+            CALL_ENTERED.load(Ordering::SeqCst),
+            "the C call must have started, or this test proves nothing"
+        );
+
+        // Drop the last provider reference the CALLER holds. The only remaining
+        // one is the clone owned by the blocking task.
+        drop(provider);
+
+        assert_eq!(
+            CALL_CTX_DESTROYED.load(Ordering::SeqCst),
+            0,
+            "destroy ran while the C call was still executing on that ctx"
+        );
+
+        // Let C return; the blocking task then releases its reference.
+        CALL_MAY_RETURN.store(true, Ordering::SeqCst);
+        for _ in 0..200 {
+            if CALL_CTX_DESTROYED.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            CALL_CTX_DESTROYED.load(Ordering::SeqCst),
+            1,
+            "once the call returns the ctx must be released exactly once"
         );
     }
 }
