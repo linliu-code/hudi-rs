@@ -239,11 +239,18 @@ impl HudiBaseFileDataResult {
 /// [`HoodieFileGroupReader::get_closable_iterator`](crate::HoodieFileGroupReader)
 /// and dies when that function returns, while the stream it produced is handed to
 /// C++ and drained afterwards — two objects with no ordering between their frees.
-/// The guarantee is now structural rather than a rule the caller must remember:
-/// `hudi-core`'s `served_batch_stream` moves a strong reference to the provider
-/// onto the task that owns the served reader, so the provider cannot outlive
-/// its own streams by construction. Pinned by
-/// `a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`.
+/// The guarantee is now structural rather than a rule the caller must remember,
+/// on both halves:
+///
+/// * the STREAM half — `hudi-core`'s `served_batch_stream` moves a strong
+///   reference to the provider onto the task that owns the served reader, so the
+///   provider **outlives** its own streams by construction. Pinned by
+///   `a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`.
+/// * the CALL half — [`CApiBaseFileDataProvider`] holds its vtable and `ctx` in
+///   an `Arc`, and an in-flight `try_base_file` owns a clone, so a read abandoned
+///   mid-call (a `select!`, a timeout, a dropped `Stream`) cannot free the `ctx`
+///   the C function is still executing on. Pinned by
+///   `an_abandoned_call_keeps_the_ctx_alive_until_the_c_call_returns`.
 ///
 /// ⚠️ **`destroy` is consequently NOT guaranteed to run on the C++ thread that
 /// frees the reader handle, and is not ordered against that free.** Whichever of
