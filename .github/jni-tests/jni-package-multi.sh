@@ -59,9 +59,11 @@ place() {
 }
 
 # package <case dir> -- runs the packaging against <case>/out/stage and <case>/extra; output in <case>/make.log
+# (a case that marks itself with a `no-extra-native` file gets an extra dir without native/)
 package() {
   local c=$1
-  mkdir -p "$c/out/stage/native" "$c/out/stage/META-INF" "$c/extra/native"
+  mkdir -p "$c/out/stage/native" "$c/out/stage/META-INF" "$c/extra"
+  [ -e "$c/no-extra-native" ] || mkdir -p "$c/extra/native"
   make -s --no-print-directory -C "$REPO_ROOT" jni-jar-multi JNI_JAR_MULTI_PREREQ= \
     JNI_VERSION=test JNI_OUT="$c/out" JNI_STAGE="$c/out/stage" JNI_EXTRA_NATIVE_DIR="$c/extra" \
     > "$c/make.log" 2>&1
@@ -130,6 +132,13 @@ place "$c/out/stage" x86_64 "$WORK/two.so"
 place "$c/extra" x86_64 "$WORK/two-unstripped.so"
 place "$c/extra" aarch64 "$WORK/two.so"
 refused "$c" "not stripped" "an unstripped x86_64 library in JNI_EXTRA_NATIVE_DIR"
+
+echo "== an extra dir with no native/ directory"
+c="$WORK/no-native"
+place "$c/out/stage" x86_64 "$WORK/two.so"
+place "$c/out/stage" aarch64 "$WORK/two.so"
+touch "$c/no-extra-native"
+refused "$c" "has no native/ directory" "JNI_EXTRA_NATIVE_DIR without native/"
 
 echo "== a library missing a Java_ export"
 c="$WORK/one-export"

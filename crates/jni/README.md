@@ -69,8 +69,8 @@ it resolves from (and whether a classifier is present) changes:
   `.github/actions/install-jni-carrier` installs this asset into the runner's local repository
   when the coordinate does not resolve from CodeArtifact.
 
-  **The asset MUST be the multi-arch, classifier-less jar, uploaded byte-for-byte as it was built
-  and pinned by that jar's own md5.**
+  **The asset MUST be the multi-arch, classifier-less jar, uploaded byte-for-byte as built; the
+  action pins that jar's own md5.**
   The consuming action runs `install:install-file` with **no** `-Dclassifier`, so whatever bytes
   it downloads become `io.onehouse.hudi-rs:hudi-jni-native:<version>`, the coordinate every
   module and all 14 bundles resolve. Publishing a single-arch `-linux-aarch64` jar there would
@@ -83,7 +83,8 @@ it resolves from (and whether a classifier is present) changes:
   never re-jarred — and upload it as-is:
   ```
   gh run download <run-id> -R onehouseinc/hudi-rs-internal -n hudi-jni-native-carrier -D /tmp/carrier
-  (cd /tmp/carrier && md5sum -c hudi-jni-native-<version>.jar.md5)   # the md5 the workflow recorded
+  (cd /tmp/carrier && md5sum -c hudi-jni-native-<version>.jar.md5)   # checks the md5 the workflow recorded
+  cut -d' ' -f1 /tmp/carrier/hudi-jni-native-<version>.jar.md5        # the value to pin
   gh release create hudi-jni-native/<version> \
     /tmp/carrier/hudi-jni-native-<version>.jar \
     --repo onehouseinc/hudi-internal --prerelease --target <a pushed hudi-internal sha>
@@ -91,8 +92,8 @@ it resolves from (and whether a classifier is present) changes:
   Then set that md5 in `install-jni-carrier/action.yml`. If CI is unavailable altogether, build
   the jar locally with `make jni-jar-multi-portable` (below) — the portable build, never
   `jni-lib`'s host build — and merge in the other arch's `.so`; a jar carrying only this
-  machine's arch must not be uploaded. That jar is uploaded as-is too, and its own md5 is the one
-  pinned.
+  machine's arch must not be uploaded. That jar is uploaded as-is too, and the md5 to pin is
+  `md5sum` of that jar.
 
 ## Building the carrier
 
@@ -248,7 +249,8 @@ run plain `make jni-jar-multi` after `jni-lib-portable` expecting to get the por
 the `jni-lib` prerequisite would rebuild on this host *and* `rm -rf` its own stage, silently
 producing a host-glibc carrier.
 
-In all three shapes `JNI_EXTRA_NATIVE_DIR` is required — the target refuses to run without it —
+In all three shapes `JNI_EXTRA_NATIVE_DIR` is required and must contain a `native/` directory — the
+target refuses to run otherwise —
 and both arches end up in one classifier-less jar. For each arch the library comes from
 `JNI_EXTRA_NATIVE_DIR` if it has one (replacing the staged one), else from the stage. Before copying
 or writing anything the target refuses unless both `native/linux-x86_64/libhudi_jni.so` and
