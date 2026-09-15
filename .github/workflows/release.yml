@@ -17,14 +17,17 @@
 
 name: Publish artifacts
 
-# Two paths, deliberately, because both are used:
-#   * the NORMAL path -- push a `release-<version>` tag at the commit to release;
-#   * the AD-HOC path -- `workflow_dispatch`, carried over from the internal fork's own
-#     release.yml, for a release cut by hand from a chosen ref.
-# The ad-hoc path takes the version as an input rather than inferring it, because a dispatch
-# has no tag to read it from: `validate-release-tag` compares GITHUB_REF_NAME against the
-# workspace version, and on a dispatch that name is the BRANCH, so an input-less dispatch can
-# only ever fail its first job.
+# Two triggers, and only one of them publishes:
+#   * the RELEASE path -- push a `release-<version>` tag at the commit to release. This is the
+#     only event that uploads to PyPI and crates.io, and only on apache/hudi-rs (see the
+#     `Upload to pypi` and `cargo publish` steps).
+#   * the DRY-RUN path -- `workflow_dispatch`, from any ref. It runs every job up to the upload
+#     -- the version check, the wheel and sdist builds, `twine check` and
+#     `cargo publish --dry-run` -- and publishes nothing, on any repository.
+# A dispatch takes the version as an input rather than inferring it, because it has no tag to
+# read it from: `validate-release-tag` compares GITHUB_REF_NAME against the workspace version,
+# and on a dispatch that name is the BRANCH, so an input-less dispatch could only ever fail its
+# first job.
 on:
   push:
     tags:
@@ -32,7 +35,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "the workspace version this ad-hoc release carries; must equal [workspace.package] version in Cargo.toml, which .github/scripts/workspace-version.sh prints"
+        description: "the workspace version to dry-run the release of (a dispatch never publishes); must equal [workspace.package] version in Cargo.toml, which .github/scripts/workspace-version.sh prints"
         required: true
 
 jobs:
