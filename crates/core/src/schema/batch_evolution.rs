@@ -428,24 +428,18 @@ fn constant_array_from_avro_default(
                 .as_str()
                 .and_then(uuid_string_bytes)
                 .ok_or_else(|| bad("a UUID string"))?;
-            Arc::new(
-                FixedSizeBinaryArray::try_from_iter(std::iter::repeat_n(bytes.as_slice(), len))
-                    .map_err(|e| {
-                        CoreError::Schema(format!("evolution: uuid default for '{name}': {e}"))
-                    })?,
-            )
+            Arc::new(fixed_size_binary_repeated(&bytes, len).map_err(|e| {
+                CoreError::Schema(format!("evolution: uuid default for '{name}': {e}"))
+            })?)
         }
         DataType::FixedSizeBinary(width) => {
             let bytes = avro_byte_string(value, &bad)?;
             if bytes.len() != usize::try_from(*width).unwrap_or(usize::MAX) {
                 return Err(bad(&format!("a {width}-byte string")));
             }
-            Arc::new(
-                FixedSizeBinaryArray::try_from_iter(std::iter::repeat_n(bytes.as_slice(), len))
-                    .map_err(|e| {
-                        CoreError::Schema(format!("evolution: fixed default for '{name}': {e}"))
-                    })?,
-            )
+            Arc::new(fixed_size_binary_repeated(&bytes, len).map_err(|e| {
+                CoreError::Schema(format!("evolution: fixed default for '{name}': {e}"))
+            })?)
         }
         // An Avro enum default is one of its symbols; Arrow reads enums as a
         // Utf8 dictionary.
@@ -467,6 +461,27 @@ fn constant_array_from_avro_default(
         }
     };
     Ok(array)
+}
+
+/// `len` copies of `bytes` as a `FixedSizeBinary(bytes.len())` array. Built from
+/// the flat value buffer rather than `FixedSizeBinaryArray::try_from_iter`, which
+/// refuses an empty iterator and so cannot express the zero-row fill a nested
+/// field gets when its container holds no values in the batch.
+fn fixed_size_binary_repeated(
+    bytes: &[u8],
+    len: usize,
+) -> std::result::Result<arrow_array::FixedSizeBinaryArray, arrow_schema::ArrowError> {
+    let width = i32::try_from(bytes.len()).map_err(|_| {
+        arrow_schema::ArrowError::InvalidArgumentError(format!(
+            "a {}-byte fixed value does not fit an i32 width",
+            bytes.len()
+        ))
+    })?;
+    arrow_array::FixedSizeBinaryArray::try_new(
+        width,
+        arrow_buffer::Buffer::from(bytes.repeat(len)),
+        None,
+    )
 }
 
 /// The 16 bytes of a UUID string, in exactly the spellings arrow-avro's
@@ -2667,6 +2682,40 @@ mod tests {
             "and so must one inside a list"
         );
     }
+    /// A zero-row fill of a `fixed` or `uuid` default yields an empty array, as
+    /// every other type's does. It is reached when the field is a child of a
+    /// container with no values in the batch: a list of records whose every list
+    /// is empty, or a union branch no row selects.
+    #[test]
+    fn a_zero_row_fixed_or_uuid_default_fill_is_empty() {
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(Vec::<i32>::new()))],
+        );
+        let uuid_metadata: std::collections::HashMap<String, String> =
+            [("logicalType".to_string(), "uuid".to_string())].into();
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new("checksum", DataType::FixedSizeBinary(4), false),
+                avro_byte_string_default(&[1, 2, 3, 4]),
+            ),
+            Field::new("u", DataType::FixedSizeBinary(16), false).with_metadata(
+                uuid_metadata
+                    .into_iter()
+                    .chain([(
+                        "avro.field.default".to_string(),
+                        "\"550e8400-e29b-41d4-a716-446655440000\"".to_string(),
+                    )])
+                    .collect(),
+            ),
+        ]));
+        let out = project_batch_to_schema(&b, &target)
+            .expect("an empty batch fills its defaulted fixed columns with nothing");
+        assert_eq!(out.num_rows(), 0);
+        assert_eq!(out.schema(), target);
+    }
+
     /// Every spelling `uuid_string_bytes` accepts gives the same bytes; anything
     /// else is refused.
     #[test]
