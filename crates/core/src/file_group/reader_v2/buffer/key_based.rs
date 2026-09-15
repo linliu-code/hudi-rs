@@ -1405,7 +1405,9 @@ fn pad_partial_to_target(partial: &RecordBatch, target_schema: &SchemaRef) -> Re
             // value must never be silently dropped to null). A nested child-FIELD-NAME
             // difference (arrow-avro `item`/`entries` vs Parquet `element`/`key_value`)
             // is NOT such a mismatch — same buffers, different schema metadata — and is
-            // name-reconciled here exactly as the overlay path above does it. Without
+            // name-reconciled here as the overlay path above does it, but with the strict
+            // gate: a nested child nullability narrowing is refused here (see the note on
+            // the overlay's partial side). Without
             // this, a log-only partial insert whose list child is named `item` fails a
             // read that the overlay path would have completed. See ISSUES I-7.
             Ok(pidx) => {
