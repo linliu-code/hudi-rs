@@ -54,7 +54,7 @@
 # `_Unwind_*@GCC_3.0`-style symbols undefined. So the load-bearing check for this specific
 # class is NOT `-z,defs` — it is the `nm -D --undefined-only` assertion, checked by both the
 # workflow's Portability floor step and `make jni-lib-portable`, independently confirmed in a
-# process with NO pre-loaded libgcc_s (see the bare-`java` / `env -i` smoke in the local proof).
+# process with NO pre-loaded libgcc_s (a bare `env -i` `java` load, as crates/jni/README.md describes).
 #
 # Fix: `-lgcc_s` now maps to the ABSOLUTE paths of BOTH `libgcc_eh.a` and `libgcc.a` (in that
 # order — `libgcc_eh.a` first, since it provides the unwinder that libstdc++'s personality

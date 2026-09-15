@@ -69,20 +69,22 @@ it resolves from (and whether a classifier is present) changes:
   `.github/actions/install-jni-carrier` installs this asset into the runner's local repository
   when the coordinate does not resolve from CodeArtifact.
 
-  **The asset MUST be the multi-arch, classifier-less jar — the same bytes CodeArtifact holds.**
+  **The asset MUST be the multi-arch, classifier-less jar, uploaded byte-for-byte as the workflow
+  built it.**
   The consuming action runs `install:install-file` with **no** `-Dclassifier`, so whatever bytes
   it downloads become `io.onehouse.hudi-rs:hudi-jni-native:<version>`, the coordinate every
   module and all 14 bundles resolve. Publishing a single-arch `-linux-aarch64` jar there would
   seed every runner with an aarch64-only library under the multi-arch coordinate: aarch64 passes,
   x86_64 builds succeed and then fail the bundle smoke (no `native/linux-x86_64/…`), and any
   x86_64 deployment built from it fails loud at lookup time, far from the cause. The action pins
-  the asset's MD5, which is what enforces "same bytes".
+  the asset's MD5, which is what ties a version to exactly one jar.
 
   Take the jar from the workflow run's own `hudi-jni-native-carrier` artifact — never rebuilt,
   never re-jarred — and upload it as-is:
   ```
   gh run download <run-id> -R onehouseinc/hudi-rs-internal -n hudi-jni-native-carrier -D /tmp/carrier
-  md5sum /tmp/carrier/hudi-jni-native-<version>.jar        # must equal the CodeArtifact artifact's md5
+  cat /tmp/carrier/hudi-jni-native-<version>.jar.md5       # the md5 the workflow recorded
+  md5sum /tmp/carrier/hudi-jni-native-<version>.jar        # must equal it
   gh release create hudi-jni-native/<version> \
     /tmp/carrier/hudi-jni-native-<version>.jar \
     --repo onehouseinc/hudi-internal --prerelease --target <a pushed hudi-internal sha>
@@ -247,7 +249,7 @@ the `jni-lib` prerequisite would rebuild on this host *and* `rm -rf` its own sta
 producing a host-glibc carrier.
 
 In all three shapes `JNI_EXTRA_NATIVE_DIR` is required — the target refuses to run without it —
-and both arches end up in one classifier-less jar. Before writing anything the target also
+and both arches end up in one classifier-less jar. Before copying or writing anything the target also
 refuses unless BOTH `native/linux-x86_64/libhudi_jni.so` and `native/linux-aarch64/libhudi_jni.so`
 are present, each stripped and each exporting the two `Java_` symbols: an arch missing from
 `JNI_EXTRA_NATIVE_DIR` (or the same arch staged twice) would otherwise publish a one-arch
@@ -314,9 +316,9 @@ runner — only the `hudi.jni.native.version` property needs to move in lockstep
 ```
 make jni-lib        # cargo build -p hudi-jni --release; strip the .so; stage it plus
                      # META-INF/hudi-jni-native.properties (incl. glibc.floor=) under
-                     # target/jni-native/stage (rm -rf's the stage dir first; refuses a
-                     # dirty tree unless JNI_ALLOW_DIRTY=1); builds on THIS host, whatever
-                     # its glibc happens to be
+                     # target/jni-native/stage (replaces the stage dir once the build
+                     # succeeds; refuses a dirty tree unless JNI_ALLOW_DIRTY=1); builds
+                     # on THIS host, whatever its glibc happens to be
 make jni-lib-portable  # D-27: same build, inside quay.io/pypa/manylinux_2_28_<JNI_ARCH>
                      # (docker) with the static-cxx-linker wrapper; glibc floor <=2.28;
                      # stages under target/jni-portable, never target/release or
