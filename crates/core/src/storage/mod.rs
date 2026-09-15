@@ -405,19 +405,23 @@ impl Storage {
     /// props map.
     ///
     /// Load-bearing only for options that did not pass through
-    /// `OptionResolver`, such as the FFI's, which it builds from its own props.
+    /// `OptionResolver`, such as those of the C++ FFI's per-file-group
+    /// `Storage`, which it builds from its own props.
     /// `Table::new` and `FileGroupReader::new_with_options` resolve options
     /// first, and that copies every `AWS_*` environment variable into the
     /// storage options (lowercased), so on those paths the map already carries
     /// `aws_region` or `aws_default_region` whenever the environment does, and
     /// this returns early.
     ///
-    /// Any spelling of a region key counts as the caller passing one:
+    /// Any spelling of a region key counts as the caller passing one.
     /// `object_store` lowercases every key before parsing it, so `AWS_REGION`
-    /// in the map is as explicit as `region`, and `aws_default_region` /
-    /// `default_region` also set the region. Injecting `region` beside any of
-    /// them would leave `object_store` resolving two region settings in
-    /// `HashMap` order, which is a different answer from one run to the next.
+    /// in the map is as explicit as `region`, and injecting `region` beside it
+    /// would leave `object_store` resolving two region settings in `HashMap`
+    /// order, a different answer from one run to the next. A caller's
+    /// `aws_default_region` / `default_region` is not order-dependent (it only
+    /// fills a region nothing else set), but an injected `region` would always
+    /// beat it, so it is treated as explicit too and the caller's default wins
+    /// over the environment.
     ///
     /// Returns the SAME `Arc` when nothing applies, so the common path neither
     /// copies the map nor touches the environment.
@@ -648,7 +652,9 @@ mod tests {
     //
     // The fallback semantics under test:
     //   - non-S3 schemes  → options returned unchanged.
-    //   - already-set `region`/`aws_region` → never overridden.
+    //   - a region already set under any spelling (`region`, `aws_region`,
+    //     `default_region`, `aws_default_region`, in any case) → never
+    //     overridden.
     //   - S3 URL + AWS_REGION env set → `region` injected.
     //   - S3 URL + only AWS_DEFAULT_REGION set → `region` injected.
     //   - S3 URL + no env / empty env value → options returned unchanged.
@@ -937,7 +943,7 @@ mod tests {
 
         assert!(
             Arc::ptr_eq(&first.object_store, &second.object_store),
-            "two Storages over the same (host, options) must share one ObjectStore"
+            "two Storages over the same store identity must share one ObjectStore"
         );
     }
 
@@ -1103,6 +1109,7 @@ mod tests {
     fn test_storage_new_survives_a_poisoned_object_store_cache_lock() {
         // Poison the process-wide cache lock the way any panic while holding
         // it would. Every later `Storage::new` must still work, not panic.
+        // The spawned thread's panic message on stderr is expected.
         let _ = std::thread::spawn(|| {
             let _held = OBJECT_STORE_CACHE.lock();
             panic!("poison OBJECT_STORE_CACHE for the test");
