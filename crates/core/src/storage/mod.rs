@@ -21,8 +21,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use once_cell::sync::Lazy;
 
@@ -337,9 +337,12 @@ impl Storage {
         // new client. See OBJECT_STORE_CACHE.
         let key = object_store_cache_key(&base_url, options.as_ref());
         let object_store: Arc<dyn ObjectStore> = {
+            // A pure cache: a panic while the lock was held cannot leave the
+            // map half-updated, so a poisoned lock is recovered rather than
+            // turned into a panic in every later `Storage::new`.
             let mut cache = OBJECT_STORE_CACHE
                 .lock()
-                .expect("OBJECT_STORE_CACHE mutex poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(existing) = cache.get(&key) {
                 existing.clone()
             } else {
@@ -1063,6 +1066,26 @@ mod tests {
                 "`{key}` configures the store at {url}"
             );
         }
+    }
+
+    #[test]
+    fn test_storage_new_survives_a_poisoned_object_store_cache_lock() {
+        // Poison the process-wide cache lock the way any panic while holding
+        // it would. Every later `Storage::new` must still work, not panic.
+        let _ = std::thread::spawn(|| {
+            let _held = OBJECT_STORE_CACHE.lock();
+            panic!("poison OBJECT_STORE_CACHE for the test");
+        })
+        .join();
+        assert!(OBJECT_STORE_CACHE.is_poisoned());
+
+        let base = canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap();
+        let url = Url::from_directory_path(&base).unwrap();
+        let configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            url.as_str().to_string(),
+        )]));
+        assert!(Storage::new(Arc::new(HashMap::new()), configs).is_ok());
     }
 
     #[test]
