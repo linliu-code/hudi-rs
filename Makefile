@@ -142,7 +142,13 @@ test-python: ## Run tests on Python
 	uv run pytest -s $(PYTHON_DIR)
 
 # ---- JNI library carrier (hudi-internal's hudi-native-reader resolves it from Maven) ----
-JNI_VERSION ?= 0.5.0-dev.$(shell git rev-parse --short HEAD)
+# The default version is derived from [workspace.package] version in the root Cargo.toml, the
+# same way jni-native.yml's package job derives it: always a dev coordinate,
+# <x.y.z>-dev.<short sha>, whatever pre-release suffix the workspace version carries. Both are
+# recursive (`=`), so only the targets that use the version evaluate it, and a version that
+# cannot be read stops those targets instead of minting a coordinate from an empty string.
+JNI_WORKSPACE_VERSION = $(or $(shell .github/scripts/workspace-version.sh 2>/dev/null),$(error cannot read [workspace.package] version with .github/scripts/workspace-version.sh; fix it or pass JNI_VERSION explicitly))
+JNI_VERSION ?= $(firstword $(subst -, ,$(JNI_WORKSPACE_VERSION)))-dev.$(shell git rev-parse --short HEAD)
 JNI_ARCH ?= $(shell uname -m | sed 's/arm64/aarch64/;s/amd64/x86_64/')
 JNI_OS ?= linux
 JNI_OUT ?= target/jni-native
@@ -166,15 +172,15 @@ JNI_PORTABLE_OUT ?= target/jni-portable
 # NOT by itself merge in another arch's library — that's jni-jar-multi's JNI_EXTRA_NATIVE_DIR job,
 # which jni-install/jni-deploy pull in as their prerequisite under JNI_MULTI=1.
 ifeq ($(JNI_MULTI),1)
-JNI_JAR := $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar
+JNI_JAR = $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar
 JNI_DEPLOY_PREREQ := jni-jar-multi
 JNI_CLASSIFIER_ARG :=
-JNI_DEPLOY_COORD := io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION)
+JNI_DEPLOY_COORD = io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION)
 else
-JNI_JAR := $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION)-$(JNI_OS)-$(JNI_ARCH).jar
+JNI_JAR = $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION)-$(JNI_OS)-$(JNI_ARCH).jar
 JNI_DEPLOY_PREREQ := jni-jar
 JNI_CLASSIFIER_ARG := -Dclassifier=$(JNI_OS)-$(JNI_ARCH)
-JNI_DEPLOY_COORD := io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH)
+JNI_DEPLOY_COORD = io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH)
 endif
 
 # The staged copy is stripped. Measured on an aarch64 build: 74,330,712 B -> 55,604,776 B, and
@@ -304,6 +310,12 @@ jni-install: $(JNI_DEPLOY_PREREQ) ## Install the carrier jar into the local Mave
 	$(info --- Install $(JNI_JAR) into the local Maven repository as $(JNI_DEPLOY_COORD) ---)
 	mvn -B -ntp install:install-file -Dfile=$(JNI_JAR) -DgroupId=io.onehouse.hudi-rs -DartifactId=hudi-jni-native \
 	  -Dversion=$(JNI_VERSION) $(JNI_CLASSIFIER_ARG) -Dpackaging=jar -DgeneratePom=true
+
+.PHONY: test-jni-carrier
+test-jni-carrier: ## Test the carrier's Makefile rules: the default JNI_VERSION and jni-jar-multi's packaging checks (needs gcc, binutils, cargo and a JDK's jar)
+	$(info --- Test the JNI carrier Makefile rules ---)
+	.github/jni-tests/jni-version.sh
+	.github/jni-tests/jni-package-multi.sh
 
 .PHONY: coverage
 coverage: coverage-rust ## Generate coverage report (alias for coverage-rust)
