@@ -236,10 +236,10 @@ impl ReadVolume {
 ///
 /// Caveat, recorded deliberately: this map is unbounded and lives for the
 /// process. That is bounded in practice by the number of DISTINCT
-/// (host, options) pairs a process sees, which is small — but a caller that
-/// mints per-request credentials would grow it without limit. Nothing here
-/// evicts; if that ever becomes a problem the fix is an entry-bounded cache, not
-/// a per-split rebuild.
+/// (store identity, read options) pairs a process sees, which is small — but a
+/// caller that mints per-request credentials would grow it without limit.
+/// Nothing here evicts; if that ever becomes a problem the fix is an
+/// entry-bounded cache, not a per-split rebuild.
 static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -281,10 +281,14 @@ fn object_store_cache_key(base_url: &Url, options: &HashMap<String, String>) -> 
                 .split('/')
                 .filter(|s| !s.is_empty())
                 .collect();
-            // The fewest leading segments whose removal leaves exactly the path
-            // `parse_url_opts` returns. No match keeps every segment, which can
-            // only split the cache, never merge two stores.
+            // The most leading segments whose removal still leaves exactly the
+            // path `parse_url_opts` returns. Two counts can only both match
+            // when the extra segments decode to nothing but a delimiter, and
+            // taking the larger keeps those in the key. No match keeps every
+            // segment. Either way the cache can only split, never merge two
+            // stores.
             let consumed = (0..=segments.len())
+                .rev()
                 .find(|&k| {
                     ObjPath::from_url_path(segments[k..].join("/")).is_ok_and(|p| &p == path)
                 })
@@ -992,6 +996,21 @@ mod tests {
             (
                 "https://acct.dfs.core.windows.net/container-a/x%2Fy",
                 "https://acct.dfs.core.windows.net/container-b/x%2Fy",
+            ),
+            // The path ends at the bucket or container, trailing slash or not.
+            (
+                "https://acct.dfs.core.windows.net/container-a",
+                "https://acct.dfs.core.windows.net/container-b",
+            ),
+            (
+                "https://s3.us-west-2.amazonaws.com/bucket-a/",
+                "https://s3.us-west-2.amazonaws.com/bucket-b/",
+            ),
+            // A first segment that decodes to nothing but a delimiter names a
+            // different (if invalid) bucket from no segment at all.
+            (
+                "https://s3.us-west-2.amazonaws.com/%2F",
+                "https://s3.us-west-2.amazonaws.com/",
             ),
         ];
         for (a, b) in pairs {
