@@ -53,6 +53,7 @@ use crate::file_group::reader_v2::buffered_record::{
 use crate::file_group::reader_v2::merge_iterator::DEFAULT_BATCH_SIZE;
 // `CoreError` / `RecordPayload` are used only by the test-only compaction
 // primitive and the unit tests (production compaction lives on the spillable map).
+#[cfg(test)]
 use crate::error::CoreError;
 #[cfg(test)]
 use crate::file_group::reader_v2::buffered_record::RecordPayload;
