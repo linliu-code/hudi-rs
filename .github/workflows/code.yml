@@ -50,6 +50,9 @@ jobs:
       - name: Check the version is single-sourced
         run: make check-version
 
+      - name: Test the version single-source checker
+        run: make test-version-check
+
       - name: Install system dependencies
         run: |
           sudo apt-get update

@@ -42,6 +42,13 @@ make coverage-rust                                             # tarpaulin HTML 
 # that touches the merge map or its dependencies.
 cargo clippy -p hudi-core --lib --no-default-features -- -D warnings
 cargo test -p hudi-core --lib --no-default-features
+
+# The project version has one authority: [workspace.package] version in the root Cargo.toml.
+# To bump it, edit that line and propagate it to the manifests that cannot derive it (or run
+# `cargo set-version`, as release/README.md does, which does both).
+make version-sync            # rewrite intra-workspace dependency requirements to the authority
+make check-version           # assert nothing else carries a copy (part of `make check`; CI runs it)
+make test-version-check      # the checker's own tests
 ```
 
 ## Conventions
