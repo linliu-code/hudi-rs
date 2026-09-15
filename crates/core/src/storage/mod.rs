@@ -248,8 +248,9 @@ static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
 ///
 /// The URL part is everything up to the path, plus whatever leading path
 /// segments `parse_url_opts` consumes rather than hands back as the object
-/// path. That is the derivation `object_store`'s own `DefaultObjectStoreRegistry`
-/// uses, and it matters because the bucket or container is not always the host:
+/// path. That is the idea behind `object_store`'s own
+/// `DefaultObjectStoreRegistry`, and it matters because the bucket or container
+/// is not always the host:
 ///
 /// - `abfss://container@account.dfs.core.windows.net/tbl` carries the container
 ///   in the user-info, so scheme+host alone is the same for every container;
@@ -257,9 +258,14 @@ static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
 ///   `https://s3.<region>.amazonaws.com/bucket/tbl` and R2 carry it in the first
 ///   path segment, which `parse_url_opts` strips.
 ///
-/// A key that missed either would hand one container's client to a read of
-/// another, which then resolves the same relative path inside the wrong
-/// container and returns its data without error.
+/// A key that missed either would hand one bucket's or container's client to a
+/// `Storage` for another. For the user-info form that read resolves the same
+/// relative path inside the wrong container and returns its data without error.
+///
+/// The consumed segments are counted by matching the raw URL segments against
+/// the path `parse_url_opts` returns, not by subtracting part counts: that path
+/// is percent-decoded, so a `%2F` inside a table name is one raw segment but two
+/// parts, and a subtraction would shift the bucket out of the key.
 ///
 /// The options are load-bearing too — the same `s3://bucket/path` resolves to
 /// different physical stores under different endpoints or credentials — but
@@ -270,10 +276,21 @@ fn object_store_cache_key(base_url: &Url, options: &HashMap<String, String>) -> 
     let parsed = ObjectStoreScheme::parse(base_url).ok();
     let url_part = match &parsed {
         Some((_, path)) => {
-            let segments = || base_url.path().split('/').filter(|s| !s.is_empty());
-            let consumed = segments().count().saturating_sub(path.parts_count());
+            let segments: Vec<&str> = base_url
+                .path()
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+            // The fewest leading segments whose removal leaves exactly the path
+            // `parse_url_opts` returns. No match keeps every segment, which can
+            // only split the cache, never merge two stores.
+            let consumed = (0..=segments.len())
+                .find(|&k| {
+                    ObjPath::from_url_path(segments[k..].join("/")).is_ok_and(|p| &p == path)
+                })
+                .unwrap_or(segments.len());
             let mut url_part = base_url[..url::Position::AfterPort].to_string();
-            for segment in segments().take(consumed) {
+            for segment in &segments[..consumed] {
                 url_part.push('/');
                 url_part.push_str(segment);
             }
@@ -957,6 +974,20 @@ mod tests {
                 "https://acct.r2.cloudflarestorage.com/bucket-b/tbl",
             ),
             ("s3://bucket-a/tbl", "s3://bucket-b/tbl"),
+            // A percent-encoded `/` in the table path decodes into an extra
+            // path part, which must not shift the bucket out of the key.
+            (
+                "https://s3.us-west-2.amazonaws.com/bucket-a/x%2Fy",
+                "https://s3.us-west-2.amazonaws.com/bucket-b/x%2Fy",
+            ),
+            (
+                "https://acct.r2.cloudflarestorage.com/bucket-a/x%2Fy",
+                "https://acct.r2.cloudflarestorage.com/bucket-b/x%2Fy",
+            ),
+            (
+                "https://acct.dfs.core.windows.net/container-a/x%2Fy",
+                "https://acct.dfs.core.windows.net/container-b/x%2Fy",
+            ),
         ];
         for (a, b) in pairs {
             assert_ne!(
