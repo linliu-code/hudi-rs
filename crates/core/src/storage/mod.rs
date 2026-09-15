@@ -333,8 +333,8 @@ impl Storage {
 
         let options = Self::with_region_fallback(&base_url, options);
 
-        // ENG-42276 — consult the process-level store cache before building a
-        // new client. See OBJECT_STORE_CACHE.
+        // Consult the process-level store cache before building a new client.
+        // See OBJECT_STORE_CACHE.
         let key = object_store_cache_key(&base_url, options.as_ref());
         let object_store: Arc<dyn ObjectStore> = {
             // A pure cache: a panic while the lock was held cannot leave the
@@ -346,11 +346,11 @@ impl Storage {
             if let Some(existing) = cache.get(&key) {
                 existing.clone()
             } else {
-                // Bind hyper's dispatch task to the process-lifetime runtime
-                // rather than the caller's per-task one: a cached store whose
-                // dispatcher died with a transient runtime fails every later
-                // read with `DispatchGone`.
-                let _guard = crate::ffi_support::OBJECT_STORE_RUNTIME.enter();
+                // No runtime is entered here. Building a store spawns no task:
+                // hyper spawns a connection's task on the runtime driving the
+                // first request over it, so the caller's choice of runtime for
+                // its reads decides that lifetime (see
+                // `ffi_support::OBJECT_STORE_RUNTIME`).
                 match parse_url_opts(&base_url, options.as_ref()) {
                     Ok((new_store, _)) => {
                         let arc: Arc<dyn ObjectStore> = Arc::new(new_store);
