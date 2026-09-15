@@ -165,6 +165,12 @@ pub fn forward_scan_pass1(
     let mut total_log_blocks: u64 = 0;
     let mut total_corrupt_blocks: u64 = 0;
     let mut total_rollbacks: u64 = 0;
+    // Per-gate skip counts, reported once in the Pass 1 summary below. The
+    // per-block skip lines are `trace!`, so these are what keeps "why rows
+    // disappeared" visible at `debug!` without one line per skipped block.
+    let mut skipped_future: u64 = 0;
+    let mut skipped_uncommitted: u64 = 0;
+    let mut skipped_out_of_range: u64 = 0;
 
     log::trace!(
         "[Pass1] forward_scan: {} total blocks, latest_instant_time={}, has_instant_range={}",
@@ -255,9 +261,10 @@ pub fn forward_scan_pass1(
 
         // Gate 2: Future blocks → skip (instant > latestInstantTime)
         if block.block_type != BlockType::Command && instant_time.as_str() > latest_instant_time {
-            log::debug!(
+            log::trace!(
                 "[Pass1] Gate2: future block #{total_log_blocks} instant={instant_time} > {latest_instant_time}, skipped"
             );
+            skipped_future += 1;
             continue;
         }
 
@@ -272,9 +279,10 @@ pub fn forward_scan_pass1(
             && let Some(gate) = completion_gate
             && !gate.admits(&instant_time)
         {
-            log::debug!(
+            log::trace!(
                 "[Pass1] Gate3: block #{total_log_blocks} instant={instant_time} uncommitted/inflight, skipped"
             );
+            skipped_uncommitted += 1;
             continue;
         }
 
@@ -283,9 +291,10 @@ pub fn forward_scan_pass1(
             && let Some(range) = instant_range
             && range.not_in_range(&instant_time, timezone)?
         {
-            log::debug!(
+            log::trace!(
                 "[Pass1] Gate4: block #{total_log_blocks} instant={instant_time} out of range, skipped"
             );
+            skipped_out_of_range += 1;
             continue;
         }
 
@@ -354,7 +363,7 @@ pub fn forward_scan_pass1(
                         ))
                     })?
                     .to_string();
-                log::debug!("[Pass1] ROLLBACK: removing instant={target}");
+                log::trace!("[Pass1] ROLLBACK: removing instant={target}");
                 target_rollback_instants.insert(target.clone());
                 ordered_instants_list.retain(|t| t != &target);
                 instant_to_blocks_map.remove(&target);
@@ -400,20 +409,31 @@ pub fn forward_scan_pass1(
         }
     }
 
+    // Level rule for this reader: narration -- a line per log block, per log
+    // file, per instant, or per step of the scan -- is `trace!`, since a file
+    // group can carry thousands of blocks and a gate skip is as frequent as an
+    // accept; the one completion summary per pass is `debug!`, and carries the
+    // counts that narration would otherwise be needed for. A corrupt block keeps
+    // its `warn!` at Gate 1: it is an exception, not per-block volume.
     log::debug!(
         "[Pass1] complete: ordered_instants={ordered_instants_list:?} \
          total_blocks={total_log_blocks} corrupt={total_corrupt_blocks} \
-         rollbacks={total_rollbacks}",
+         rollbacks={total_rollbacks} skipped_future={skipped_future} \
+         skipped_uncommitted={skipped_uncommitted} skipped_out_of_range={skipped_out_of_range}",
     );
-    for (instant, blocks) in &instant_to_blocks_map {
-        log::trace!(
-            "[Pass1]   instant={instant}: {} block(s) [{:?}]",
-            blocks.len(),
-            blocks
-                .iter()
-                .map(|b| format!("{:?}", b.block_type))
-                .collect::<Vec<_>>(),
-        );
+    // Guarded so the loop, and the `Vec` of block types each iteration builds,
+    // is not run at all unless `trace!` is enabled.
+    if log::log_enabled!(log::Level::Trace) {
+        for (instant, blocks) in &instant_to_blocks_map {
+            log::trace!(
+                "[Pass1]   instant={instant}: {} block(s) [{:?}]",
+                blocks.len(),
+                blocks
+                    .iter()
+                    .map(|b| format!("{:?}", b.block_type))
+                    .collect::<Vec<_>>(),
+            );
+        }
     }
 
     Ok(Pass1Result {

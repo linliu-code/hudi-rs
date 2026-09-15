@@ -610,8 +610,10 @@ impl HoodieFileGroupReader {
             reader_context.latest_commit_time,
             reader_context.record_key_field(),
         );
-        for (i, lf) in input_split.log_file_paths.iter().enumerate() {
-            log::trace!("  log_file[{i}]: {lf}");
+        if log::log_enabled!(log::Level::Trace) {
+            for (i, lf) in input_split.log_file_paths.iter().enumerate() {
+                log::trace!("  log_file[{i}]: {lf}");
+            }
         }
 
         // Mirrors Java lines 119-121:
