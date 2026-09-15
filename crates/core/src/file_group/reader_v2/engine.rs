@@ -2006,10 +2006,13 @@ impl HoodieFileGroupReader {
     /// Worth stating because the gap is silent and reads as data: a streaming
     /// read of a fixture with five deletes reports `num_deletes: 0` while
     /// returning exactly the same rows as the eager read that reports five. No
-    /// production caller reads these *through this accessor* - only the test
-    /// harness and the benchmark do - but that is precisely where a zero would
-    /// be believed. Production streaming callers read the same counters off the
-    /// shared sink instead, via [`Self::stream_stats_handle`].
+    /// production *streaming* caller reads these - only the test harness and
+    /// the benchmark do - but that is precisely where a zero would be believed.
+    /// The production caller of this accessor, the metadata-table read, reads
+    /// after [`Self::read`], where the values are complete. The FFI's streaming
+    /// route reads only `final_merge_us` and `output_build_us`, off the shared
+    /// sink via [`Self::stream_stats_handle`]; the insert/update/delete counts
+    /// have no production reader on either call shape.
     pub fn read_stats(&self) -> &HoodieReadStats {
         &self.read_stats
     }
