@@ -99,7 +99,8 @@ fn types_equivalent(a: &DataType, b: &DataType) -> bool {
 ///   form — and skipping resolution there would decode `Int64` where the required
 ///   schema says `Timestamp`. Equal canonical forms do not license skipping.
 /// * `doc` is dropped because it is prose: it cannot change a decoded value, a
-///   type, or a branch.
+///   type, or a branch. Only from schema nodes — a `default` value is data, and
+///   a `doc` key inside one is left alone.
 /// * Everything else counts as a difference and makes the read resolve, including
 ///   `default`, `aliases` and `avro.java.string`. Some of those would in fact be
 ///   harmless to ignore; being wrong in this direction costs one resolving
@@ -111,7 +112,9 @@ pub(crate) fn avro_schema_json_equivalent(a_json: &str, b_json: &str) -> crate::
         match value {
             Value::Object(map) => {
                 map.remove("doc");
-                for (_, v) in map.iter_mut() {
+                // A `default` is a VALUE, not a schema node: a map or record
+                // default can hold a key spelled `doc`, and that key is data.
+                for (_, v) in map.iter_mut().filter(|(k, _)| k.as_str() != "default") {
                     strip_doc(v);
                 }
             }
@@ -670,6 +673,46 @@ mod tests {
         // Malformed input is an error, not a false "equivalent".
         assert!(avro_schema_json_equivalent(base, "{not json").is_err());
     }
+    /// A `doc` key inside a DEFAULT value is data, not prose, and must count.
+    ///
+    /// A map- or record-typed field's default is a JSON object, and a key of that
+    /// object can be spelled `doc`; stripping it there would judge two schemas
+    /// with different defaults equivalent. The control: `doc` on the schema node
+    /// that holds the default is still stripped.
+    #[test]
+    fn avro_schema_json_equivalence_keeps_doc_inside_a_default_value() {
+        let with_default = |default: &str, field_doc: &str| {
+            format!(
+                r#"{{"type":"record","name":"R","fields":[{{"name":"m","doc":"{field_doc}","type":{{"type":"map","values":"string"}},"default":{default}}}]}}"#
+            )
+        };
+        assert!(
+            !avro_schema_json_equivalent(
+                &with_default(r#"{"doc":"alpha","k":"v"}"#, "same"),
+                &with_default(r#"{"doc":"BETA","k":"v"}"#, "same"),
+            )
+            .unwrap(),
+            "map defaults that differ under a `doc` key are different defaults"
+        );
+        assert!(
+            avro_schema_json_equivalent(
+                &with_default(r#"{"doc":"alpha","k":"v"}"#, "one"),
+                &with_default(r#"{"doc":"alpha","k":"v"}"#, "two"),
+            )
+            .unwrap(),
+            "the field's own `doc` is still prose"
+        );
+        let record_default = |doc_value: &str| {
+            format!(
+                r#"{{"type":"record","name":"R","fields":[{{"name":"s","type":{{"type":"record","name":"S","fields":[{{"name":"doc","type":"string"}}]}},"default":{{"doc":"{doc_value}"}}}}]}}"#
+            )
+        };
+        assert!(
+            !avro_schema_json_equivalent(&record_default("x"), &record_default("y")).unwrap(),
+            "a record default whose field is named `doc` is data"
+        );
+    }
+
     /// `defaults_carrier_writer_json` renames away exactly the fields that declare
     /// a default, at every depth, and resolving the reader against the result
     /// stamps each of those defaults — including nested ones — while the fields
