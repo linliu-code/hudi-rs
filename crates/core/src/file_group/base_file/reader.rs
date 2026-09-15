@@ -153,6 +153,17 @@ pub struct BaseFileReadOptions {
     /// fact in Arrow, which is why it has to be handed to the decoder rather
     /// than applied to the decoded batch.
     ///
+    /// One divergence from Java, from `arrow-avro` and not from this crate: a
+    /// reader field the writer never wrote that declares NO default is refused by
+    /// Java (Avro requires the default, `Resolver.RecordAdjust`) whatever its
+    /// nullability, but `arrow-avro` accepts it when it is a null-first union,
+    /// reads it as NULL, and stamps a `"null"` default the schema never declared.
+    /// A null-second union or a non-union field is refused, as in Java. Hudi's
+    /// own Avro conversion declares `"default": null` on every nullable column,
+    /// so schemas it writes never reach the divergent case. Pinned by
+    /// `pins_that_a_null_first_reader_only_field_without_a_default_resolves_to_null`
+    /// (`log_file::avro`), so an `arrow-avro` upgrade that changes it is visible.
+    ///
     /// Only the HFile reader honors this; Parquet and Lance ignore it (their
     /// files carry no Avro writer schema to resolve from). When it is `None`,
     /// or when it is the file's own writer schema verbatim, the file is decoded

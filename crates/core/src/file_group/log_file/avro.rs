@@ -524,4 +524,57 @@ mod tests {
             &arrow_schema::DataType::Int32
         );
     }
+    /// PINS arrow-avro behaviour that diverges from Java: a reader field the
+    /// writer never wrote, declared as a null-first union with NO `default`, is
+    /// resolved to NULL, and the resolved field is stamped with a
+    /// `"avro.field.default": "null"` the reader schema never declared.
+    ///
+    /// Avro's specification and Java's `Resolver.RecordAdjust` require such a
+    /// field to declare a default, and Java refuses to read without one whatever
+    /// the field's nullability. arrow-avro takes a null-first union's first branch
+    /// as an implicit default. The other shapes agree with Java and are pinned
+    /// alongside: a null-SECOND union and a non-union field without a default
+    /// are refused. See `BaseFileReadOptions::reader_schema_json`.
+    ///
+    /// If an arrow-avro upgrade starts refusing the first shape, this test fails
+    /// and the divergence note has to change with it.
+    #[test]
+    fn pins_that_a_null_first_reader_only_field_without_a_default_resolves_to_null() {
+        let writer = r#"{"type":"record","name":"r","fields":[{"name":"a","type":"long"}]}"#;
+        let reader_with = |field: &str| {
+            format!(
+                r#"{{"type":"record","name":"r","fields":[{{"name":"a","type":"long"}},{field}]}}"#
+            )
+        };
+
+        let reader = reader_with(r#"{"name":"b","type":["null","string"]}"#);
+        let mut decoder = AvroBlockDecoder::try_new_with_reader(writer, Some(&reader), 1024)
+            .expect("arrow-avro resolves a null-first reader-only field with no default");
+        decoder.decode(&[0x0E]).unwrap(); // long 7, zigzag encoded
+        let batch = decoder.flush().unwrap().expect("a batch");
+        assert!(batch.column(1).is_null(0), "and reads it as NULL");
+        assert_eq!(
+            batch
+                .schema()
+                .field(1)
+                .metadata()
+                .get("avro.field.default")
+                .map(String::as_str),
+            Some("null"),
+            "stamping a default the reader schema never declared"
+        );
+
+        for refused in [
+            r#"{"name":"c","type":["string","null"]}"#,
+            r#"{"name":"d","type":"string"}"#,
+        ] {
+            let err = AvroBlockDecoder::try_new_with_reader(writer, Some(&reader_with(refused)), 1)
+                .err()
+                .unwrap_or_else(|| panic!("{refused} must be refused"));
+            assert!(
+                err.to_string().contains("must have a default value"),
+                "{refused}: {err}"
+            );
+        }
+    }
 }
