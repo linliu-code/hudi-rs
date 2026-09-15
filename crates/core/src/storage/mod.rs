@@ -345,8 +345,8 @@ impl Storage {
         self.read_volume.clone()
     }
 
-    /// ENG-40156 — fall back to `AWS_REGION` / `AWS_DEFAULT_REGION` for S3 URLs
-    /// when the caller passed no region.
+    /// Fall back to `AWS_REGION` / `AWS_DEFAULT_REGION` for S3 URLs when the
+    /// caller passed no region.
     ///
     /// Without this, `object_store::parse_url_opts` builds an `AmazonS3` client
     /// against the default us-east-1 endpoint, and a HEAD to a bucket in any
@@ -354,6 +354,21 @@ impl Storage {
     /// `AWS_REGION` (set by IRSA, or by `spark.executorEnv.AWS_REGION`), so
     /// honouring it here means callers need not thread a region through the FFI
     /// props map.
+    ///
+    /// Load-bearing only for options that did not pass through
+    /// `OptionResolver`, such as the FFI's, which it builds from its own props.
+    /// `Table::new` and `FileGroupReader::new_with_options` resolve options
+    /// first, and that copies every `AWS_*` environment variable into the
+    /// storage options (lowercased), so on those paths the map already carries
+    /// `aws_region` or `aws_default_region` whenever the environment does, and
+    /// this returns early.
+    ///
+    /// Any spelling of a region key counts as the caller passing one:
+    /// `object_store` lowercases every key before parsing it, so `AWS_REGION`
+    /// in the map is as explicit as `region`, and `aws_default_region` /
+    /// `default_region` also set the region. Injecting `region` beside any of
+    /// them would leave `object_store` resolving two region settings in
+    /// `HashMap` order, which is a different answer from one run to the next.
     ///
     /// Returns the SAME `Arc` when nothing applies, so the common path neither
     /// copies the map nor touches the environment.
@@ -365,7 +380,13 @@ impl Storage {
         if scheme != "s3" && scheme != "s3a" {
             return options;
         }
-        if options.contains_key("region") || options.contains_key("aws_region") {
+        let has_region = options.keys().any(|k| {
+            matches!(
+                k.to_ascii_lowercase().as_str(),
+                "region" | "aws_region" | "default_region" | "aws_default_region"
+            )
+        });
+        if has_region {
             return options;
         }
         let region = std::env::var("AWS_REGION")
@@ -378,9 +399,7 @@ impl Storage {
         // debug!, not info!: embedders construct a Storage per file group, so on
         // an s3 table whose region arrives only from the environment this fires
         // once per split rather than once per process.
-        log::debug!(
-            "[ENG-40156] hudi-rs Storage: injecting region={region} from env for {scheme} url"
-        );
+        log::debug!("hudi-rs Storage: injecting region={region} from env for {scheme} url");
         let mut merged: HashMap<String, String> = (*options).clone();
         merged.insert("region".to_string(), region);
         Arc::new(merged)
@@ -738,6 +757,76 @@ mod tests {
         // Hadoop-style `s3a://` URLs hit the same injection path.
         assert_eq!(out.get("region"), Some(&"us-west-2".to_string()));
 
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+        }
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_respects_an_explicit_region_in_any_key_spelling() {
+        // object_store lowercases every key before parsing it, and reads both
+        // default-region spellings as a region, so each of these is the caller
+        // passing a region. None may get an env region injected beside it.
+        unsafe {
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        for key in [
+            "AWS_REGION",
+            "Region",
+            "REGION",
+            "aws_default_region",
+            "AWS_DEFAULT_REGION",
+            "default_region",
+        ] {
+            let in_opts = Arc::new(HashMap::from([(key.to_string(), "eu-west-1".to_string())]));
+            let out = Storage::with_region_fallback(&s3_url(), in_opts.clone());
+            assert!(
+                Arc::ptr_eq(&in_opts, &out),
+                "an explicit `{key}` must not get `region` injected beside it, got {out:?}"
+            );
+        }
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+        }
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_keeps_an_uppercase_explicit_region_deterministic() {
+        // Fold the result through the key parsing `parse_url_opts` applies.
+        // Each iteration builds a fresh HashMap, so each has its own iteration
+        // order: an injected `region` beside `AWS_REGION` would make the
+        // resolved region follow that order instead of the caller.
+        unsafe {
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        for _ in 0..64 {
+            let in_opts = Arc::new(HashMap::from([(
+                "AWS_REGION".to_string(),
+                "eu-west-1".to_string(),
+            )]));
+            let out = Storage::with_region_fallback(&s3_url(), in_opts);
+            let builder = out.iter().fold(
+                object_store::aws::AmazonS3Builder::new(),
+                |builder, (k, v)| match k
+                    .to_ascii_lowercase()
+                    .parse::<object_store::aws::AmazonS3ConfigKey>()
+                {
+                    Ok(key) => builder.with_config(key, v),
+                    Err(_) => builder,
+                },
+            );
+            assert_eq!(
+                builder
+                    .get_config_value(&object_store::aws::AmazonS3ConfigKey::Region)
+                    .as_deref(),
+                Some("eu-west-1"),
+                "the caller's region must win over the environment, every time"
+            );
+        }
         unsafe {
             std::env::remove_var("AWS_REGION");
         }
