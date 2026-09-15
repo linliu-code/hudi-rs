@@ -176,6 +176,137 @@ mod tests {
     use hudi_test::assert_arrow_field_names_eq;
     use std::sync::Arc;
 
+    /// Every UTC spelling is rewritten to `UTC` at every depth the recursion
+    /// claims — `Struct`, `List`, `LargeList`, `Map`, `Union` — while names,
+    /// nullability, field and schema metadata, a non-UTC zone and a zone-less
+    /// timestamp are left exactly as they were.
+    #[test]
+    fn normalize_utc_timezone_spelling_rewrites_every_alias_at_every_depth() {
+        use arrow_schema::{TimeUnit, UnionFields, UnionMode};
+        use std::collections::HashMap;
+
+        let md = |k: &str| HashMap::from([(k.to_string(), "v".to_string())]);
+        // `tz(alias)` is the zone a field is built with; the expected schema is
+        // the same builder with every alias mapped to "UTC".
+        let build = |tz: &dyn Fn(&str) -> String| {
+            let ts =
+                |alias: &str| DataType::Timestamp(TimeUnit::Microsecond, Some(tz(alias).into()));
+            Schema::new_with_metadata(
+                vec![
+                    Field::new("offset", ts("+00:00"), true),
+                    Field::new("compact", ts("+0000"), false),
+                    Field::new("unsigned", ts("00:00"), true),
+                    Field::new("zulu", ts("Z"), true).with_metadata(md("f")),
+                    Field::new("lower_zulu", ts("z"), true),
+                    Field::new("utc", ts("UTC"), true),
+                    Field::new(
+                        "other_zone",
+                        DataType::Timestamp(TimeUnit::Millisecond, Some("+01:00".into())),
+                        true,
+                    ),
+                    Field::new(
+                        "no_zone",
+                        DataType::Timestamp(TimeUnit::Microsecond, None),
+                        true,
+                    ),
+                    Field::new(
+                        "s",
+                        DataType::Struct(
+                            vec![
+                                Field::new("inner", ts("+00:00"), false).with_metadata(md("s")),
+                                Field::new("n", DataType::Int32, true),
+                            ]
+                            .into(),
+                        ),
+                        true,
+                    ),
+                    Field::new(
+                        "l",
+                        DataType::List(Arc::new(Field::new("item", ts("Z"), false))),
+                        true,
+                    ),
+                    Field::new(
+                        "ll",
+                        DataType::LargeList(Arc::new(Field::new("element", ts("+0000"), true))),
+                        true,
+                    ),
+                    Field::new(
+                        "m",
+                        DataType::Map(
+                            Arc::new(Field::new(
+                                "entries",
+                                DataType::Struct(
+                                    vec![
+                                        Field::new("key", DataType::Utf8, false),
+                                        Field::new("value", ts("z"), true),
+                                    ]
+                                    .into(),
+                                ),
+                                false,
+                            )),
+                            false,
+                        ),
+                        true,
+                    ),
+                    Field::new(
+                        "u",
+                        DataType::Union(
+                            UnionFields::try_new(
+                                vec![0, 1],
+                                vec![
+                                    Field::new("ts", ts("00:00"), true),
+                                    Field::new("i", DataType::Int32, true),
+                                ],
+                            )
+                            .unwrap(),
+                            UnionMode::Dense,
+                        ),
+                        true,
+                    ),
+                    Field::new(
+                        "nested",
+                        DataType::List(Arc::new(Field::new(
+                            "item",
+                            DataType::Struct(
+                                vec![Field::new(
+                                    "deep",
+                                    DataType::Map(
+                                        Arc::new(Field::new(
+                                            "entries",
+                                            DataType::Struct(
+                                                vec![
+                                                    Field::new("key", DataType::Utf8, false),
+                                                    Field::new("value", ts("+00:00"), true),
+                                                ]
+                                                .into(),
+                                            ),
+                                            false,
+                                        )),
+                                        false,
+                                    ),
+                                    true,
+                                )]
+                                .into(),
+                            ),
+                            true,
+                        ))),
+                        true,
+                    ),
+                ],
+                md("schema"),
+            )
+        };
+        let as_written = build(&|alias| alias.to_string());
+        let expected = build(&|alias| match alias {
+            "+00:00" | "+0000" | "00:00" | "Z" | "z" => "UTC".to_string(),
+            other => other.to_string(),
+        });
+        assert_ne!(as_written, expected, "the fixture must contain aliases");
+        assert_eq!(normalize_utc_timezone_spelling(&as_written), expected);
+        // Idempotent: a normalised schema comes back unchanged.
+        assert_eq!(normalize_utc_timezone_spelling(&expected), expected);
+    }
+
     #[test]
     fn test_prepend_meta_fields() {
         let schema = Schema::new(vec![Field::new("field1", DataType::Int32, false)]);
