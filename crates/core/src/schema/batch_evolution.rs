@@ -48,7 +48,7 @@ const MICROS_PER_MILLIS: i64 = 1000;
 /// not carry defaults. That is exactly when it is needed here: a reader field
 /// the writer never wrote has to come from somewhere, and Avro says it comes
 /// from this.
-const AVRO_FIELD_DEFAULT_KEY: &str = "avro.field.default";
+pub(crate) const AVRO_FIELD_DEFAULT_KEY: &str = "avro.field.default";
 
 /// Project `batch` to `target` schema: reorder by name, null-fill missing
 /// nullable columns, evolve types. Identity-cheap when schemas already match.

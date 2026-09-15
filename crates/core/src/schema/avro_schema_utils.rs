@@ -133,76 +133,93 @@ pub(crate) fn avro_schema_json_equivalent(a_json: &str, b_json: &str) -> crate::
     Ok(a == b)
 }
 
-/// A writer schema that makes every field of `reader_json` that declares a
-/// non-null `default` reader-only, at every depth, while leaving every other
-/// field resolving to itself.
+/// `schema` with every field that `reader_json` declares a `default` for
+/// carrying that default as `avro.field.default` metadata, at every depth.
 ///
-/// It is `reader_json` with each such field renamed to a name nothing in its
-/// record answers to (and stripped of its aliases, which would otherwise match
-/// it back). Resolving `reader_json` against it has no promotion to refuse —
-/// every surviving field is its own type — so `arrow-avro` always builds it,
-/// and stamps each renamed field's declared default on the result exactly as it
-/// does for a field a real writer never wrote.
+/// `schema` must be the Arrow conversion of `reader_json` itself; fields are
+/// matched by name and nested types by position in the Avro tree (a record's
+/// fields, an array's items, a map's values, a union's branches). The metadata
+/// value is the default's JSON text, which is how `arrow-avro` stamps it on a
+/// schema it resolved and what [`project_batch_to_schema`] reads to fill a field
+/// the source never wrote. Nothing else about `schema` changes.
 ///
-/// This is what the log rewrite takes its defaults from when the block's real
-/// writer schema cannot be resolved against the reader: that refusal is the
-/// very evolution the rewrite exists for, and a rewrite without defaults would
-/// fill a reader-only field with NULL where the schema declares its value.
-/// A default stamped on a field the real writer DID write is inert, because a
-/// default is consulted only for a field absent from the batch.
+/// This is what the log rewrite takes its defaults from. It used to take them
+/// from a schema `arrow-avro` resolved against the block's writer, which fails
+/// twice over: `arrow-avro` refuses to resolve exactly the evolutions the
+/// rewrite exists for (`int -> string`), and when it does resolve, a named type
+/// referenced after the record that defines it closes comes back in the
+/// WRITER's shape, without the fields — and so without the defaults — the
+/// evolution added. The defaults are the reader's, so they are read from the
+/// reader schema.
 ///
-/// A field whose default is `null` is left alone. Filling it with its default
-/// and filling it with no default are the same null, and renaming it would hide
-/// the defaults of any record nested inside it — the common shape, since a
-/// nullable record column is declared `"default": null`. A field with a non-null
-/// default on a record type does hide its nested defaults, but a default on a
-/// nested type is refused when it is materialised anyway
-/// (`batch_evolution::constant_array_from_avro_default`).
+/// A name that does not resolve, or a union whose branch count disagrees with
+/// the Arrow union, is left unstamped rather than guessed at: the fill then
+/// behaves as it would with no default declared. A recursive reference stops at
+/// the first repeat.
 ///
-/// Only schema positions are walked (`fields`, a field's `type`, `items`,
-/// `values`, union branches), never a `default` payload. A renamed field keeps
-/// its type, so a named type it defines is still defined for any later
-/// reference to it.
-pub(crate) fn defaults_carrier_writer_json(reader_json: &str) -> crate::Result<String> {
+/// [`project_batch_to_schema`]: crate::schema::batch_evolution::project_batch_to_schema
+pub(crate) fn with_avro_defaults(
+    schema: &arrow_schema::Schema,
+    reader_json: &str,
+) -> crate::Result<arrow_schema::Schema> {
+    use arrow_schema::Field;
     use serde_json::Value;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
-    fn walk(node: &mut Value) {
+    const PRIMITIVES: [&str; 8] = [
+        "null", "boolean", "int", "long", "float", "double", "bytes", "string",
+    ];
+
+    fn full_name(name: &str, namespace: Option<&str>) -> String {
+        match namespace {
+            Some(ns) if !name.contains('.') && !ns.is_empty() => format!("{ns}.{name}"),
+            _ => name.to_string(),
+        }
+    }
+
+    /// The namespace a named type's own children resolve names against.
+    fn own_namespace<'a>(
+        node: &'a serde_json::Map<String, Value>,
+        enclosing: Option<&'a str>,
+    ) -> Option<&'a str> {
+        let name = node.get("name").and_then(Value::as_str);
+        match (
+            node.get("namespace").and_then(Value::as_str),
+            name.and_then(|n| n.rsplit_once('.')),
+        ) {
+            (_, Some((ns, _))) => Some(ns),
+            (Some(ns), None) => Some(ns),
+            (None, None) => enclosing,
+        }
+    }
+
+    /// Every named type (record, enum, fixed) by full name.
+    fn register<'a>(
+        node: &'a Value,
+        namespace: Option<&'a str>,
+        named: &mut HashMap<String, &'a Value>,
+    ) {
         match node {
-            Value::Array(branches) => branches.iter_mut().for_each(walk),
+            Value::Array(branches) => branches.iter().for_each(|b| register(b, namespace, named)),
             Value::Object(map) => {
-                if let Some(Value::Array(fields)) = map.get_mut("fields") {
-                    let taken: std::collections::HashSet<String> = fields
-                        .iter()
-                        .flat_map(|f| {
-                            let aliases = f["aliases"].as_array().cloned().unwrap_or_default();
-                            std::iter::once(f["name"].clone()).chain(aliases)
-                        })
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect();
-                    let mut next = 0usize;
-                    for field in fields.iter_mut() {
-                        let Value::Object(field) = field else {
-                            continue;
-                        };
-                        if let Some(ty) = field.get_mut("type") {
-                            walk(ty);
-                        }
-                        if field.get("default").is_some_and(|d| !d.is_null()) {
-                            let fresh = loop {
-                                let candidate = format!("_default_carrier_{next}");
-                                next += 1;
-                                if !taken.contains(&candidate) {
-                                    break candidate;
-                                }
-                            };
-                            field.insert("name".to_string(), Value::String(fresh));
-                            field.remove("aliases");
+                let inner = own_namespace(map, namespace);
+                if let (Some(name), Some("record" | "error" | "enum" | "fixed")) = (
+                    map.get("name").and_then(Value::as_str),
+                    map.get("type").and_then(Value::as_str),
+                ) {
+                    named.entry(full_name(name, inner)).or_insert(node);
+                }
+                if let Some(Value::Array(fields)) = map.get("fields") {
+                    for field in fields {
+                        if let Some(ty) = field.get("type") {
+                            register(ty, inner, named);
                         }
                     }
                 }
                 for key in ["items", "values", "type"] {
-                    if let Some(child @ (Value::Object(_) | Value::Array(_))) = map.get_mut(key) {
-                        walk(child);
+                    if let Some(child @ (Value::Object(_) | Value::Array(_))) = map.get(key) {
+                        register(child, inner, named);
                     }
                 }
             }
@@ -210,11 +227,197 @@ pub(crate) fn defaults_carrier_writer_json(reader_json: &str) -> crate::Result<S
         }
     }
 
-    let mut schema: Value = serde_json::from_str(reader_json)
+    struct Stamper<'a> {
+        named: HashMap<String, &'a Value>,
+        in_progress: Vec<String>,
+    }
+
+    impl<'a> Stamper<'a> {
+        fn stamp_fields(
+            &mut self,
+            fields_json: &'a [Value],
+            fields: &arrow_schema::Fields,
+            namespace: Option<&'a str>,
+        ) -> Vec<arrow_schema::FieldRef> {
+            fields
+                .iter()
+                .map(|field| {
+                    let Some(json) = fields_json
+                        .iter()
+                        .find(|f| f.get("name").and_then(Value::as_str) == Some(field.name()))
+                    else {
+                        return field.clone();
+                    };
+                    let data_type = match json.get("type") {
+                        Some(ty) => self.stamp_type(ty, field.data_type(), namespace),
+                        None => field.data_type().clone(),
+                    };
+                    let mut metadata = field.metadata().clone();
+                    if let Some(default) = json.get("default") {
+                        metadata.insert(
+                            crate::schema::batch_evolution::AVRO_FIELD_DEFAULT_KEY.to_string(),
+                            default.to_string(),
+                        );
+                    }
+                    Arc::new(
+                        Field::new(field.name(), data_type, field.is_nullable())
+                            .with_metadata(metadata),
+                    )
+                })
+                .collect()
+        }
+
+        fn stamp_child(
+            &mut self,
+            ty: &'a Value,
+            field: &arrow_schema::FieldRef,
+            namespace: Option<&'a str>,
+        ) -> arrow_schema::FieldRef {
+            let data_type = self.stamp_type(ty, field.data_type(), namespace);
+            Arc::new(field.as_ref().clone().with_data_type(data_type))
+        }
+
+        fn stamp_type(
+            &mut self,
+            ty: &'a Value,
+            data_type: &DataType,
+            namespace: Option<&'a str>,
+        ) -> DataType {
+            match ty {
+                Value::String(name) if PRIMITIVES.contains(&name.as_str()) => data_type.clone(),
+                Value::String(name) => {
+                    let key = [full_name(name, namespace), name.clone()]
+                        .into_iter()
+                        .find(|k| self.named.contains_key(k));
+                    match key {
+                        Some(key) if !self.in_progress.contains(&key) => {
+                            let definition = self.named[&key];
+                            self.in_progress.push(key);
+                            let stamped = self.stamp_type(definition, data_type, namespace);
+                            self.in_progress.pop();
+                            stamped
+                        }
+                        _ => data_type.clone(),
+                    }
+                }
+                Value::Array(branches) => {
+                    let non_null: Vec<&'a Value> = branches
+                        .iter()
+                        .filter(|b| b.as_str() != Some("null"))
+                        .collect();
+                    match data_type {
+                        DataType::Union(union_fields, mode)
+                            if union_fields.len() == branches.len() =>
+                        {
+                            let (ids, fields): (Vec<i8>, Vec<arrow_schema::FieldRef>) =
+                                union_fields
+                                    .iter()
+                                    .zip(branches)
+                                    .map(|((id, f), branch)| {
+                                        (id, self.stamp_child(branch, f, namespace))
+                                    })
+                                    .unzip();
+                            match arrow_schema::UnionFields::try_new(ids, fields) {
+                                Ok(stamped) => DataType::Union(stamped, *mode),
+                                Err(_) => data_type.clone(),
+                            }
+                        }
+                        DataType::Union(..) => data_type.clone(),
+                        _ if branches.len() == 2 && non_null.len() == 1 => {
+                            self.stamp_type(non_null[0], data_type, namespace)
+                        }
+                        _ => data_type.clone(),
+                    }
+                }
+                Value::Object(map) => {
+                    let inner = own_namespace(map, namespace);
+                    match (map.get("type"), data_type) {
+                        (Some(Value::String(kind)), DataType::Struct(fields))
+                            if kind == "record" || kind == "error" =>
+                        {
+                            match map.get("fields") {
+                                Some(Value::Array(fields_json)) => DataType::Struct(
+                                    self.stamp_fields(fields_json, fields, inner).into(),
+                                ),
+                                _ => data_type.clone(),
+                            }
+                        }
+                        (Some(Value::String(kind)), DataType::List(item)) if kind == "array" => {
+                            match map.get("items") {
+                                Some(items) => DataType::List(self.stamp_child(items, item, inner)),
+                                None => data_type.clone(),
+                            }
+                        }
+                        (Some(Value::String(kind)), DataType::LargeList(item))
+                            if kind == "array" =>
+                        {
+                            match map.get("items") {
+                                Some(items) => {
+                                    DataType::LargeList(self.stamp_child(items, item, inner))
+                                }
+                                None => data_type.clone(),
+                            }
+                        }
+                        (Some(Value::String(kind)), DataType::Map(entries, sorted))
+                            if kind == "map" =>
+                        {
+                            match (map.get("values"), entries.data_type()) {
+                                (Some(values), DataType::Struct(kv)) if kv.len() == 2 => {
+                                    let kv: Vec<arrow_schema::FieldRef> = vec![
+                                        kv[0].clone(),
+                                        self.stamp_child(values, &kv[1], inner),
+                                    ];
+                                    DataType::Map(
+                                        Arc::new(
+                                            entries
+                                                .as_ref()
+                                                .clone()
+                                                .with_data_type(DataType::Struct(kv.into())),
+                                        ),
+                                        *sorted,
+                                    )
+                                }
+                                _ => data_type.clone(),
+                            }
+                        }
+                        // `{"type": <schema>}` wrapping another schema, or a
+                        // primitive carrying a logical type.
+                        (Some(inner_ty @ (Value::Object(_) | Value::Array(_))), _) => {
+                            self.stamp_type(inner_ty, data_type, namespace)
+                        }
+                        (Some(inner_ty @ Value::String(name)), _)
+                            if !matches!(
+                                name.as_str(),
+                                "record" | "error" | "array" | "map" | "enum" | "fixed"
+                            ) =>
+                        {
+                            self.stamp_type(inner_ty, data_type, namespace)
+                        }
+                        _ => data_type.clone(),
+                    }
+                }
+                _ => data_type.clone(),
+            }
+        }
+    }
+
+    let reader: Value = serde_json::from_str(reader_json)
         .map_err(|e| crate::error::CoreError::Schema(format!("bad reader avro json: {e}")))?;
-    walk(&mut schema);
-    serde_json::to_string(&schema)
-        .map_err(|e| crate::error::CoreError::Schema(format!("serialize avro json: {e}")))
+    let Some(Value::Array(fields_json)) = reader.get("fields") else {
+        return Ok(schema.clone());
+    };
+    let mut named = HashMap::new();
+    register(&reader, None, &mut named);
+    let namespace = reader.as_object().and_then(|m| own_namespace(m, None));
+    let mut stamper = Stamper {
+        named,
+        in_progress: Vec::new(),
+    };
+    let fields = stamper.stamp_fields(fields_json, schema.fields(), namespace);
+    Ok(arrow_schema::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
 }
 
 /// Append top-level field definitions (copied verbatim from `source_json`) to
@@ -712,113 +915,224 @@ mod tests {
             "a record default whose field is named `doc` is data"
         );
     }
-
-    /// `defaults_carrier_writer_json` renames away exactly the fields that declare
-    /// a default, at every depth, and resolving the reader against the result
-    /// stamps each of those defaults — including nested ones — while the fields
-    /// without one resolve to themselves.
+    /// `with_avro_defaults` stamps each declared default as its JSON text at every
+    /// depth — record fields, array items, map values, nullable and general union
+    /// branches, named types referenced by simple or full name anywhere after their
+    /// definition — changes nothing else, and terminates on a recursive reference.
     #[test]
-    fn the_defaults_carrier_makes_every_defaulted_field_reader_only() {
-        use arrow_schema::DataType;
-        let reader = r#"{"type":"record","name":"R","fields":[
+    fn with_avro_defaults_stamps_every_declared_default_at_every_depth() {
+        use arrow_schema::{DataType, Field};
+        let reader = r#"{"type":"record","name":"R","namespace":"top","fields":[
             {"name":"id","type":"long"},
-            {"name":"_default_carrier_0","type":"int"},
-            {"name":"flag","type":"boolean","default":true,"aliases":["id"]},
-            {"name":"s","type":["null",{"type":"record","name":"S","fields":[
-                {"name":"x","type":"int","default":5},
-                {"name":"y","type":"string"}
-            ]}],"default":null},
-            {"name":"again","type":["null","S"]},
-            {"name":"arr","type":{"type":"array","items":{"type":"record","name":"A","fields":[
-                {"name":"a","type":"long","default":9}
-            ]}}},
+            {"name":"flag","type":"boolean","default":true},
+            {"name":"note","type":["null","string"],"default":null},
+            {"name":"a","type":{"type":"record","name":"A","namespace":"other","fields":[
+                {"name":"s","type":{"type":"record","name":"S","fields":[
+                    {"name":"x","type":"int","default":5},
+                    {"name":"y","type":"string"}]}}]}},
+            {"name":"by_full_name","type":["null","other.S"],"default":null},
+            {"name":"arr","type":{"type":"array","items":{"type":"record","name":"I","fields":[
+                {"name":"i","type":"long","default":9}]}}},
             {"name":"m","type":{"type":"map","values":{"type":"record","name":"V","fields":[
-                {"name":"v","type":"string","default":"z"}
-            ]}}},
-            {"name":"rec_default","type":{"type":"record","name":"D","fields":[
-                {"name":"d","type":"int"}
-            ]},"default":{"d":1,"fields":[{"name":"not_a_schema","default":0}]}}
+                {"name":"v","type":{"type":"string","logicalType":"uuid"},"default":"z"}]}}},
+            {"name":"u","type":["int",{"type":"record","name":"U","fields":[
+                {"name":"w","type":"double","default":1.5}]}]},
+            {"name":"node","type":{"type":"record","name":"Node","fields":[
+                {"name":"next","type":["null","Node"],"default":null},
+                {"name":"d","type":"int","default":0}]}},
+            {"name":"after","type":"I"}
         ]}"#;
-        let carrier = defaults_carrier_writer_json(reader).unwrap();
-        let carrier_value: serde_json::Value = serde_json::from_str(&carrier).unwrap();
-        let top: Vec<&str> = carrier_value["fields"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["name"].as_str().unwrap())
-            .collect();
-        // `flag` and `rec_default` declare non-null defaults; `s` declares a null
-        // one and is kept, so the record inside it is still walked. The name
-        // already taken by a real field is skipped, and the alias that would
-        // match `id` is gone.
-        assert_eq!(
-            top,
-            [
-                "id",
-                "_default_carrier_0",
-                "_default_carrier_1",
-                "s",
-                "again",
+        // A stand-in for the Arrow conversion: the recursive `node.next` is cut
+        // at one level, which is all an Arrow schema can hold.
+        let s_struct = || {
+            DataType::Struct(
+                vec![
+                    Field::new("x", DataType::Int32, false),
+                    Field::new("y", DataType::Utf8, false),
+                ]
+                .into(),
+            )
+        };
+        let i_struct = || DataType::Struct(vec![Field::new("i", DataType::Int64, false)].into());
+        let node_leaf = DataType::Struct(vec![Field::new("d", DataType::Int32, false)].into());
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("flag", DataType::Boolean, false),
+            Field::new("note", DataType::Utf8, true),
+            Field::new(
+                "a",
+                DataType::Struct(vec![Field::new("s", s_struct(), false)].into()),
+                false,
+            ),
+            Field::new("by_full_name", s_struct(), true),
+            Field::new(
                 "arr",
+                DataType::List(Arc::new(Field::new("item", i_struct(), false))),
+                false,
+            ),
+            Field::new(
                 "m",
-                "_default_carrier_2"
-            ]
-        );
-        assert!(carrier_value["fields"][2].get("aliases").is_none());
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("key", DataType::Utf8, false),
+                                Field::new(
+                                    "value",
+                                    DataType::Struct(
+                                        vec![Field::new("v", DataType::FixedSizeBinary(16), false)]
+                                            .into(),
+                                    ),
+                                    false,
+                                ),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                false,
+            ),
+            Field::new(
+                "u",
+                DataType::Union(
+                    arrow_schema::UnionFields::try_new(
+                        vec![0, 1],
+                        vec![
+                            Field::new("int", DataType::Int32, false),
+                            Field::new(
+                                "U",
+                                DataType::Struct(
+                                    vec![Field::new("w", DataType::Float64, false)].into(),
+                                ),
+                                false,
+                            ),
+                        ],
+                    )
+                    .unwrap(),
+                    arrow_schema::UnionMode::Dense,
+                ),
+                false,
+            ),
+            Field::new(
+                "node",
+                DataType::Struct(
+                    vec![
+                        Field::new("next", node_leaf, true),
+                        Field::new("d", DataType::Int32, false),
+                    ]
+                    .into(),
+                ),
+                false,
+            ),
+            Field::new("after", i_struct(), false),
+        ]);
+
+        let stamped = with_avro_defaults(&schema, reader).unwrap();
+        let default_of = |f: &Field| f.metadata().get("avro.field.default").cloned();
+        let child = |dt: &DataType, name: &str| -> Field {
+            match dt {
+                DataType::Struct(fields) => fields
+                    .iter()
+                    .find(|f| f.name() == name)
+                    .unwrap_or_else(|| panic!("no child {name}"))
+                    .as_ref()
+                    .clone(),
+                other => panic!("{other} is not a struct"),
+            }
+        };
+        let top = |name: &str| stamped.field_with_name(name).unwrap().clone();
+
+        assert_eq!(default_of(&top("id")), None);
+        assert_eq!(default_of(&top("flag")).as_deref(), Some("true"));
+        assert_eq!(default_of(&top("note")).as_deref(), Some("null"));
+        let s_in_a = child(top("a").data_type(), "s");
         assert_eq!(
-            carrier_value["fields"][3]["type"][1]["fields"][0]["name"],
-            "_default_carrier_0"
+            default_of(&child(s_in_a.data_type(), "x")).as_deref(),
+            Some("5")
+        );
+        assert_eq!(default_of(&child(s_in_a.data_type(), "y")), None);
+        assert_eq!(
+            default_of(&child(top("by_full_name").data_type(), "x")).as_deref(),
+            Some("5"),
+            "a reference by full name, after its definition closed"
+        );
+        let DataType::List(item) = top("arr").data_type().clone() else {
+            panic!("arr")
+        };
+        assert_eq!(
+            default_of(&child(item.data_type(), "i")).as_deref(),
+            Some("9")
+        );
+        let DataType::Map(entries, _) = top("m").data_type().clone() else {
+            panic!("m")
+        };
+        let value = child(entries.data_type(), "value");
+        assert_eq!(
+            default_of(&child(value.data_type(), "v")).as_deref(),
+            Some("\"z\"")
+        );
+        let DataType::Union(branches, _) = top("u").data_type().clone() else {
+            panic!("u")
+        };
+        assert_eq!(
+            default_of(&child(branches.iter().nth(1).unwrap().1.data_type(), "w")).as_deref(),
+            Some("1.5")
+        );
+        let node = top("node");
+        assert_eq!(
+            default_of(&child(node.data_type(), "next")).as_deref(),
+            Some("null")
         );
         assert_eq!(
-            carrier_value["fields"][7]["default"]["fields"][0]["name"], "not_a_schema",
-            "a default payload is data, not a schema, and is never rewritten"
+            default_of(&child(node.data_type(), "d")).as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            default_of(&child(child(node.data_type(), "next").data_type(), "d")).as_deref(),
+            Some("0"),
+            "a recursive reference stamps the level the Arrow schema holds, and terminates"
+        );
+        assert_eq!(
+            default_of(&child(top("after").data_type(), "i")).as_deref(),
+            Some("9")
         );
 
-        let resolved = crate::file_group::log_file::avro::AvroBlockDecoder::try_new_with_reader(
-            &carrier,
-            Some(reader),
-            1,
-        )
-        .expect("a reader always resolves against its own defaults carrier")
-        .schema();
-        let default_of = |field: &arrow_schema::Field| {
-            field
-                .metadata()
-                .get("avro.field.default")
-                .cloned()
-                .unwrap_or_default()
+        // Nothing but the metadata changed.
+        let strip = |schema: &Schema| {
+            fn strip_dt(dt: &DataType) -> DataType {
+                match dt {
+                    DataType::Struct(fs) => DataType::Struct(
+                        fs.iter().map(|f| strip_field(f)).collect::<Vec<_>>().into(),
+                    ),
+                    DataType::List(f) => DataType::List(Arc::new(strip_field(f))),
+                    DataType::Map(f, s) => DataType::Map(Arc::new(strip_field(f)), *s),
+                    DataType::Union(fs, m) => DataType::Union(
+                        arrow_schema::UnionFields::try_new(
+                            fs.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                            fs.iter().map(|(_, f)| strip_field(f)).collect::<Vec<_>>(),
+                        )
+                        .unwrap(),
+                        *m,
+                    ),
+                    other => other.clone(),
+                }
+            }
+            fn strip_field(f: &Field) -> Field {
+                let mut md = f.metadata().clone();
+                md.remove("avro.field.default");
+                Field::new(f.name(), strip_dt(f.data_type()), f.is_nullable()).with_metadata(md)
+            }
+            Schema::new(
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| strip_field(f))
+                    .collect::<Vec<_>>(),
+            )
         };
-        assert_eq!(
-            default_of(resolved.field_with_name("flag").unwrap()),
-            "true"
-        );
-        assert_eq!(default_of(resolved.field_with_name("id").unwrap()), "");
-        // `again` references `S` by name; the carrier's `S` still defines it.
-        for name in ["s", "again"] {
-            let DataType::Struct(children) = resolved.field_with_name(name).unwrap().data_type()
-            else {
-                panic!("{name} is a struct");
-            };
-            assert_eq!(children.len(), 2);
-            assert_eq!(default_of(&children[0]), "5", "{name}.x");
-            assert_eq!(default_of(&children[1]), "", "{name}.y");
-        }
-        let DataType::List(item) = resolved.field_with_name("arr").unwrap().data_type() else {
-            panic!("arr is a list");
-        };
-        let DataType::Struct(a) = item.data_type() else {
-            panic!("arr items are records");
-        };
-        assert_eq!(default_of(&a[0]), "9");
-        let DataType::Map(entries, _) = resolved.field_with_name("m").unwrap().data_type() else {
-            panic!("m is a map");
-        };
-        let DataType::Struct(kv) = entries.data_type() else {
-            panic!("map entries are a struct");
-        };
-        let DataType::Struct(v) = kv[1].data_type() else {
-            panic!("map values are records");
-        };
-        assert_eq!(default_of(&v[0]), "\"z\"");
+        assert_eq!(strip(&stamped), schema);
     }
 }
