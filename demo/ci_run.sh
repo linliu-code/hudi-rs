@@ -17,6 +17,21 @@
 # specific language governing permissions and limitations
 # under the License.
 #
+# Fail on the first failing step, so a failing app turns the job red
+set -e
+
+# Always tear down the compose stack to release file locks and avoid cache save issues,
+# then exit with the status of the step that ended the script
+teardown() {
+  status=$?
+  docker compose down -v || echo 'Warning: Failed to tear down compose stack' >&2
+  if [ $status -ne 0 ]; then
+    echo "ci_run.sh failed with exit status $status" >&2
+  fi
+  exit $status
+}
+trap teardown EXIT
+
 # Enable BuildKit for faster, cache-friendly builds
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
@@ -82,6 +97,3 @@ else
   echo "Unknown app path: $app_path"
   exit 1
 fi
-
-# Always tear down the compose stack to release file locks and avoid cache save issues
-docker compose down -v || echo 'Warning: Failed to tear down compose stack' >&2
