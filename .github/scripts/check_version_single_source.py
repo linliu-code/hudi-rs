@@ -108,15 +108,18 @@ DEP_KINDS = ("dependencies", "dev-dependencies", "build-dependencies")
 ENTRY = re.compile(r"""^("[^"]*"|'[^']*'|[A-Za-z0-9_.-]+)\s*=\s*(.*)$""")
 # Values may be basic ("...") or literal ('...') strings; exactly one of the two groups matches.
 _STRING = r"""(?:"([^"]*)"|'([^']*)')"""
-KEY_PATH = re.compile(r"(?<![A-Za-z0-9_-])path\s*=\s*" + _STRING)
-KEY_VERSION = re.compile(r"(?<![A-Za-z0-9_-])version\s*=\s*" + _STRING)
-KEY_PACKAGE = re.compile(r"(?<![A-Za-z0-9_-])package\s*=\s*" + _STRING)
+# The key itself may be bare or quoted (`"version" = ...` is the same key). Search with find_key(),
+# which ignores a match that sits inside a string value.
+KEY_PATH = re.compile(r"""(?<![A-Za-z0-9_-])(?:path|"path"|'path')\s*=\s*""" + _STRING)
+KEY_VERSION = re.compile(r"""(?<![A-Za-z0-9_-])(?:version|"version"|'version')\s*=\s*""" + _STRING)
+KEY_PACKAGE = re.compile(r"""(?<![A-Za-z0-9_-])(?:package|"package"|'package')\s*=\s*""" + _STRING)
 # A dependency that names a registry or a git source is not the workspace's own crate, whatever
 # its name.
 KEY_ELSEWHERE = re.compile(r"(?<![A-Za-z0-9_-])(git|registry)\s*=")
 # `name = "1.2.3"` and `name = '1.2.3'`: a dependency given as a bare version requirement.
 STRING_VALUE = re.compile(r"""^("([^"]*)"|'([^']*)')$""")
 UNPARSED = "__UNPARSED__"
+TRIPLE_QUOTE = re.compile(r"\"\"\"|\'\'\'")
 
 
 class Dep(NamedTuple):
@@ -164,6 +167,28 @@ def blank_strings(code: str) -> str:
             out.append(ch)
         i += 1
     return "".join(out)
+
+
+def find_key(pattern: re.Pattern, text: str) -> re.Match | None:
+    """The first match of a KEY_* pattern that is not inside a string value.
+
+    `features = ["version = '1'"]` contains the text of a version key, but not the key.
+    """
+    bare = blank_strings(text)
+    for m in pattern.finditer(text):
+        if bare[m.start()] == text[m.start()]:
+            return m
+    return None
+
+
+def manifest_lines(text: str, keepends: bool = False) -> list[str]:
+    """Splits a manifest on LF only.
+
+    `str.splitlines()` also splits on U+2028, U+0085 and friends, which TOML allows inside comments
+    and strings. With keepends=False the line ending (LF or CRLF) is removed.
+    """
+    kept = [part for part in re.split(r"(?<=\n)", text) if part]
+    return kept if keepends else [part.rstrip("\n").rstrip("\r") for part in kept]
 
 
 def depth(code: str, opener: str, closer: str) -> int:
@@ -254,7 +279,7 @@ def header(line: str) -> tuple[str, re.Match] | None:
 
 def version_line_in(lines: list[str], indices) -> int | None:
     for j in indices:
-        if KEY_VERSION.search(code_part(lines[j])):
+        if find_key(KEY_VERSION, code_part(lines[j])):
             return j
     return None
 
@@ -266,13 +291,14 @@ def dep_entries(text: str):
     strings `name = "<requirement>"`, quoted keys, dotted keys (`name.workspace = true`,
     `name.version = "..."`, gathered per dependency), and `[dependencies.name]` sub-tables.
     Comments are ignored, including a `#` after a section header or a value. Yields
-    Dep(UNPARSED, <what>, "", None) for any other shape, so the caller fails loudly instead of
-    reporting a skipped dependency as a clean one.
+    Dep(UNPARSED, <what>, "", None) for any other shape -- including any multi-line (triple-quoted)
+    string, whose quotes this line-based reader cannot track -- so the caller fails loudly instead
+    of reporting a skipped dependency as a clean one.
 
     Hand-rolled rather than via `tomllib`, which only exists on Python 3.11+ -- this has to run
     on whatever python3 a contributor's machine and the CI runner happen to have.
     """
-    lines = text.splitlines()
+    lines = manifest_lines(text)
     table = None
     dotted: dict[str, list[int]] = {}
 
@@ -298,7 +324,10 @@ def dep_entries(text: str):
                     j += 1
                 body = range(i + 1, j)
                 spec = "\n".join(code_part(lines[k]) for k in body)
-                yield Dep(kind[0], kind[1], spec, version_line_in(lines, body))
+                if TRIPLE_QUOTE.search(spec):
+                    yield Dep(UNPARSED, f"[{kind[0]}.{kind[1]}] uses a multi-line string", "", None)
+                else:
+                    yield Dep(kind[0], kind[1], spec, version_line_in(lines, body))
                 i = j
                 continue
             if kind:
@@ -316,43 +345,29 @@ def dep_entries(text: str):
             continue
         key, value = split_key(m.group(1)), m.group(2).strip()
         name = unquote(key[0])
-        if value.startswith("["):
-            # A multi-line array (`name.features = [` ... `]`): consume its continuation lines.
-            start = i
-            level = depth(value, "[", "]")
+        start = i
+        if value.startswith(("[", "{")) and not TRIPLE_QUOTE.search(value):
+            # A value that may continue on later lines: consume them, up to the next header.
+            opener, closer = ("[", "]") if value.startswith("[") else ("{", "}")
+            level = depth(value, opener, closer)
             while level > 0 and i + 1 < len(lines) and not header(lines[i + 1]):
                 i += 1
-                level += depth(code_part(lines[i]), "[", "]")
+                level += depth(code_part(lines[i]), opener, closer)
+            shape = "array" if opener == "[" else "inline table"
             if level > 0:
-                yield Dep(UNPARSED, f"[{table}] {name} has an unterminated array", "", None)
+                yield Dep(UNPARSED, f"[{table}] {name} has an unterminated {shape}", "", None)
                 i += 1
                 continue
-            if len(key) == 2:
-                dotted.setdefault(name, []).append(start)
-            else:
-                yield Dep(UNPARSED, f"[{table}] {name} = {value}", "", None)
-            i += 1
-            continue
-        if len(key) == 2:
-            dotted.setdefault(name, []).append(i)
-            i += 1
-            continue
-        if len(key) > 2:
+        span = range(start, i + 1)
+        if any(TRIPLE_QUOTE.search(code_part(lines[k])) for k in span):
+            yield Dep(UNPARSED, f"[{table}] {name} uses a multi-line string", "", None)
+        elif len(key) == 2:
+            dotted.setdefault(name, []).append(start)
+        elif len(key) > 2:
             yield Dep(UNPARSED, f"[{table}] {name} written as the dotted key `{m.group(1)}`", "", None)
-            i += 1
-            continue
-        if value.startswith("{"):
-            start = i
-            level = depth(value, "{", "}")
-            while level > 0 and i + 1 < len(lines) and not header(lines[i + 1]):
-                i += 1
-                level += depth(code_part(lines[i]), "{", "}")
-            if level > 0:
-                yield Dep(UNPARSED, f"[{table}] {name} has an unterminated inline table", "", None)
-                i += 1
-                continue
+        elif value.startswith("{"):
             spec = "\n".join([value] + [code_part(lines[k]) for k in range(start + 1, i + 1)])
-            yield Dep(table, name, spec, version_line_in(lines, range(start, i + 1)))
+            yield Dep(table, name, spec, version_line_in(lines, span))
         elif STRING_VALUE.match(value):
             sm = STRING_VALUE.match(value)
             requirement = sm.group(2) if sm.group(2) is not None else sm.group(3)
@@ -367,7 +382,7 @@ def rewrite_version(line: str, want: str) -> str:
     """Rewrites the version literal in one manifest line, leaving any trailing comment alone."""
     code = code_part(line)
     rest = line[len(code):]
-    m = KEY_VERSION.search(code)
+    m = find_key(KEY_VERSION, code)
     if m:
         _, start, end = string_value(m)
         return code[:start] + want + code[end:] + rest
@@ -391,7 +406,7 @@ def workspace_members() -> list[str]:
     its own unrelated version on purpose and is none of this checker's business: it is not part of
     this workspace and nothing published from here derives from it.
     """
-    text = "\n".join(code_part(line) for line in (ROOT / "Cargo.toml").read_text().splitlines())
+    text = "\n".join(code_part(line) for line in manifest_lines((ROOT / "Cargo.toml").read_text(encoding="utf-8")))
     block = re.search(r"^\[workspace\]\s*$(.*?)(?=^\[)", text, re.M | re.S)
     if not block:
         raise SystemExit("Cargo.toml has no [workspace] section, so rule 0 cannot know what the "
@@ -420,7 +435,7 @@ PACKAGE_NAME = re.compile(r'^name\s*=\s*"([^"]+)"')
 def package_section(text: str):
     """Yields the stripped lines of a manifest's own `[package]` section."""
     section = ""
-    for line in text.splitlines():
+    for line in manifest_lines(text):
         stripped = code_part(line).strip()
         m = ARRAY_SECTION.match(stripped) or SECTION.match(stripped)
         if m:
@@ -482,6 +497,21 @@ def tracked_files() -> list[str]:
     return [line for line in out.stdout.splitlines() if line]
 
 
+def read_manifest(rel: str, failures: list[str], cache: dict[str, str | None]) -> str | None:
+    """The manifest's text, or None (with one failure recorded) if it is not valid UTF-8.
+
+    Read as bytes, not with read_text(): universal newlines would turn a CRLF manifest into LF
+    when --fix writes it back.
+    """
+    if rel not in cache:
+        try:
+            cache[rel] = (ROOT / rel).read_bytes().decode("utf-8")
+        except UnicodeDecodeError:
+            failures.append(f"{rel}: not valid UTF-8, which Cargo requires; it cannot be checked")
+            cache[rel] = None
+    return cache[rel]
+
+
 def main() -> int:
     fix = "--fix" in sys.argv[1:]
     want = authority()
@@ -499,8 +529,12 @@ def main() -> int:
     # dependency requirements, and the rule 2 sweep exempts Cargo.toml entirely. That is the exact
     # shape this milestone exists to make impossible, so it is checked rather than assumed.
     members = workspace_members()
+    manifests: dict[str, str | None] = {}
     for rel in members:
-        key = package_version_key((ROOT / rel).read_text())
+        text = read_manifest(rel, failures, manifests)
+        if text is None:
+            continue
+        key = package_version_key(text)
         if key is None:
             failures.append(
                 f"{rel}: workspace member has no `version` key in [package] -- it must read "
@@ -526,14 +560,15 @@ def main() -> int:
     # `hudi-core = "0.5.0"` has no path, but it is still a second copy of the project's version in
     # a published manifest. (A manifest outside the workspace, such as a demo app, may depend on a
     # released version from the registry on purpose, so there only a `path` makes it ours.)
-    member_names = {package_name((ROOT / rel).read_text()) for rel in members} - {None}
+    member_names = {package_name(manifests[rel]) for rel in members if manifests[rel] is not None} - {None}
     for rel in tracked:
         if Path(rel).name != "Cargo.toml":
             continue
         in_workspace = rel == "Cargo.toml" or rel in members
-        # Bytes, not read_text(): universal newlines would turn a CRLF manifest into LF on --fix.
-        text = (ROOT / rel).read_bytes().decode("utf-8")
-        lines_kept = text.splitlines(keepends=True)
+        text = read_manifest(rel, failures, manifests)
+        if text is None:
+            continue
+        lines_kept = manifest_lines(text, keepends=True)
         rewrites: dict[int, str] = {}
         for section, name, spec, version_line in dep_entries(text):
             if section == UNPARSED:
@@ -543,15 +578,15 @@ def main() -> int:
                     f"let a drifted version be reported as clean"
                 )
                 continue
-            renamed = KEY_PACKAGE.search(spec)
+            renamed = find_key(KEY_PACKAGE, spec)
             renamed = string_value(renamed)[0] if renamed else None
             # A bare `tpch = "0.3"` from the registry would still read as the member `tpch` here; no
             # such dependency exists, and one would be reported loudly rather than skipped.
             names_member = (in_workspace and not KEY_ELSEWHERE.search(spec)
                             and (renamed or name) in member_names)
-            if not KEY_PATH.search(spec) and not names_member:
+            if not find_key(KEY_PATH, spec) and not names_member:
                 continue  # not an intra-workspace dependency
-            got = KEY_VERSION.search(spec)
+            got = find_key(KEY_VERSION, spec)
             got = string_value(got)[0] if got else None
             if got is None:
                 continue  # path-only: cargo resolves it by path, there is no literal to drift

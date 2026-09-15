@@ -303,6 +303,49 @@ class Rule1Dependencies(CheckerTestCase):
         self.assertIn(f"hudi-core = {{ version = '{self.want}'", self.tree.read("crates/hudi/Cargo.toml"))
         self.assertPasses(self.tree.check())
 
+    def test_a_quoted_version_key_is_read_and_rewritten(self):
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
+                      'hudi-core = { "version" = "0.5.0", path = "../core", default-features = false }')
+        self.assertFails(self.tree.check(), 'hudi-core requests version "0.5.0"')
+        self.assertPasses(self.tree.check("--fix"))
+        self.assertIn(f'hudi-core = {{ "version" = "{self.want}"', self.tree.read("crates/hudi/Cargo.toml"))
+
+    def test_a_triple_quoted_value_fails_loudly_and_fix_leaves_it(self):
+        line = "hudi-core = { version = " + "'" * 3 + "0.5.0" + "'" * 3 + ', path = "../core" }'
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(), line)
+        self.assertFails(self.tree.check(), "uses a multi-line string")
+        self.assertEqual(self.tree.check("--fix").returncode, 1)
+        self.assertIn(line, self.tree.read("crates/hudi/Cargo.toml"))
+
+    def test_a_version_key_inside_a_string_is_not_the_version(self):
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
+                      "[dependencies.hudi-core]\nfeatures = [\"version = '1'\"]\n"
+                      'version = "0.5.0"\npath = "../core"\n\n[dependencies]')
+        self.assertFails(self.tree.check(), 'hudi-core requests version "0.5.0"')
+        self.assertPasses(self.tree.check("--fix"))
+        manifest = self.tree.read("crates/hudi/Cargo.toml")
+        self.assertIn("features = [\"version = '1'\"]", manifest)
+        self.assertIn(f'version = "{self.want}"', manifest)
+
+    def test_an_unterminated_inline_table_fails_loudly(self):
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(), 'hudi-core = { path = "../core",')
+        self.assertFails(self.tree.check(), "hudi-core has an unterminated inline table")
+
+    def test_an_unterminated_array_at_end_of_file_fails_loudly(self):
+        self.tree.append("crates/hudi/Cargo.toml", "\n[dev-dependencies]\nfoo.features = [\n")
+        self.assertFails(self.tree.check(), "foo has an unterminated array")
+
+    def test_a_line_separator_in_a_comment_does_not_start_a_new_line(self):
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
+                      f'hudi-core = {{ version = "{self.want}", path = "../core", default-features = false }}'
+                      ' # was hudi-core = { version = "0.5.0", path = "../core" }')
+        self.assertPasses(self.tree.check())
+
+    def test_a_manifest_that_is_not_utf8_fails_with_a_message(self):
+        path = self.tree.dir / "crates/hudi/Cargo.toml"
+        path.write_bytes(path.read_bytes() + b"\n# \xff\n")
+        self.assertFails(self.tree.check(), "crates/hudi/Cargo.toml: not valid UTF-8")
+
     def test_a_single_quoted_sub_table_is_read(self):
         self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
                       "[dependencies.hudi-core]\nversion = '0.5.0'\npath = '../core'\n\n[dependencies]")
