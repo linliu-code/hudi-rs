@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -45,13 +46,11 @@ ROOT = Path(__file__).resolve().parents[2]
 # Compared with the file's NAME, so `fooCargo.toml` is swept like any other file.
 LITERAL_ALLOWED_NAMES = ("Cargo.toml", "Cargo.lock")
 
-# One prose file is exempt: crates/jni/README.md records the versions of carriers that were
-# actually published, which are history and must NOT be rewritten by a bump. The exemption is
-# named rather than extended to `*.md`, because a blanket suffix rule would let a pinned version
-# in ANY document rot silently -- documentation that tells a reader to install the wrong version
-# is the same defect as a stale literal in a script, just slower to notice.
+# Exemptions are named files rather than a suffix rule such as `*.md`, because a blanket rule
+# would let a pinned version in ANY document rot silently -- documentation that tells a reader to
+# install the wrong version is the same defect as a stale literal in a script, just slower to
+# notice.
 SWEEP_SKIP_FILES = (
-    "crates/jni/README.md",
     # Release-process prose: its bump-rule sentence quotes three example versions (the
     # current dev version and the minor/major bumps of it) that are meant to stay as written
     # after every real bump. Upstream #749/#759 added the sentence; it is not a version site.
@@ -99,20 +98,60 @@ def authority_patterns(want: str) -> tuple[re.Pattern, re.Pattern]:
     return everywhere, re.compile(exact)
 
 
-SECTION = re.compile(r"^\[([^\[\]]+)\]\s*$")
+SECTION = re.compile(r"^\[([^\[\]]+)\]$")
 # `[[bench]]` / `[[bin]]` are array-of-table headers. Without matching them the previous
 # section stayed in force, so an inline table inside a `[[bench]]` that followed a
 # `[dependencies]` block was read AS a dependency -- a false failure, and under --fix a
 # rewrite of a line that is not a dependency requirement.
-ARRAY_SECTION = re.compile(r"^\[\[([^\[\]]+)\]\]\s*$")
+ARRAY_SECTION = re.compile(r"^\[\[([^\[\]]+)\]\]$")
 DEP_KINDS = ("dependencies", "dev-dependencies", "build-dependencies")
 ENTRY = re.compile(r"""^("[^"]*"|'[^']*'|[A-Za-z0-9_.-]+)\s*=\s*(.*)$""")
 KEY_PATH = re.compile(r'(?<![A-Za-z0-9_-])path\s*=\s*"([^"]*)"')
 KEY_VERSION = re.compile(r'(?<![A-Za-z0-9_-])version\s*=\s*"([^"]*)"')
 KEY_PACKAGE = re.compile(r'(?<![A-Za-z0-9_-])package\s*=\s*"([^"]*)"')
+# A dependency that names a registry or a git source is not the workspace's own crate, whatever
+# its name.
+KEY_ELSEWHERE = re.compile(r"(?<![A-Za-z0-9_-])(git|registry)\s*=")
 # `name = "1.2.3"` and `name = '1.2.3'`: a dependency given as a bare version requirement.
-STRING_VALUE = re.compile(r"""^("([^"]*)"|'([^']*)')\s*(#.*)?$""")
+STRING_VALUE = re.compile(r"""^("([^"]*)"|'([^']*)')$""")
 UNPARSED = "__UNPARSED__"
+
+
+class Dep(NamedTuple):
+    """One dependency as a manifest writes it.
+
+    `spec` is its keys as `key = value` text with comments removed, for KEY_* searches.
+    `version_line` is the index of the line holding its `version` literal (None if it has none),
+    so --fix rewrites that one line and never some other occurrence of the same text.
+    """
+
+    section: str
+    name: str
+    spec: str
+    version_line: int | None
+
+
+def code_part(line: str) -> str:
+    """Returns `line` without an unquoted trailing `# comment`, right-stripped.
+
+    A `#` inside a quoted string is kept. The result is always a prefix of `line`.
+    """
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#":
+            return line[:i].rstrip()
+        i += 1
+    return line.rstrip()
 
 
 def split_key(key: str) -> list[str]:
@@ -164,79 +203,119 @@ def dep_table(section: str) -> tuple[str, str | None] | None:
     return None
 
 
-def dep_entries(text: str):
-    """Yields (section, name, spec, raw) for every dependency in a manifest.
+def header(line: str) -> tuple[str, re.Match] | None:
+    code = code_part(line).strip()
+    m = ARRAY_SECTION.match(code)
+    if m:
+        return "array", m
+    m = SECTION.match(code)
+    return ("table", m) if m else None
 
-    `spec` is text KEY_PATH / KEY_VERSION / KEY_PACKAGE can be searched in, and `raw` is the exact
-    text the entry occupies in the manifest, so --fix can rewrite it in place. Handles four shapes:
-    `name = { ... }` inline tables (also split across lines), `name = "<requirement>"` bare
-    version strings, quoted keys, and `[dependencies.name]` sub-tables. Yields
-    (UNPARSED, <what>, "", "") for any other shape -- a dotted key such as
-    `hudi-core.version = "..."`, or a value that is neither a table nor a string -- so the caller
-    fails loudly instead of reporting a skipped dependency as a clean one.
+
+def version_line_in(lines: list[str], indices) -> int | None:
+    for j in indices:
+        if KEY_VERSION.search(code_part(lines[j])):
+            return j
+    return None
+
+
+def dep_entries(text: str):
+    """Yields a Dep for every dependency in a manifest.
+
+    Handles five shapes: `name = { ... }` inline tables (also split across lines), bare version
+    strings `name = "<requirement>"`, quoted keys, dotted keys (`name.workspace = true`,
+    `name.version = "..."`, gathered per dependency), and `[dependencies.name]` sub-tables.
+    Comments are ignored, including a `#` after a section header or a value. Yields
+    Dep(UNPARSED, <what>, "", None) for any other shape, so the caller fails loudly instead of
+    reporting a skipped dependency as a clean one.
 
     Hand-rolled rather than via `tomllib`, which only exists on Python 3.11+ -- this has to run
     on whatever python3 a contributor's machine and the CI runner happen to have.
     """
-    table = None
     lines = text.splitlines()
+    table = None
+    dotted: dict[str, list[int]] = {}
+
+    def flush():
+        # `hudi-core.version = "x"` and `hudi-core.path = "..."` read as `version = "x"` and
+        # `path = "..."` of one dependency.
+        for name, idxs in dotted.items():
+            spec = "\n".join(code_part(lines[j]).strip().split(".", 1)[1] for j in idxs)
+            yield Dep(table, name, spec, version_line_in(lines, idxs))
+        dotted.clear()
+
     i = 0
     while i < len(lines):
-        stripped = lines[i].strip()
-        m = ARRAY_SECTION.match(stripped)
-        if m:
-            table = None
-            i += 1
-            continue
-        m = SECTION.match(stripped)
-        if m:
-            kind = dep_table(m.group(1))
+        h = header(lines[i])
+        if h:
+            yield from flush()
+            kind = dep_table(h[1].group(1)) if h[0] == "table" else None
             table = None
             if kind and kind[1] is not None:
-                # Collect the sub-table's own keys, up to the next section header of any kind.
-                body, j = [], i + 1
-                while j < len(lines) and not (
-                    SECTION.match(lines[j].strip()) or ARRAY_SECTION.match(lines[j].strip())
-                ):
-                    body.append(lines[j])
+                # The sub-table's own keys, up to the next section header of any kind.
+                j = i + 1
+                while j < len(lines) and not header(lines[j]):
                     j += 1
-                raw = "\n".join(body)
-                yield kind[0], kind[1], raw, raw
+                body = range(i + 1, j)
+                spec = "\n".join(code_part(lines[k]) for k in body)
+                yield Dep(kind[0], kind[1], spec, version_line_in(lines, body))
                 i = j
                 continue
             if kind:
                 table = kind[0]
             i += 1
             continue
-        if table is None or not stripped or stripped.startswith("#"):
+        code = code_part(lines[i]).strip()
+        if table is None or not code:
             i += 1
             continue
-        m = ENTRY.match(stripped)
+        m = ENTRY.match(code)
         if not m:
-            yield UNPARSED, f"[{table}] line `{stripped}`", "", ""
+            yield Dep(UNPARSED, f"[{table}] line `{code}`", "", None)
             i += 1
             continue
         key, value = split_key(m.group(1)), m.group(2).strip()
         name = unquote(key[0])
-        if len(key) > 1:
-            yield UNPARSED, f"[{table}] {name} written as the dotted key `{m.group(1)}`", "", ""
+        if len(key) == 2:
+            dotted.setdefault(name, []).append(i)
+            i += 1
+            continue
+        if len(key) > 2:
+            yield Dep(UNPARSED, f"[{table}] {name} written as the dotted key `{m.group(1)}`", "", None)
             i += 1
             continue
         if value.startswith("{"):
-            raw = lines[i]
-            depth = raw.count("{") - raw.count("}")
+            start = i
+            depth = value.count("{") - value.count("}")
             while depth > 0 and i + 1 < len(lines):
                 i += 1
-                raw += "\n" + lines[i]
-                depth += lines[i].count("{") - lines[i].count("}")
-            yield table, name, raw[raw.index("=") + 1:], raw
+                nxt = code_part(lines[i])
+                depth += nxt.count("{") - nxt.count("}")
+            spec = "\n".join([value] + [code_part(lines[k]) for k in range(start + 1, i + 1)])
+            yield Dep(table, name, spec, version_line_in(lines, range(start, i + 1)))
         elif STRING_VALUE.match(value):
             sm = STRING_VALUE.match(value)
             requirement = sm.group(2) if sm.group(2) is not None else sm.group(3)
-            yield table, name, f'version = "{requirement}"', lines[i]
+            yield Dep(table, name, f'version = "{requirement}"', i)
         else:
-            yield UNPARSED, f"[{table}] {name} = {value}", "", ""
+            yield Dep(UNPARSED, f"[{table}] {name} = {value}", "", None)
         i += 1
+    yield from flush()
+
+
+def rewrite_version(line: str, want: str) -> str:
+    """Rewrites the version literal in one manifest line, leaving any trailing comment alone."""
+    code = code_part(line)
+    rest = line[len(code):]
+    m = KEY_VERSION.search(code)
+    if m:
+        return code[:m.start(1)] + want + code[m.end(1):] + rest
+    key, eq, value = code.partition("=")
+    sm = STRING_VALUE.match(value.strip())
+    if not eq or not sm:
+        return line
+    lead = value[: len(value) - len(value.lstrip())]
+    return key + eq + lead + value.strip()[0] + want + value.strip()[-1] + rest
 
 
 def workspace_members() -> list[str]:
@@ -268,11 +347,11 @@ def workspace_members() -> list[str]:
     return manifests
 
 
-PACKAGE_VERSION_KEY = re.compile(r"^version\s*[.=]")
+PACKAGE_VERSION_KEY = re.compile(r"""^(version|"version"|'version')\s*[.=]""")
 # Both spellings Cargo accepts for inheriting the workspace version.
 INHERITS_VERSION = (
-    re.compile(r"^version\s*\.\s*workspace\s*=\s*true\s*(#.*)?$"),
-    re.compile(r"^version\s*=\s*\{\s*workspace\s*=\s*true\s*\}\s*(#.*)?$"),
+    re.compile(r"""^(version|"version"|'version')\s*\.\s*workspace\s*=\s*true$"""),
+    re.compile(r"""^(version|"version"|'version')\s*=\s*\{\s*workspace\s*=\s*true\s*\}$"""),
 )
 PACKAGE_NAME = re.compile(r'^name\s*=\s*"([^"]+)"')
 
@@ -281,12 +360,12 @@ def package_section(text: str):
     """Yields the stripped lines of a manifest's own `[package]` section."""
     section = ""
     for line in text.splitlines():
-        stripped = line.strip()
+        stripped = code_part(line).strip()
         m = ARRAY_SECTION.match(stripped) or SECTION.match(stripped)
         if m:
             section = m.group(1)
             continue
-        if section == "package":
+        if section == "package" and stripped:
             yield stripped
 
 
@@ -391,7 +470,9 @@ def main() -> int:
         if Path(rel).name != "Cargo.toml":
             continue
         in_workspace = rel == "Cargo.toml" or rel in members
-        for section, name, spec, raw in dep_entries((ROOT / rel).read_text()):
+        text = (ROOT / rel).read_text()
+        rewrites: dict[int, str] = {}
+        for section, name, spec, version_line in dep_entries(text):
             if section == UNPARSED:
                 failures.append(
                     f"{rel}: {name} is a Cargo shape this checker does not parse -- teach it to "
@@ -400,7 +481,10 @@ def main() -> int:
                 )
                 continue
             renamed = KEY_PACKAGE.search(spec)
-            names_member = in_workspace and (renamed.group(1) if renamed else name) in member_names
+            # A bare `tpch = "0.3"` from the registry would still read as the member `tpch` here; no
+            # such dependency exists, and one would be reported loudly rather than skipped.
+            names_member = (in_workspace and not KEY_ELSEWHERE.search(spec)
+                            and (renamed.group(1) if renamed else name) in member_names)
             if not KEY_PATH.search(spec) and not names_member:
                 continue  # not an intra-workspace dependency
             got = KEY_VERSION.search(spec)
@@ -410,26 +494,25 @@ def main() -> int:
             if got.group(1) == want:
                 continue
             if fix:
-                path = ROOT / rel
-                before = path.read_text()
-                key_text, _, value = raw.partition("=")
-                if STRING_VALUE.match(value.strip()):
-                    new_raw = key_text + "=" + value.replace(got.group(1), want, 1)
-                else:
-                    new_raw = KEY_VERSION.sub(
-                        lambda v: v.group(0)[: v.start(1) - v.start(0)] + want + v.group(0)[v.end(1) - v.start(0):],
-                        raw, count=1)
-                after = before.replace(raw, new_raw, 1)
-                if after == before:
+                lines = text.splitlines(keepends=True)
+                line = lines[version_line] if version_line is not None else ""
+                body = line.rstrip("\r\n")
+                new = rewrite_version(body, want)
+                if version_line is None or new == body:
                     failures.append(f"{rel}: [{section}] {name} could not be rewritten")
                 else:
-                    path.write_text(after)
+                    rewrites[version_line] = new + line[len(body):]
                     fixed.append(f"{rel}: [{section}] {name} {got.group(1)} -> {want}")
             else:
                 failures.append(
                     f"{rel}: [{section}] {name} requests version \"{got.group(1)}\" "
                     f"but the authority is \"{want}\""
                 )
+        if rewrites:
+            lines = text.splitlines(keepends=True)
+            for index, new_line in rewrites.items():
+                lines[index] = new_line
+            (ROOT / rel).write_text("".join(lines))
 
     # ---- Rule 2: nothing else carries a copy of a project version. ----
     for rel in tracked:

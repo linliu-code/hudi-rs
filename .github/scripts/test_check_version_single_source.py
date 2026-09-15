@@ -28,6 +28,7 @@ Run with:  python3 -m unittest discover -s .github/scripts -p 'test_*.py'   (or 
 
 from __future__ import annotations
 
+import atexit
 import re
 import shutil
 import subprocess
@@ -69,6 +70,7 @@ class Tree:
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     dst.symlink_to(src.readlink())
             cls._template = base
+            atexit.register(shutil.rmtree, base, True)
         return cls._template
 
     def __init__(self) -> None:
@@ -195,6 +197,10 @@ class Rule0Members(CheckerTestCase):
         self.tree.sub("crates/core/Cargo.toml", r"^version\.workspace = true$", "version = { workspace = true }")
         self.assertPasses(self.tree.check())
 
+    def test_a_package_header_with_a_comment_still_has_its_version(self):
+        self.tree.sub("crates/core/Cargo.toml", r"^\[package\]$", "[package] # the core crate")
+        self.assertPasses(self.tree.check())
+
     def test_a_key_that_only_starts_with_version_is_not_the_version(self):
         self.tree.sub("crates/core/Cargo.toml", r"^version\.workspace = true$",
                       'versioning-note = "see the workspace"\nversion.workspace = true')
@@ -240,10 +246,61 @@ class Rule1Dependencies(CheckerTestCase):
         self.assertPasses(self.tree.check("--fix"))
         self.assertPasses(self.tree.check())
 
-    def test_a_dotted_key_dependency_fails_loudly(self):
+    def test_a_dependency_value_of_an_unknown_shape_fails_loudly(self):
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(), "hudi-core = 5")
+        self.assertFails(self.tree.check(), "is a Cargo shape this checker does not parse")
+
+    def test_a_dotted_workspace_dependency_passes(self):
+        self.tree.sub("crates/hudi/Cargo.toml", r"^\[dependencies\]$", "[dependencies]\nlog.workspace = true")
+        self.assertPasses(self.tree.check())
+
+    def test_a_drifted_dotted_key_dependency_fails_and_fix_rewrites_it(self):
         self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
                       'hudi-core.version = "0.5.0"\nhudi-core.path = "../core"')
-        self.assertFails(self.tree.check(), "is a Cargo shape this checker does not parse")
+        self.assertFails(self.tree.check(), 'hudi-core requests version "0.5.0"')
+        self.assertPasses(self.tree.check("--fix"))
+        self.assertIn(f'hudi-core.version = "{self.want}"', self.tree.read("crates/hudi/Cargo.toml"))
+        self.assertPasses(self.tree.check())
+
+    def test_a_section_header_with_a_comment_is_still_a_section(self):
+        self.tree.sub("crates/hudi/Cargo.toml", r"^\[dependencies\]$", "[dependencies] # crate deps")
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
+                      f'hudi-core = {{ version = "{dev("0.1.0")}", path = "../core", default-features = false }}')
+        self.assertFails(self.tree.check(), "hudi-core requests version")
+
+    def test_a_brace_in_a_comment_does_not_merge_entries_and_fix_rewrites_the_right_one(self):
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
+                      'foo = { version = "1.2", features = ["x"] } # {\n'
+                      f'hudi-core = {{ version = "{dev("0.1.0")}", path = "../core", default-features = false }}')
+        self.assertFails(self.tree.check(), "hudi-core requests version")
+        self.assertPasses(self.tree.check("--fix"))
+        manifest = self.tree.read("crates/hudi/Cargo.toml")
+        self.assertIn('foo = { version = "1.2", features = ["x"] } # {', manifest)
+        self.assertIn(f'hudi-core = {{ version = "{self.want}"', manifest)
+
+    def test_a_commented_out_version_is_neither_read_nor_rewritten(self):
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
+                      f'[dependencies.hudi-core]\n# version = "0.0.1" was the old pin\n'
+                      f'version = "{dev("0.1.0")}"\npath = "../core"\n\n[dependencies]')
+        self.assertFails(self.tree.check(), f'hudi-core requests version "{dev("0.1.0")}"')
+        self.assertPasses(self.tree.check("--fix"))
+        manifest = self.tree.read("crates/hudi/Cargo.toml")
+        self.assertIn('# version = "0.0.1" was the old pin', manifest)
+        self.assertPasses(self.tree.check())
+
+    def test_fix_leaves_an_identical_commented_line_elsewhere_alone(self):
+        self.tree.sub("crates/hudi/Cargo.toml", r"^\[package\]$", '[package]\n# hudi-core = "0.5.0"')
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(), 'hudi-core = "0.5.0"')
+        self.assertPasses(self.tree.check("--fix"))
+        manifest = self.tree.read("crates/hudi/Cargo.toml")
+        self.assertIn('# hudi-core = "0.5.0"', manifest)
+        self.assertIn(f'\nhudi-core = "{self.want}"', manifest)
+        self.assertPasses(self.tree.check())
+
+    def test_a_git_or_registry_dependency_named_like_a_member_is_not_ours(self):
+        self.tree.sub("crates/hudi/Cargo.toml", r"^\[dependencies\]$",
+                      '[dependencies]\ntpch = { version = "0.3", git = "https://example.invalid/tpch" }')
+        self.assertPasses(self.tree.check())
 
     def test_a_target_sub_table_with_a_dotted_cfg_is_checked(self):
         self.tree.append("crates/hudi/Cargo.toml",
@@ -257,8 +314,8 @@ class Rule1Dependencies(CheckerTestCase):
                          'something = { path = "../core", version = "0.1.0" }\n')
         self.assertPasses(self.tree.check())
 
-    def test_a_manifest_outside_the_workspace_keeps_its_own_versions(self):
-        self.tree.sub("demo/apps/datafusion/Cargo.toml", r'^version = "0\.1\.0"$', 'version = "0.1.1"')
+    def test_a_manifest_outside_the_workspace_may_depend_on_a_released_version(self):
+        self.tree.sub("demo/apps/datafusion/Cargo.toml", r"^\[dependencies\]$", '[dependencies]\nhudi-core = "0.1.0"')
         self.assertPasses(self.tree.check())
 
 
@@ -281,6 +338,10 @@ class Rule2Sweep(CheckerTestCase):
     def test_a_pinned_dev_version_in_any_other_document_fails(self):
         self.tree.append("README.md", f"Install the {dev('0.4.2')} build.\n")
         self.assertFails(self.tree.check(), "README.md line")
+
+    def test_the_jni_readme_is_swept(self):
+        self.tree.append("crates/jni/README.md", f"Use hudi-jni-native {dev('0.4.2')}.abc1234.\n")
+        self.assertFails(self.tree.check(), "crates/jni/README.md line")
 
     def test_a_file_whose_name_only_ends_in_cargo_toml_is_swept(self):
         self.tree.write("docs/fooCargo.toml", f'version = "{dev("0.4.2")}"\n', track=True)
