@@ -57,17 +57,17 @@ library ahead of the jar; ship jar and library together.**
 The Maven coordinates are the same regardless of where the jar comes from — only the repository
 it resolves from (and whether a classifier is present) changes:
 
-- **CodeArtifact**, via CI (`jni-native.yml`, see "Building the carrier" below — a single
-  classifier-less `io.onehouse.hudi-rs:hudi-jni-native:<version>` jar carrying BOTH Linux
-  arches, D-26) or, for a single-arch jar, `make jni-deploy`
-  (`io.onehouse.hudi-rs:hudi-jni-native:<version>:<os>-<arch>`, needs a fresh `codeartifact`
-  token in `~/.m2/settings.xml`).
+- **CodeArtifact**, via `make jni-deploy` — a single-arch
+  `io.onehouse.hudi-rs:hudi-jni-native:<version>:<os>-<arch>` jar, or with `JNI_MULTI=1` the
+  classifier-less `io.onehouse.hudi-rs:hudi-jni-native:<version>` jar carrying BOTH Linux arches
+  (needs a fresh `codeartifact` token in `~/.m2/settings.xml`). CI (`jni-native.yml`, see
+  "Building the carrier" below) builds that multi-arch jar but does not publish it: it uploads
+  it as the `hudi-jni-native-carrier` workflow artifact.
 - **This machine's local Maven repository**, via `make jni-install` (single-arch,
   classifier) or `make jni-install JNI_MULTI=1` (multi-arch, no classifier).
 - **A pre-release asset on `onehouseinc/hudi-internal`**. hudi-internal's
   `.github/actions/install-jni-carrier` installs this asset into the runner's local repository
-  when the coordinate does not resolve from CodeArtifact (D-18 in the effort workspace) — the
-  fallback route if CI's OIDC assume, or CodeArtifact itself, is down.
+  when the coordinate does not resolve from CodeArtifact.
 
   **The asset MUST be the multi-arch, classifier-less jar — the same bytes CodeArtifact holds.**
   The consuming action runs `install:install-file` with **no** `-Dclassifier`, so whatever bytes
@@ -78,9 +78,8 @@ it resolves from (and whether a classifier is present) changes:
   x86_64 deployment built from it fails loud at lookup time, far from the cause. The action pins
   the asset's MD5, which is what enforces "same bytes".
 
-  This is what was actually done for the `0.5.0-dev.5fa3c21` carrier (asset `549507607`,
-  md5 `eb80d7ba1aeeaf866cf02318cfe44141`): the jar was taken from the workflow run's own
-  `hudi-jni-native-carrier` artifact — never rebuilt, never re-jarred — and uploaded as-is.
+  Take the jar from the workflow run's own `hudi-jni-native-carrier` artifact — never rebuilt,
+  never re-jarred — and upload it as-is:
   ```
   gh run download <run-id> -R onehouseinc/hudi-rs-internal -n hudi-jni-native-carrier -D /tmp/carrier
   md5sum /tmp/carrier/hudi-jni-native-<version>.jar        # must equal the CodeArtifact artifact's md5
@@ -98,52 +97,39 @@ it resolves from (and whether a classifier is present) changes:
 ### CI (`.github/workflows/jni-native.yml`)
 
 Triggers:
-- Push a tag `jni-native/<version>` (e.g. `jni-native/0.5.0-dev.abc1234`) at the commit to
+- Push a tag `jni-native/<version>` (e.g. `jni-native/<x.y.z>-dev.abc1234`) at the commit to
   build.
-- `workflow_dispatch` (kept for when this file reaches the default branch, AS-16) with an
-  optional `version` input; defaults to the tag's suffix, else `0.5.0-dev.<short sha>`.
+- `workflow_dispatch` (kept for when this file reaches the default branch) with an optional
+  `version` input; defaults to the tag's suffix, else `<x.y.z>-dev.<short sha>` — see "Version
+  scheme" below.
 
-> **Pushing a `jni-native/*` tag IS a publish.** It builds a library from the tagged commit and
-> deploys it to the org's shared internal CodeArtifact Maven repository under the OIDC publisher
-> role — a shared repository, not just this branch. Tag pushes are *not* covered by branch
-> protection, so anyone with push access to this repository can start one. A `guard` job runs
-> before any build and refuses the two cheapest abuses: a version outside
-> `^[0-9]+\.[0-9]+\.[0-9]+(-dev\.[0-9a-f]{7,})?$` (so a stray `jni-native/1.0.0` cannot mint a
-> release-looking coordinate) and a tagged commit that is not an ancestor of `origin/main` or of
-> `origin/davis/rli-native-hfile-read` (so a tag on arbitrary code cannot be published). The
-> allowed-branch list lives in `ALLOWED_BRANCHES` in `.github/workflows/jni-native.yml` — keep it
-> in sync with this paragraph. The remaining control is a repository setting an agent cannot
-> make and the repository owner must: put the publish step behind a GitHub `environment` with
-> deployment/tag protection so use of the publisher role is auditable and approvable.
+The workflow builds, checks and packages the carrier. It publishes nothing: its output is the
+`hudi-jni-native-carrier` workflow artifact.
 
 A `build` job matrix runs BOTH Linux arches in parallel — `x86_64` on `ubuntu-24.04`,
 `aarch64` on `ubuntu-24.04-arm` — each leg builds INSIDE a `manylinux_2_28_<arch>` container
-(D-27, below), asserts the `.so` exports exactly 2 `Java_...` symbols, asserts the portability
-floor, and runs the **JNI load smoke** twice: once on the runner itself and once inside an
+(D-27, below) with `.github/jni-portable/container-build.sh`, asserts the `.so` exports exactly
+2 `Java_...` symbols, asserts the portability floor, and runs the **JNI load smoke** twice: once
+on the runner itself and once inside an
 `eclipse-temurin:17-jdk-jammy` container (glibc 2.35, older than the runner's own glibc 2.39) —
 both via `.github/jni-smoke/org/apache/hudi/io/nativereader/NativeFileGroupReader.java` (same
 package/class as the real reader, only the `version()` liveness probe), which `System.load`s the
 just-built library and checks its output matches `SMOKE hudi-jni .* abi=3`. Each leg uploads its
 `.so` plus properties as a workflow artifact (`libhudi_jni-linux-<arch>`).
 
-A `package` job (needs both legs) downloads both artifacts, assembles ONE classifier-less jar
-(layout below), uploads it as a workflow artifact (`hudi-jni-native-carrier`), then publishes it
-to the org's CodeArtifact Maven repo (`onehouse-internal`, D-26) via `mvn deploy:deploy-file`
-under the OIDC role `GithubActionsPublishHudi-RepositoryPublisherRole-10H7ABJVFNSQ9` — the same
-role hudi-rs-internal's former `publish-native-lib.yml` assumed — and verifies the publish
-resolves with `dependency:get` against a clean local `~/.m2/repository`. A new coordinate per
-version; never an overwrite. If the OIDC assume fails, the jar still exists as a workflow
-artifact and the orchestrator falls back to the release-asset route above.
+A `package` job (needs both legs) downloads both artifacts, re-asserts the portability floor on
+each library it is about to package, assembles ONE classifier-less jar (layout below) and
+uploads it as a workflow artifact (`hudi-jni-native-carrier`).
 
 ### The glibc floor (D-27)
 
 A Rust cdylib links the versioned glibc symbols of the BUILD host's libc, so a library built
 directly on the `ubuntu-24.04`/`ubuntu-24.04-arm` runners (glibc 2.39) cannot load on any older
 host — Amazon Linux 2023 (2.34), RHEL/Alma 8 (2.28), or even this box (2.35). The first cut of
-this workflow did exactly that and failed to load anywhere but the runners themselves
-(`investigations/m3-carrier-glibc-floor/`). Fix: each leg's `make jni-lib` now runs inside
-`quay.io/pypa/manylinux_2_28_<arch>` (AlmaLinux 8, glibc 2.28), which pins the *glibc* floor to
-2.28 for free. The *libstdc++*/*libgcc* floor (from `librocksdb-sys`, a C++ dependency) is a
+this workflow did exactly that and failed to load anywhere but the runners themselves. Fix:
+each leg's `make jni-lib` now runs inside `quay.io/pypa/manylinux_2_28_<arch>` (AlmaLinux 8,
+glibc 2.28), which pins the *glibc* floor to 2.28 for free. The *libstdc++*/*libgcc* floor
+(from `librocksdb-sys`, a C++ dependency) is a
 second, independent problem: `RUSTFLAGS`'s `-C link-arg=-static-libstdc++
 -C link-arg=-static-libgcc` do **not** remove it — those flags only rewrite gcc's own
 *automatic* C++-runtime linking, and have no effect on the *explicit* `-lstdc++`/`-lgcc_s` that
@@ -165,11 +151,20 @@ job unless, on the just-built `.so`:
 - max `GLIBC_` symbol version (`objdump -T ... | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1`)
   is `<= 2.28`;
 - there are zero versioned `GLIBCXX_`/`CXXABI_` imports;
-- `readelf -d`'s NEEDED list contains neither `libstdc++.so.6` nor `libgcc_s.so.1`;
+- every soname in `readelf -d`'s NEEDED list is on an ALLOW-list — `libc.so.6`, `libm.so.6`,
+  `libdl.so.2`, `libpthread.so.0`, `librt.so.1` and `ld-linux-*.so.*` (`JNI_ALLOWED_NEEDED` in
+  `.github/jni-portable/portability-floor.sh`). Any other dynamic dependency, `libstdc++.so.6`
+  and `libgcc_s.so.1` included, fails the step: link it statically, or add it to that list
+  together with the reason every deployment host will have it;
 - `nm -D --undefined-only`'s `_Unwind_`/`__cxa_`/`__gxx_` hits, EXCLUDING weak symbols (`w`,
   e.g. `__cxa_pure_virtual` — libstdc++'s own convention leaves this one optional) and symbols
   with an `@GLIBC_x.y` version tag (e.g. `__cxa_atexit@GLIBC_2.17` — legitimately provided by
-  `libc.so.6` itself, present in ANY C++ binary, static or dynamic), come to zero.
+  `libc.so.6` itself, present in ANY C++ binary, static or dynamic), come to zero;
+- exactly two `Java_` symbols are exported from `.dynsym`;
+- the library is stripped (no `.symtab` section).
+
+The checks are `.github/jni-portable/portability-floor.sh`, the one script the workflow's build
+and package jobs and `make jni-lib-portable` all run.
 
 The measured floor is written into the properties as `glibc.floor=<version>` (single-arch,
 `jni-lib`) or `glibc.floor.linux-<arch>=<version>` per arch (multi-arch, the workflow's
@@ -192,8 +187,7 @@ only checked glibc-symbol versions and NEEDED, so it passed too. It even passed 
 module-test run locally — but only because this box's own JVM already had `libgcc_s.so.1`
 loaded in the *process's global symbol scope*, silently satisfying the `dlopen` at runtime. The
 CI runner's Temurin JVM does not, and the identical load there threw `UnsatisfiedLinkError:
-undefined symbol: _Unwind_GetTextRelBase` (hudi-rs run 34164782183,
-`investigations/m3-carrier-unwinder-symbols/`).
+undefined symbol: _Unwind_GetTextRelBase`.
 
 **A native library loading successfully in one process proves only that whatever happened to
 already be loaded in that process's global scope covered its gaps — never trust it as proof of
@@ -202,18 +196,20 @@ a clean, self-contained link.** The only trustworthy checks are static: `nm -D
 exclusions above) and, independently, loading the library in a process guaranteed to have
 nothing preloaded (`env -i PATH=/usr/bin:/bin <jdk>/bin/java -cp ... NativeFileGroupReader
 <so>` — no ambient JVM, no inherited `LD_PRELOAD`) plus `ldd <so>` showing no "not found".
-Both are run as part of the local proof (`evidence/m3-t1-fix2-portable-floor.txt`, "fix round
-3" section) and as workflow steps.
+The static check is part of the portability floor every build asserts; the clean-process load is
+the way to confirm a library by hand.
 
 ### Local fallback (`make jni-jar-multi-portable`, `make jni-jar-multi`, `make jni-lib-portable`)
 
 `make jni-lib` always builds on THIS host, whichever glibc that happens to be (documented via
 `glibc.floor=`, not asserted) — a normal local build is not floor-2.28. `make jni-lib-portable`
-instead runs the SAME container build the workflow does (`docker run` against
-`quay.io/pypa/manylinux_2_28_<arch>`, the `static-cxx-linker.sh` wrapper, `JNI_ARCH` picking
-the image), staging under `target/jni-portable/` — it never touches `target/release/` or the
-plain `jni-lib`'s `target/jni-native/stage/`, so it is safe to run alongside other gates on a
-shared box. Needs `docker`; only builds THIS machine's arch (no cross-arch emulation).
+instead runs the SAME container build the workflow does (`docker run` of
+`.github/jni-portable/container-build.sh` in `quay.io/pypa/manylinux_2_28_<arch>`, with the
+`static-cxx-linker.sh` wrapper, `JNI_ARCH` picking the image; `CARGO_BUILD_JOBS` is passed into
+the container when set), staging under `target/jni-portable/` — it never touches
+`target/release/` or the plain `jni-lib`'s `target/jni-native/stage/`, so it is safe to run
+alongside other gates on a shared box. Needs `docker`; only builds THIS machine's arch (no
+cross-arch emulation).
 
 To assemble a full multi-arch jar locally (CI-built or floor-2.28), merge in another arch's
 library built elsewhere:
@@ -251,10 +247,14 @@ the `jni-lib` prerequisite would rebuild on this host *and* `rm -rf` its own sta
 producing a host-glibc carrier.
 
 In all three shapes `JNI_EXTRA_NATIVE_DIR` is required — the target refuses to run without it —
-and both arches end up in one classifier-less jar. `make jni-install JNI_MULTI=1` / `make
-jni-deploy JNI_MULTI=1` (both depend on `jni-jar-multi`, so they still need
-`JNI_EXTRA_NATIVE_DIR`) install/deploy that jar under
-`io.onehouse.hudi-rs:hudi-jni-native:<version>` with no classifier.
+and both arches end up in one classifier-less jar. Before writing anything the target also
+refuses unless BOTH `native/linux-x86_64/libhudi_jni.so` and `native/linux-aarch64/libhudi_jni.so`
+are present, each stripped and each exporting the two `Java_` symbols: an arch missing from
+`JNI_EXTRA_NATIVE_DIR` (or the same arch staged twice) would otherwise publish a one-arch
+library under the multi-arch coordinate. `make jni-install JNI_MULTI=1` / `make jni-deploy
+JNI_MULTI=1` (both depend on `jni-jar-multi`, so they still need `JNI_EXTRA_NATIVE_DIR`)
+install/deploy that jar under `io.onehouse.hudi-rs:hudi-jni-native:<version>` with no
+classifier.
 
 ### Multi-arch jar layout and properties keys
 
@@ -288,15 +288,17 @@ stripped=true
 ```
 
 `stripped=true` records D-29: the staged libraries are `strip --strip-unneeded`ed (measured
-aarch64: 74,330,712 B → 55,604,776 B) and the floor script asserts both `Java_` entry points
-survived in `.dynsym`.
+aarch64: 74,330,712 B → 55,604,776 B). It is a claim about bytes the packaging step may only
+have copied, so it is checked where it is written: the workflow's `package` job runs the floor
+script (stripped, both `Java_` entry points in `.dynsym`) on each library, and `jni-jar-multi`
+makes the same two checks.
 
 (the single-arch jar's properties file keeps its original shape plus `glibc.floor=<version>` —
 see "Make targets" below.) The `x86_64` then `aarch64` order is fixed — both the workflow's
-`package` job and `jni-jar-multi` iterate the two arches in that same order (only the ones
-actually present) for BOTH the `md5.linux-<arch>=` and `glibc.floor.linux-<arch>=` lines, so
-they always come out identical between CI and a local build, whichever arch this machine's
-`jni-lib`/`jni-lib-portable` staged first.
+`package` job and `jni-jar-multi` iterate the two arches in that same order for BOTH the
+`md5.linux-<arch>=` and `glibc.floor.linux-<arch>=` lines, so they always come out identical
+between CI and a local build, whichever arch this machine's `jni-lib`/`jni-lib-portable` staged
+first.
 
 ### Consumer side (hudi-internal)
 
@@ -364,16 +366,21 @@ stripped=true
 
 ## Version scheme
 
-`JNI_VERSION` defaults to `0.5.0-dev.<hudi-rs short sha>` — one Maven coordinate per hudi-rs
-commit that touches the library. A rebuild after any hudi-rs change is a **new** coordinate,
-never an overwrite of an existing one, so a CI run always resolves the exact library its
-commit was built against and nothing already published is ever silently replaced.
+`JNI_VERSION` defaults to `<x.y.z>-dev.<hudi-rs short sha>`, where `<x.y.z>` is
+`[workspace.package] version` in the root `Cargo.toml` (read by
+`.github/scripts/workspace-version.sh`) without any pre-release suffix — the same default the
+workflow computes, and never a release-looking `<x.y.z>.<sha>`. If the version cannot be read,
+the JNI targets stop rather than guess; pass `JNI_VERSION=...` to override. That is one Maven
+coordinate per hudi-rs commit that touches the library. A rebuild after any hudi-rs change is a
+**new** coordinate, never an overwrite of an existing one, so a CI run always resolves the exact
+library its commit was built against and nothing already published is ever silently replaced.
 
 **Never re-tag an existing version — cut a new `-dev.<sha>` instead.** A re-run produces
 different bytes even from the identical commit (`built=` is a timestamp, and the Rust build is
-not bit-reproducible), so re-pushing `jni-native/<an existing version>` either fails on
-CodeArtifact's immutability or, if the release asset is re-cut from it, silently invalidates the
-MD5 that hudi-internal's `install-jni-carrier` action pins for that version.
+not bit-reproducible), so rebuilding `jni-native/<an existing version>` yields a second jar under
+the same version: deploying it fails on CodeArtifact's immutability and, if the release asset is
+re-cut from it, it silently invalidates the MD5 that hudi-internal's `install-jni-carrier` action
+pins for that version.
 
 ## Lockstep rule
 
