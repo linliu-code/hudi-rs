@@ -7225,6 +7225,141 @@ mod tests {
         assert!(!batch.column(1).is_null(0));
     }
 
+    /// A genuine type difference below the list is declined and the log value
+    /// kept — the decline-and-keep behaviour the name reconciliation must not
+    /// widen into.
+    #[test]
+    fn reconcile_defaults_declines_a_list_child_whose_type_differs() {
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+        let mut b = ListBuilder::new(Int32Builder::new()).with_field(Arc::new(Field::new(
+            "element",
+            DataType::Int32,
+            true,
+        )));
+        b.values().append_value(1);
+        b.append(true);
+        let prior = keyed_row(
+            DataType::List(Arc::new(Field::new("element", DataType::Int32, true))),
+            Arc::new(b.finish()),
+        );
+        let winner_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let (out, changed) = reconcile_null_winner_from(winner_type, &prior).unwrap();
+        assert!(!changed, "Int32 elements must not be re-tagged as Int64");
+        assert!(out.get_record().unwrap().column(1).is_null(0));
+    }
+
+    /// A map whose entries field is `entries` (arrow-avro) on one side and
+    /// `key_value` (parquet) on the other is the same data.
+    #[test]
+    fn reconcile_defaults_reconciles_a_map_entries_field_name() {
+        use arrow_array::builder::{Int64Builder, MapBuilder, MapFieldNames, StringBuilder};
+        let map_type = |entries: &str, key: &str, value: &str| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    entries,
+                    DataType::Struct(
+                        vec![
+                            Field::new(key, DataType::Utf8, false),
+                            Field::new(value, DataType::Int64, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            )
+        };
+        let mut b = MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "key_value".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            StringBuilder::new(),
+            Int64Builder::new(),
+        );
+        b.keys().append_value("a");
+        b.values().append_value(1);
+        b.append(true).unwrap();
+        let prior = keyed_row(map_type("key_value", "key", "value"), Arc::new(b.finish()));
+        let winner_type = map_type("entries", "key", "value");
+        let (out, changed) = reconcile_null_winner_from(winner_type.clone(), &prior).unwrap();
+        assert!(changed, "the prior's map must be adopted");
+        let batch = out.get_record().unwrap();
+        assert_eq!(batch.schema().field(1).data_type(), &winner_type);
+        assert!(!batch.column(1).is_null(0));
+    }
+
+    /// A list child name difference nested inside a struct reconciles through the
+    /// struct, for the default-reconciling merge and for the partial pad alike.
+    #[test]
+    fn a_list_child_field_name_inside_a_struct_reconciles() {
+        use arrow_array::StructArray;
+        let struct_of = |child: &str| {
+            DataType::Struct(
+                vec![Field::new(
+                    "tags",
+                    DataType::List(Arc::new(Field::new(child, DataType::Int64, true))),
+                    true,
+                )]
+                .into(),
+            )
+        };
+        let struct_array = |child: &str| -> ArrayRef {
+            let DataType::Struct(fields) = struct_of(child) else {
+                unreachable!()
+            };
+            Arc::new(StructArray::new(
+                fields,
+                vec![list_with_a_null_element(child)],
+                None,
+            ))
+        };
+
+        let prior = keyed_row(struct_of("element"), struct_array("element"));
+        let (out, changed) = reconcile_null_winner_from(struct_of("item"), &prior).unwrap();
+        assert!(
+            changed,
+            "reconcile_defaults_from_prior must adopt the prior struct"
+        );
+        assert_eq!(
+            out.get_record().unwrap().schema().field(1).data_type(),
+            &struct_of("item")
+        );
+
+        let partial = keyed_row(struct_of("item"), struct_array("item"));
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("col", struct_of("element"), true),
+        ]));
+        let padded = pad_partial_to_target(&partial, &target)
+            .expect("pad_partial_to_target must reconcile through the struct");
+        assert_eq!(padded.schema().field(1).data_type(), &struct_of("element"));
+    }
+
+    /// A `LargeList` child name difference reconciles in the partial pad.
+    #[test]
+    fn pad_partial_reconciles_a_large_list_child_field_name() {
+        use arrow_array::builder::{Int64Builder, LargeListBuilder};
+        let large =
+            |child: &str| DataType::LargeList(Arc::new(Field::new(child, DataType::Int64, true)));
+        let mut b = LargeListBuilder::new(Int64Builder::new()).with_field(Arc::new(Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        )));
+        b.values().append_value(7);
+        b.append(true);
+        let partial = keyed_row(large("item"), Arc::new(b.finish()));
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("col", large("element"), true),
+        ]));
+        let padded = pad_partial_to_target(&partial, &target)
+            .expect("a LargeList child-field-NAME difference must reconcile");
+        assert_eq!(padded.schema().field(1).data_type(), &large("element"));
+    }
+
     /// An `IS_PARTIAL` log block carries Hudi meta columns
     /// (`_hoodie_commit_time`, `_hoodie_record_key`, …) alongside the updated data
     /// column. The projected reader (target) schema may have pruned those meta
