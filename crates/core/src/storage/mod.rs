@@ -223,7 +223,7 @@ impl ReadVolume {
     }
 }
 
-/// ENG-42276 — process-wide cache of built `ObjectStore`s.
+/// Process-wide cache of built `ObjectStore`s.
 ///
 /// `parse_url_opts` builds a fresh client per call, and for S3 that means a new
 /// credential chain and a new TLS connection pool. Embedders construct a
@@ -238,8 +238,8 @@ impl ReadVolume {
 /// process. That is bounded in practice by the number of DISTINCT
 /// (host, options) pairs a process sees, which is small — but a caller that
 /// mints per-request credentials would grow it without limit. Nothing here
-/// evicts, matching internal main; if that ever becomes a problem the fix is an
-/// entry-bounded cache, not a per-split rebuild.
+/// evicts; if that ever becomes a problem the fix is an entry-bounded cache, not
+/// a per-split rebuild.
 static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -643,7 +643,7 @@ mod tests {
     use std::fs::canonicalize;
     use std::path::Path;
 
-    // ── ENG-40156 — with_region_fallback ──────────────────────────────
+    // ── with_region_fallback ──────────────────────────────────────────
     //
     // These tests cover the env-driven region injection. Tests that touch
     // process env are marked `#[serial(env_vars)]` so concurrent execution
@@ -887,11 +887,10 @@ mod tests {
         }
     }
 
-    // ── ENG-42276 — OBJECT_STORE_CACHE ────────────────────────────────
+    // ── OBJECT_STORE_CACHE ────────────────────────────────────────────
     //
-    // Internal main ships this cache with no test at all. These are written
-    // here rather than ported, because "the same store is reused" is exactly
-    // the property the change exists for and nothing else pins it.
+    // "The same store is reused, and distinct stores are not" is exactly the
+    // property the cache exists for, and nothing else pins it.
 
     #[test]
     fn test_object_store_cache_key_separates_distinct_option_sets() {
