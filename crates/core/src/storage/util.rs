@@ -35,6 +35,14 @@ pub fn parse_uri(uri: &str) -> Result<Url> {
     // `Path` parser rejects them ("contained empty path segment"), so normalize
     // them away at ingestion rather than letting a "//" base path fail later.
     //
+    // Object stores do not share Hadoop's tolerance: in S3 an empty segment is
+    // part of the key, so `s3://bucket/a//b` and `s3://bucket/a/b` name
+    // different objects. Collapsing therefore trades the loud `EmptySegment`
+    // failure such a path used to hit for a read of the single-slash path. That
+    // is accepted because this crate parses table base paths here (through
+    // `HudiConfigValue::to_url`), where a doubled slash is almost always a
+    // string-concatenation accident rather than a deliberate key.
+    //
     // Collapse the runs of `/` directly in the ALREADY-percent-encoded path
     // string and write it back with `set_path`. The previous approach round-
     // tripped through `path_segments()` (which yields decoded-view segments) and
