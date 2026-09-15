@@ -28,6 +28,9 @@ use once_cell::sync::Lazy;
 
 use async_recursion::async_recursion;
 use bytes::Bytes;
+use object_store::aws::AmazonS3ConfigKey;
+use object_store::azure::AzureConfigKey;
+use object_store::gcp::GoogleConfigKey;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt, ObjectStoreScheme, parse_url_opts};
 use url::Url;
@@ -227,9 +230,9 @@ impl ReadVolume {
 /// `Storage` PER FILE GROUP (see `cpp/src/lib.rs`), so on a scan of N splits the
 /// uncached path pays that N times and shares no connections between them.
 ///
-/// Keyed by the store-identifying part of the URL plus the option set, so two
-/// stores that differ in bucket, container, endpoint or credentials never share
-/// an entry — see [`object_store_cache_key`].
+/// Keyed by the store-identifying part of the URL plus the options the store
+/// reads, so two stores that differ in bucket, container, endpoint or
+/// credentials never share an entry — see [`object_store_cache_key`].
 ///
 /// Caveat, recorded deliberately: this map is unbounded and lives for the
 /// process. That is bounded in practice by the number of DISTINCT
@@ -241,7 +244,7 @@ static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Identity of a built store: the part of `base_url` the store is bound to,
-/// plus the option set in a stable order.
+/// plus the options it reads, in a stable order.
 ///
 /// The URL part is everything up to the path, plus whatever leading path
 /// segments `parse_url_opts` consumes rather than hands back as the object
@@ -258,12 +261,15 @@ static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
 /// another, which then resolves the same relative path inside the wrong
 /// container and returns its data without error.
 ///
-/// The option set is load-bearing too — the same `s3://bucket/path` resolves
-/// to different physical stores under different endpoints or credentials, so a
-/// URL-only key would hand one endpoint's client to another's read.
+/// The options are load-bearing too — the same `s3://bucket/path` resolves to
+/// different physical stores under different endpoints or credentials — but
+/// only the ones the store's builder recognises: `parse_url_opts` drops every
+/// other key, so keying on them would split one store into an entry per
+/// distinct unrelated property.
 fn object_store_cache_key(base_url: &Url, options: &HashMap<String, String>) -> String {
-    let url_part = match ObjectStoreScheme::parse(base_url) {
-        Ok((_, path)) => {
+    let parsed = ObjectStoreScheme::parse(base_url).ok();
+    let url_part = match &parsed {
+        Some((_, path)) => {
             let segments = || base_url.path().split('/').filter(|s| !s.is_empty());
             let consumed = segments().count().saturating_sub(path.parts_count());
             let mut url_part = base_url[..url::Position::AfterPort].to_string();
@@ -275,11 +281,34 @@ fn object_store_cache_key(base_url: &Url, options: &HashMap<String, String>) -> 
         }
         // Unrecognised: `parse_url_opts` refuses it too, so nothing is cached
         // under this key; the whole URL is the conservative identity.
-        Err(_) => base_url.as_str().to_string(),
+        None => base_url.as_str().to_string(),
     };
-    let mut opts: Vec<(&String, &String)> = options.iter().collect();
+    let mut opts: Vec<(&String, &String)> = options
+        .iter()
+        .filter(|(k, _)| match parsed.as_ref().map(|(scheme, _)| scheme) {
+            Some(scheme) => store_reads_option(scheme, k),
+            None => true,
+        })
+        .collect();
     opts.sort();
     format!("{url_part}|{opts:?}")
+}
+
+/// Whether the store `parse_url_opts` builds for `scheme` reads option `key`.
+///
+/// Mirrors `parse_url_opts`, which lowercases each key and parses it as the
+/// scheme's config key, silently dropping keys that do not parse. Local and
+/// in-memory stores read no options. A scheme this does not know keeps every
+/// key, which can only split the cache, never merge two stores.
+fn store_reads_option(scheme: &ObjectStoreScheme, key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    match scheme {
+        ObjectStoreScheme::Local | ObjectStoreScheme::Memory => false,
+        ObjectStoreScheme::AmazonS3 => key.parse::<AmazonS3ConfigKey>().is_ok(),
+        ObjectStoreScheme::MicrosoftAzure => key.parse::<AzureConfigKey>().is_ok(),
+        ObjectStoreScheme::GoogleCloudStorage => key.parse::<GoogleConfigKey>().is_ok(),
+        _ => true,
+    }
 }
 
 impl Storage {
@@ -988,6 +1017,52 @@ mod tests {
             Arc::ptr_eq(&prod.object_store, &prod_again.object_store),
             "two tables in one container share one ObjectStore"
         );
+    }
+
+    #[test]
+    fn test_object_store_cache_key_ignores_options_the_store_does_not_read() {
+        let s3 = Url::parse("s3://example-bucket/path/").unwrap();
+        let region = HashMap::from([("region".to_string(), "us-west-2".to_string())]);
+        let mut with_unread = region.clone();
+        with_unread.insert("spark.sql.shuffle.partitions".to_string(), "8".to_string());
+        with_unread.insert("azure_storage_account_key".to_string(), "k".to_string());
+        assert_eq!(
+            object_store_cache_key(&s3, &region),
+            object_store_cache_key(&s3, &with_unread),
+            "options the S3 builder drops must not split its cache entry"
+        );
+
+        let local = Url::parse("file:///tmp/tbl").unwrap();
+        assert_eq!(
+            object_store_cache_key(&local, &HashMap::new()),
+            object_store_cache_key(&local, &region),
+            "a local store reads no options"
+        );
+    }
+
+    #[test]
+    fn test_object_store_cache_key_keeps_every_option_the_store_reads() {
+        // Recognised keys stay in the key whatever their case, because the
+        // builder lowercases them before parsing.
+        let cases = [
+            ("s3://example-bucket/path/", "AWS_ENDPOINT"),
+            ("s3://example-bucket/path/", "aws_secret_access_key"),
+            (
+                "abfss://container@acct.dfs.core.windows.net/tbl",
+                "AZURE_STORAGE_ACCOUNT_KEY",
+            ),
+            ("gs://bucket/tbl", "google_service_account"),
+        ];
+        for (url, key) in cases {
+            let url = Url::parse(url).unwrap();
+            let a = HashMap::from([(key.to_string(), "value-a".to_string())]);
+            let b = HashMap::from([(key.to_string(), "value-b".to_string())]);
+            assert_ne!(
+                object_store_cache_key(&url, &a),
+                object_store_cache_key(&url, &b),
+                "`{key}` configures the store at {url}"
+            );
+        }
     }
 
     #[test]
