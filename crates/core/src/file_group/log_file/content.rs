@@ -1607,6 +1607,7 @@ mod tests {
         assert_rewrite_chain_carries_defaults(&targets);
         Ok(())
     }
+
     /// A reader-only field NESTED in a record the writer did write takes its
     /// default on the same unresolvable rewrite. The enclosing column is declared
     /// `"default": null`, which is how every nullable record column is declared,
@@ -1676,6 +1677,7 @@ mod tests {
         assert_eq!(y.value(0), "why");
         Ok(())
     }
+
     /// A reader-only field inside a named record that is REFERENCED after the
     /// record defining it closes takes its default, on a rewrite whose writer
     /// arrow-avro can resolve.

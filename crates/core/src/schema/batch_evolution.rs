@@ -463,10 +463,11 @@ fn constant_array_from_avro_default(
     Ok(array)
 }
 
-/// `len` copies of `bytes` as a `FixedSizeBinary(bytes.len())` array. Built from
-/// the flat value buffer rather than `FixedSizeBinaryArray::try_from_iter`, which
-/// refuses an empty iterator and so cannot express the zero-row fill a nested
-/// field gets when its container holds no values in the batch.
+/// `len` copies of `bytes` as a `FixedSizeBinary(bytes.len())` array. Built with
+/// the builder rather than `FixedSizeBinaryArray::try_from_iter`, which refuses an
+/// empty iterator and so cannot express the zero-row fill a nested field gets when
+/// its container holds no values in the batch; the builder also keeps the row
+/// count for a zero-width value, whose value buffer is empty whatever `len` is.
 fn fixed_size_binary_repeated(
     bytes: &[u8],
     len: usize,
@@ -477,11 +478,11 @@ fn fixed_size_binary_repeated(
             bytes.len()
         ))
     })?;
-    arrow_array::FixedSizeBinaryArray::try_new(
-        width,
-        arrow_buffer::Buffer::from(bytes.repeat(len)),
-        None,
-    )
+    let mut builder = arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(len, width);
+    for _ in 0..len {
+        builder.append_value(bytes)?;
+    }
+    Ok(builder.finish())
 }
 
 /// The 16 bytes of a UUID string, in exactly the spellings arrow-avro's
@@ -2682,10 +2683,12 @@ mod tests {
             "and so must one inside a list"
         );
     }
+
     /// A zero-row fill of a `fixed` or `uuid` default yields an empty array, as
-    /// every other type's does. It is reached when the field is a child of a
-    /// container with no values in the batch: a list of records whose every list
-    /// is empty, or a union branch no row selects.
+    /// every other type's does. It is reached through a zero-row batch, as here,
+    /// and when the field is a child of a container with no values in the batch:
+    /// a list of records whose every list is empty, or a union branch no row
+    /// selects.
     #[test]
     fn a_zero_row_fixed_or_uuid_default_fill_is_empty() {
         let b = batch(
@@ -2714,6 +2717,27 @@ mod tests {
             .expect("an empty batch fills its defaulted fixed columns with nothing");
         assert_eq!(out.num_rows(), 0);
         assert_eq!(out.schema(), target);
+    }
+
+    /// A zero-width `fixed` default fills one (empty) value per row: the array
+    /// length follows the row count, not the value buffer, which is empty either
+    /// way.
+    #[test]
+    fn a_zero_width_fixed_default_fills_every_row() {
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new("empty", DataType::FixedSizeBinary(0), false),
+                "\"\"",
+            ),
+        ]));
+        let out = project_batch_to_schema(&b, &target)
+            .expect("a zero-width fixed default fills three rows");
+        assert_eq!(out.column(1).len(), 3);
     }
 
     /// Every spelling `uuid_string_bytes` accepts gives the same bytes; anything
