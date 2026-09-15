@@ -69,8 +69,8 @@ it resolves from (and whether a classifier is present) changes:
   `.github/actions/install-jni-carrier` installs this asset into the runner's local repository
   when the coordinate does not resolve from CodeArtifact.
 
-  **The asset MUST be the multi-arch, classifier-less jar, uploaded byte-for-byte as the workflow
-  built it.**
+  **The asset MUST be the multi-arch, classifier-less jar, uploaded byte-for-byte as it was built
+  and pinned by that jar's own md5.**
   The consuming action runs `install:install-file` with **no** `-Dclassifier`, so whatever bytes
   it downloads become `io.onehouse.hudi-rs:hudi-jni-native:<version>`, the coordinate every
   module and all 14 bundles resolve. Publishing a single-arch `-linux-aarch64` jar there would
@@ -83,8 +83,7 @@ it resolves from (and whether a classifier is present) changes:
   never re-jarred — and upload it as-is:
   ```
   gh run download <run-id> -R onehouseinc/hudi-rs-internal -n hudi-jni-native-carrier -D /tmp/carrier
-  cat /tmp/carrier/hudi-jni-native-<version>.jar.md5       # the md5 the workflow recorded
-  md5sum /tmp/carrier/hudi-jni-native-<version>.jar        # must equal it
+  (cd /tmp/carrier && md5sum -c hudi-jni-native-<version>.jar.md5)   # the md5 the workflow recorded
   gh release create hudi-jni-native/<version> \
     /tmp/carrier/hudi-jni-native-<version>.jar \
     --repo onehouseinc/hudi-internal --prerelease --target <a pushed hudi-internal sha>
@@ -92,7 +91,8 @@ it resolves from (and whether a classifier is present) changes:
   Then set that md5 in `install-jni-carrier/action.yml`. If CI is unavailable altogether, build
   the jar locally with `make jni-jar-multi-portable` (below) — the portable build, never
   `jni-lib`'s host build — and merge in the other arch's `.so`; a jar carrying only this
-  machine's arch must not be uploaded.
+  machine's arch must not be uploaded. That jar is uploaded as-is too, and its own md5 is the one
+  pinned.
 
 ## Building the carrier
 
@@ -249,11 +249,12 @@ the `jni-lib` prerequisite would rebuild on this host *and* `rm -rf` its own sta
 producing a host-glibc carrier.
 
 In all three shapes `JNI_EXTRA_NATIVE_DIR` is required — the target refuses to run without it —
-and both arches end up in one classifier-less jar. Before copying or writing anything the target also
-refuses unless BOTH `native/linux-x86_64/libhudi_jni.so` and `native/linux-aarch64/libhudi_jni.so`
-are present, each stripped and each exporting the two `Java_` symbols: an arch missing from
-`JNI_EXTRA_NATIVE_DIR` (or the same arch staged twice) would otherwise publish a one-arch
-library under the multi-arch coordinate. `make jni-install JNI_MULTI=1` / `make jni-deploy
+and both arches end up in one classifier-less jar. For each arch the library comes from
+`JNI_EXTRA_NATIVE_DIR` if it has one (replacing the staged one), else from the stage. Before copying
+or writing anything the target refuses unless both `native/linux-x86_64/libhudi_jni.so` and
+`native/linux-aarch64/libhudi_jni.so` are present, each stripped and each exporting the two `Java_`
+symbols; a jar missing an arch would otherwise publish a one-arch library under the multi-arch
+coordinate. `make jni-install JNI_MULTI=1` / `make jni-deploy
 JNI_MULTI=1` (both depend on `jni-jar-multi`, so they still need `JNI_EXTRA_NATIVE_DIR`)
 install/deploy that jar under `io.onehouse.hudi-rs:hudi-jni-native:<version>` with no
 classifier.

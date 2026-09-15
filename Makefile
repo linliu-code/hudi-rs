@@ -234,6 +234,7 @@ JNI_JAR_MULTI_PREREQ ?= jni-lib
 # THIRD-PARTY.txt come from the same script that job runs.
 define jni_package_multi
 	test -n "$(JNI_EXTRA_NATIVE_DIR)" || { echo "JNI_EXTRA_NATIVE_DIR is required"; exit 2; }
+	test -d "$(JNI_EXTRA_NATIVE_DIR)/native" || { echo "JNI_EXTRA_NATIVE_DIR=$(JNI_EXTRA_NATIVE_DIR) has no native/ directory (expected native/linux-<arch>/libhudi_jni.so)"; exit 2; }
 	test -d "$(JNI_STAGE)/native" || { echo "no staged library under $(JNI_STAGE)/native -- run jni-lib or jni-lib-portable first, or point JNI_OUT/JNI_STAGE at an existing stage"; exit 2; }
 	for a in x86_64 aarch64; do \
 	  so=$(JNI_EXTRA_NATIVE_DIR)/native/linux-$$a/libhudi_jni.so; \

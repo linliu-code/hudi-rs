@@ -16,7 +16,7 @@
 # under the License.
 
 name: JNI native carrier
-# Trigger: push a tag `jni-native/<version>` (e.g. jni-native/<workspace version>.abc1234) at the
+# Trigger: push a tag `jni-native/<version>` (e.g. jni-native/<x.y.z>-dev.abc1234) at the
 # commit to build. The default version is DERIVED from the one authority --
 # `[workspace.package] version` in the root Cargo.toml, read by
 # .github/scripts/workspace-version.sh -- so a version bump is a single edit there and never
