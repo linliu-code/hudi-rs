@@ -332,13 +332,13 @@ fn constant_array_from_avro_default(
         ])),
         DataType::Float32 => {
             let wide = value.as_f64().ok_or_else(|| bad("a number"))?;
-            let narrow = wide as f32;
-            // `as` saturates to infinity; a JSON number is always finite, so an
-            // infinite result is an out-of-range default, not a value.
-            if narrow.is_infinite() {
+            // The bounds arrow-avro's resolution applies to the same default, so
+            // the two paths refuse the same values (`as` would round a value just
+            // past `f32::MAX` down to it, or saturate a larger one to infinity).
+            if !wide.is_finite() || wide < f32::MIN as f64 || wide > f32::MAX as f64 {
                 return Err(bad("in float32 range"));
             }
-            Arc::new(Float32Array::from(vec![narrow; len]))
+            Arc::new(Float32Array::from(vec![wide as f32; len]))
         }
         DataType::Float64 => Arc::new(Float64Array::from(vec![
             value.as_f64().ok_or_else(
@@ -469,20 +469,20 @@ fn constant_array_from_avro_default(
     Ok(array)
 }
 
-/// The 16 bytes of a UUID string, in the spellings arrow-avro's resolution
-/// accepts for a `uuid` default: hyphenated (`8-4-4-4-12`) or 32 bare hex
-/// digits, either optionally braced or behind `urn:uuid:`.
+/// The 16 bytes of a UUID string, in exactly the spellings arrow-avro's
+/// resolution accepts for a `uuid` default (`uuid::Uuid::try_parse`): 32 bare
+/// hex digits, hyphenated `8-4-4-4-12`, or the hyphenated form braced
+/// (`{...}`) or behind `urn:uuid:`.
 fn uuid_string_bytes(text: &str) -> Option<[u8; 16]> {
-    let text = text.strip_prefix("urn:uuid:").unwrap_or(text);
-    let text = text
-        .strip_prefix('{')
-        .and_then(|t| t.strip_suffix('}'))
-        .unwrap_or(text);
+    let hyphenated = |t: &str| {
+        (t.len() == 36 && [8, 13, 18, 23].iter().all(|&i| t.as_bytes()[i] == b'-'))
+            .then(|| t.bytes().filter(|&b| b != b'-').collect::<Vec<u8>>())
+    };
     let hex: Vec<u8> = match text.len() {
         32 => text.bytes().collect(),
-        36 if [8, 13, 18, 23].iter().all(|&i| text.as_bytes()[i] == b'-') => {
-            text.bytes().filter(|&b| b != b'-').collect()
-        }
+        36 => hyphenated(text)?,
+        38 => hyphenated(text.strip_prefix('{')?.strip_suffix('}')?)?,
+        45 => hyphenated(text.strip_prefix("urn:uuid:")?)?,
         _ => return None,
     };
     if hex.len() != 32 || !hex.iter().all(u8::is_ascii_hexdigit) {
@@ -2024,10 +2024,21 @@ mod tests {
                 with_default(Field::new("f", DataType::Float32, false), default),
             ]))
         };
-        let err = project_batch_to_schema(&b, &target_with("1e40"))
-            .expect_err("1e40 does not fit a float")
-            .to_string();
-        assert!(err.contains("in float32 range"), "got: {err}");
+        // `3.4028234714e38` is past `f32::MAX` by less than half its last place, so
+        // `as f32` would round it down to `f32::MAX` rather than to infinity.
+        for out_of_range in ["1e40", "-1e40", "3.4028236e38", "3.4028234714e38"] {
+            let err = project_batch_to_schema(&b, &target_with(out_of_range))
+                .expect_err("out of float range")
+                .to_string();
+            assert!(err.contains("in float32 range"), "{out_of_range}: {err}");
+        }
+        let out = project_batch_to_schema(&b, &target_with("3.4e38")).unwrap();
+        let f = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(f.value(0), 3.4e38f32, "just under f32::MAX is in range");
 
         let out = project_batch_to_schema(&b, &target_with("1.5")).unwrap();
         let f = out
@@ -2679,6 +2690,10 @@ mod tests {
             "550e8400-e29b-41d4-a716-44665544000g",
             "550e8400+e29b+41d4+a716+446655440000",
             "+50e8400e29b41d4a716446655440000",
+            "{550e8400e29b41d4a716446655440000}",
+            "urn:uuid:550e8400e29b41d4a716446655440000",
+            "urn:uuid:{550e8400-e29b-41d4-a716-446655440000}",
+            "URN:UUID:550e8400-e29b-41d4-a716-446655440000",
             "",
         ] {
             assert_eq!(uuid_string_bytes(bad), None, "{bad}");
