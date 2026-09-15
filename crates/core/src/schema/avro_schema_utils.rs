@@ -130,6 +130,90 @@ pub(crate) fn avro_schema_json_equivalent(a_json: &str, b_json: &str) -> crate::
     Ok(a == b)
 }
 
+/// A writer schema that makes every field of `reader_json` that declares a
+/// non-null `default` reader-only, at every depth, while leaving every other
+/// field resolving to itself.
+///
+/// It is `reader_json` with each such field renamed to a name nothing in its
+/// record answers to (and stripped of its aliases, which would otherwise match
+/// it back). Resolving `reader_json` against it has no promotion to refuse —
+/// every surviving field is its own type — so `arrow-avro` always builds it,
+/// and stamps each renamed field's declared default on the result exactly as it
+/// does for a field a real writer never wrote.
+///
+/// This is what the log rewrite takes its defaults from when the block's real
+/// writer schema cannot be resolved against the reader: that refusal is the
+/// very evolution the rewrite exists for, and a rewrite without defaults would
+/// fill a reader-only field with NULL where the schema declares its value.
+/// A default stamped on a field the real writer DID write is inert, because a
+/// default is consulted only for a field absent from the batch.
+///
+/// A field whose default is `null` is left alone. Filling it with its default
+/// and filling it with no default are the same null, and renaming it would hide
+/// the defaults of any record nested inside it — the common shape, since a
+/// nullable record column is declared `"default": null`. A field with a non-null
+/// default on a record type does hide its nested defaults, but a default on a
+/// nested type is refused when it is materialised anyway
+/// (`batch_evolution::constant_array_from_avro_default`).
+///
+/// Only schema positions are walked (`fields`, a field's `type`, `items`,
+/// `values`, union branches), never a `default` payload. A renamed field keeps
+/// its type, so a named type it defines is still defined for any later
+/// reference to it.
+pub(crate) fn defaults_carrier_writer_json(reader_json: &str) -> crate::Result<String> {
+    use serde_json::Value;
+
+    fn walk(node: &mut Value) {
+        match node {
+            Value::Array(branches) => branches.iter_mut().for_each(walk),
+            Value::Object(map) => {
+                if let Some(Value::Array(fields)) = map.get_mut("fields") {
+                    let taken: std::collections::HashSet<String> = fields
+                        .iter()
+                        .flat_map(|f| {
+                            let aliases = f["aliases"].as_array().cloned().unwrap_or_default();
+                            std::iter::once(f["name"].clone()).chain(aliases)
+                        })
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect();
+                    let mut next = 0usize;
+                    for field in fields.iter_mut() {
+                        let Value::Object(field) = field else {
+                            continue;
+                        };
+                        if let Some(ty) = field.get_mut("type") {
+                            walk(ty);
+                        }
+                        if field.get("default").is_some_and(|d| !d.is_null()) {
+                            let fresh = loop {
+                                let candidate = format!("_default_carrier_{next}");
+                                next += 1;
+                                if !taken.contains(&candidate) {
+                                    break candidate;
+                                }
+                            };
+                            field.insert("name".to_string(), Value::String(fresh));
+                            field.remove("aliases");
+                        }
+                    }
+                }
+                for key in ["items", "values", "type"] {
+                    if let Some(child @ (Value::Object(_) | Value::Array(_))) = map.get_mut(key) {
+                        walk(child);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut schema: Value = serde_json::from_str(reader_json)
+        .map_err(|e| crate::error::CoreError::Schema(format!("bad reader avro json: {e}")))?;
+    walk(&mut schema);
+    serde_json::to_string(&schema)
+        .map_err(|e| crate::error::CoreError::Schema(format!("serialize avro json: {e}")))
+}
+
 /// Append top-level field definitions (copied verbatim from `source_json`) to
 /// `base_json` for every name in `field_names` not already present in base.
 ///
@@ -585,5 +669,113 @@ mod tests {
 
         // Malformed input is an error, not a false "equivalent".
         assert!(avro_schema_json_equivalent(base, "{not json").is_err());
+    }
+    /// `defaults_carrier_writer_json` renames away exactly the fields that declare
+    /// a default, at every depth, and resolving the reader against the result
+    /// stamps each of those defaults — including nested ones — while the fields
+    /// without one resolve to themselves.
+    #[test]
+    fn the_defaults_carrier_makes_every_defaulted_field_reader_only() {
+        use arrow_schema::DataType;
+        let reader = r#"{"type":"record","name":"R","fields":[
+            {"name":"id","type":"long"},
+            {"name":"_default_carrier_0","type":"int"},
+            {"name":"flag","type":"boolean","default":true,"aliases":["id"]},
+            {"name":"s","type":["null",{"type":"record","name":"S","fields":[
+                {"name":"x","type":"int","default":5},
+                {"name":"y","type":"string"}
+            ]}],"default":null},
+            {"name":"again","type":["null","S"]},
+            {"name":"arr","type":{"type":"array","items":{"type":"record","name":"A","fields":[
+                {"name":"a","type":"long","default":9}
+            ]}}},
+            {"name":"m","type":{"type":"map","values":{"type":"record","name":"V","fields":[
+                {"name":"v","type":"string","default":"z"}
+            ]}}},
+            {"name":"rec_default","type":{"type":"record","name":"D","fields":[
+                {"name":"d","type":"int"}
+            ]},"default":{"d":1,"fields":[{"name":"not_a_schema","default":0}]}}
+        ]}"#;
+        let carrier = defaults_carrier_writer_json(reader).unwrap();
+        let carrier_value: serde_json::Value = serde_json::from_str(&carrier).unwrap();
+        let top: Vec<&str> = carrier_value["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        // `flag` and `rec_default` declare non-null defaults; `s` declares a null
+        // one and is kept, so the record inside it is still walked. The name
+        // already taken by a real field is skipped, and the alias that would
+        // match `id` is gone.
+        assert_eq!(
+            top,
+            [
+                "id",
+                "_default_carrier_0",
+                "_default_carrier_1",
+                "s",
+                "again",
+                "arr",
+                "m",
+                "_default_carrier_2"
+            ]
+        );
+        assert!(carrier_value["fields"][2].get("aliases").is_none());
+        assert_eq!(
+            carrier_value["fields"][3]["type"][1]["fields"][0]["name"],
+            "_default_carrier_0"
+        );
+        assert_eq!(
+            carrier_value["fields"][7]["default"]["fields"][0]["name"], "not_a_schema",
+            "a default payload is data, not a schema, and is never rewritten"
+        );
+
+        let resolved = crate::file_group::log_file::avro::AvroBlockDecoder::try_new_with_reader(
+            &carrier,
+            Some(reader),
+            1,
+        )
+        .expect("a reader always resolves against its own defaults carrier")
+        .schema();
+        let default_of = |field: &arrow_schema::Field| {
+            field
+                .metadata()
+                .get("avro.field.default")
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            default_of(resolved.field_with_name("flag").unwrap()),
+            "true"
+        );
+        assert_eq!(default_of(resolved.field_with_name("id").unwrap()), "");
+        // `again` references `S` by name; the carrier's `S` still defines it.
+        for name in ["s", "again"] {
+            let DataType::Struct(children) = resolved.field_with_name(name).unwrap().data_type()
+            else {
+                panic!("{name} is a struct");
+            };
+            assert_eq!(children.len(), 2);
+            assert_eq!(default_of(&children[0]), "5", "{name}.x");
+            assert_eq!(default_of(&children[1]), "", "{name}.y");
+        }
+        let DataType::List(item) = resolved.field_with_name("arr").unwrap().data_type() else {
+            panic!("arr is a list");
+        };
+        let DataType::Struct(a) = item.data_type() else {
+            panic!("arr items are records");
+        };
+        assert_eq!(default_of(&a[0]), "9");
+        let DataType::Map(entries, _) = resolved.field_with_name("m").unwrap().data_type() else {
+            panic!("m is a map");
+        };
+        let DataType::Struct(kv) = entries.data_type() else {
+            panic!("map entries are a struct");
+        };
+        let DataType::Struct(v) = kv[1].data_type() else {
+            panic!("map values are records");
+        };
+        assert_eq!(default_of(&v[0]), "\"z\"");
     }
 }
