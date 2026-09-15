@@ -29,7 +29,7 @@ use once_cell::sync::Lazy;
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, ObjectStoreExt, parse_url_opts};
+use object_store::{ObjectStore, ObjectStoreExt, ObjectStoreScheme, parse_url_opts};
 use url::Url;
 
 use crate::config::HudiConfigs;
@@ -227,8 +227,9 @@ impl ReadVolume {
 /// `Storage` PER FILE GROUP (see `cpp/src/lib.rs`), so on a scan of N splits the
 /// uncached path pays that N times and shares no connections between them.
 ///
-/// Keyed by scheme+host plus the full option set, so two stores that differ in
-/// endpoint or credentials never share an entry — see [`object_store_cache_key`].
+/// Keyed by the store-identifying part of the URL plus the option set, so two
+/// stores that differ in bucket, container, endpoint or credentials never share
+/// an entry — see [`object_store_cache_key`].
 ///
 /// Caveat, recorded deliberately: this map is unbounded and lives for the
 /// process. That is bounded in practice by the number of DISTINCT
@@ -239,19 +240,46 @@ impl ReadVolume {
 static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Identity of a built store: scheme+host, plus the option set in a stable
-/// order. The option set is load-bearing — the same `s3://bucket/path` resolves
+/// Identity of a built store: the part of `base_url` the store is bound to,
+/// plus the option set in a stable order.
+///
+/// The URL part is everything up to the path, plus whatever leading path
+/// segments `parse_url_opts` consumes rather than hands back as the object
+/// path. That is the derivation `object_store`'s own `DefaultObjectStoreRegistry`
+/// uses, and it matters because the bucket or container is not always the host:
+///
+/// - `abfss://container@account.dfs.core.windows.net/tbl` carries the container
+///   in the user-info, so scheme+host alone is the same for every container;
+/// - `https://account.dfs.core.windows.net/container/tbl`, path-style
+///   `https://s3.<region>.amazonaws.com/bucket/tbl` and R2 carry it in the first
+///   path segment, which `parse_url_opts` strips.
+///
+/// A key that missed either would hand one container's client to a read of
+/// another, which then resolves the same relative path inside the wrong
+/// container and returns its data without error.
+///
+/// The option set is load-bearing too — the same `s3://bucket/path` resolves
 /// to different physical stores under different endpoints or credentials, so a
 /// URL-only key would hand one endpoint's client to another's read.
 fn object_store_cache_key(base_url: &Url, options: &HashMap<String, String>) -> String {
-    let host_part = format!(
-        "{}://{}",
-        base_url.scheme(),
-        base_url.host_str().unwrap_or("")
-    );
+    let url_part = match ObjectStoreScheme::parse(base_url) {
+        Ok((_, path)) => {
+            let segments = || base_url.path().split('/').filter(|s| !s.is_empty());
+            let consumed = segments().count().saturating_sub(path.parts_count());
+            let mut url_part = base_url[..url::Position::AfterPort].to_string();
+            for segment in segments().take(consumed) {
+                url_part.push('/');
+                url_part.push_str(segment);
+            }
+            url_part
+        }
+        // Unrecognised: `parse_url_opts` refuses it too, so nothing is cached
+        // under this key; the whole URL is the conservative identity.
+        Err(_) => base_url.as_str().to_string(),
+    };
     let mut opts: Vec<(&String, &String)> = options.iter().collect();
     opts.sort();
-    format!("{host_part}|{opts:?}")
+    format!("{url_part}|{opts:?}")
 }
 
 impl Storage {
@@ -772,6 +800,104 @@ mod tests {
         assert!(
             Arc::ptr_eq(&first.object_store, &second.object_store),
             "two Storages over the same (host, options) must share one ObjectStore"
+        );
+    }
+
+    #[test]
+    fn test_object_store_cache_key_separates_stores_that_differ_only_in_bucket_or_container() {
+        // Every pair names two different stores whose scheme and host are the
+        // same: the bucket or container lives in the user-info or the first
+        // path segment. Each pair must key apart, or the second read is served
+        // by the first store's client.
+        let no_options = HashMap::new();
+        let pairs = [
+            (
+                "abfss://container-a@acct.dfs.core.windows.net/tbl",
+                "abfss://container-b@acct.dfs.core.windows.net/tbl",
+            ),
+            (
+                "abfs://container-a@acct.blob.core.windows.net/tbl",
+                "abfs://container-b@acct.blob.core.windows.net/tbl",
+            ),
+            (
+                "https://acct.dfs.core.windows.net/container-a/tbl",
+                "https://acct.dfs.core.windows.net/container-b/tbl",
+            ),
+            (
+                "https://acct.blob.core.windows.net/container-a/tbl",
+                "https://acct.blob.core.windows.net/container-b/tbl",
+            ),
+            (
+                "https://s3.us-west-2.amazonaws.com/bucket-a/tbl",
+                "https://s3.us-west-2.amazonaws.com/bucket-b/tbl",
+            ),
+            (
+                "https://acct.r2.cloudflarestorage.com/bucket-a/tbl",
+                "https://acct.r2.cloudflarestorage.com/bucket-b/tbl",
+            ),
+            ("s3://bucket-a/tbl", "s3://bucket-b/tbl"),
+        ];
+        for (a, b) in pairs {
+            assert_ne!(
+                object_store_cache_key(&Url::parse(a).unwrap(), &no_options),
+                object_store_cache_key(&Url::parse(b).unwrap(), &no_options),
+                "{a} and {b} are different stores"
+            );
+        }
+    }
+
+    #[test]
+    fn test_object_store_cache_key_is_shared_by_tables_in_one_store() {
+        // The other direction: the table path inside a store is not part of
+        // its identity, so tables in one bucket or container share a client.
+        let no_options = HashMap::new();
+        let pairs = [
+            (
+                "abfss://container@acct.dfs.core.windows.net/tbl-a",
+                "abfss://container@acct.dfs.core.windows.net/db/tbl-b",
+            ),
+            (
+                "https://acct.dfs.core.windows.net/container/tbl-a",
+                "https://acct.dfs.core.windows.net/container/db/tbl-b",
+            ),
+            (
+                "https://s3.us-west-2.amazonaws.com/bucket/tbl-a",
+                "https://s3.us-west-2.amazonaws.com/bucket/db/tbl-b",
+            ),
+            ("s3://bucket/tbl-a", "s3://bucket/db/tbl-b"),
+            ("file:///tmp/tbl-a", "file:///var/db/tbl-b"),
+        ];
+        for (a, b) in pairs {
+            assert_eq!(
+                object_store_cache_key(&Url::parse(a).unwrap(), &no_options),
+                object_store_cache_key(&Url::parse(b).unwrap(), &no_options),
+                "{a} and {b} are the same store"
+            );
+        }
+    }
+
+    #[test]
+    fn test_storage_new_does_not_share_an_object_store_across_containers() {
+        // The negative half of the reuse test, through `Storage::new`: two
+        // Azure containers under one account must get two clients.
+        let storage_for = |base_path: &str| {
+            let configs = Arc::new(HudiConfigs::new([(
+                HudiTableConfig::BasePath.as_ref().to_string(),
+                base_path.to_string(),
+            )]));
+            Storage::new(Arc::new(HashMap::new()), configs).unwrap()
+        };
+        let prod = storage_for("abfss://prod@acct.dfs.core.windows.net/sales");
+        let staging = storage_for("abfss://staging@acct.dfs.core.windows.net/sales");
+        let prod_again = storage_for("abfss://prod@acct.dfs.core.windows.net/orders");
+
+        assert!(
+            !Arc::ptr_eq(&prod.object_store, &staging.object_store),
+            "two containers must not share one ObjectStore"
+        );
+        assert!(
+            Arc::ptr_eq(&prod.object_store, &prod_again.object_store),
+            "two tables in one container share one ObjectStore"
         );
     }
 
