@@ -4821,6 +4821,12 @@ mod tests {
         /// interpolated message (`String`). `panic_message` has an arm for each
         /// and only one of them used to be reachable from a test.
         panic_is_literal: bool,
+        /// When set, the SERVED stats carry non-zero drain counters — a provider
+        /// filling them against contract, which is the only shape that can tell
+        /// whether the decline path zeroes them. Every other fixture leaves all
+        /// three at `Default::default()`, so an assertion that they are zero on a
+        /// decline is satisfied by the fixture rather than by the code.
+        serve_with_drain_counters: bool,
         /// The request fields of the last call.
         seen: StdMutex<Option<SeenRequest>>,
     }
@@ -4844,6 +4850,7 @@ mod tests {
                 fail_after_serving: false,
                 panic_after_serving: false,
                 panic_is_literal: false,
+                serve_with_drain_counters: false,
                 seen: StdMutex::new(None),
             })
         }
@@ -4855,6 +4862,7 @@ mod tests {
                 fail_after_serving: true,
                 panic_after_serving: false,
                 panic_is_literal: false,
+                serve_with_drain_counters: false,
                 seen: StdMutex::new(None),
             })
         }
@@ -4867,6 +4875,7 @@ mod tests {
                 fail_after_serving: false,
                 panic_after_serving: true,
                 panic_is_literal: false,
+                serve_with_drain_counters: false,
                 seen: StdMutex::new(None),
             })
         }
@@ -4880,6 +4889,22 @@ mod tests {
                 fail_after_serving: false,
                 panic_after_serving: true,
                 panic_is_literal: true,
+                serve_with_drain_counters: false,
+                seen: StdMutex::new(None),
+            })
+        }
+
+        /// Serves `batches` AND reports drain counters, which a conforming
+        /// provider must not do — those are hudi-rs's to count as it drains.
+        /// Used to prove the decline path zeroes them rather than folding a
+        /// provider's numbers into the live slot for a file nothing drained.
+        fn serving_with_drain_counters(batches: Vec<RecordBatch>) -> Arc<Self> {
+            Arc::new(Self {
+                serve: Some(batches),
+                fail_after_serving: false,
+                panic_after_serving: false,
+                panic_is_literal: false,
+                serve_with_drain_counters: true,
                 seen: StdMutex::new(None),
             })
         }
@@ -4890,6 +4915,7 @@ mod tests {
                 fail_after_serving: false,
                 panic_after_serving: false,
                 panic_is_literal: false,
+                serve_with_drain_counters: false,
                 seen: StdMutex::new(None),
             })
         }
@@ -4997,6 +5023,23 @@ mod tests {
                         Some(reader),
                         BaseFileProviderStats {
                             files_served: 1,
+                            // Distinct non-zero values so a single surviving
+                            // assignment is identifiable, not just "non-zero".
+                            rows_served: if self.serve_with_drain_counters {
+                                11
+                            } else {
+                                0
+                            },
+                            bytes_materialized: if self.serve_with_drain_counters {
+                                22
+                            } else {
+                                0
+                            },
+                            batches_received: if self.serve_with_drain_counters {
+                                33
+                            } else {
+                                0
+                            },
                             ..Default::default()
                         },
                     )
@@ -5273,7 +5316,12 @@ mod tests {
             let base_name = "f1-0_0-1-1_001.parquet";
             write_parquet_file(tmp.path(), base_name, &on_disk);
 
-            let provider = StubDataProvider::serving(vec![served]);
+            // Reports drain counters it has no business reporting. A conforming
+            // provider leaves them at zero, which is exactly why the plain
+            // `serving` stub cannot test the zeroing on the decline path: with the
+            // fixture at `Default::default()`, deleting all three assignments
+            // leaves any "they are zero" assertion passing.
+            let provider = StubDataProvider::serving_with_drain_counters(vec![served]);
             let mut reader =
                 reader_with_provider(tmp.path(), base_name, schema.clone(), provider.clone()).await;
             let live = reader.base_file_provider_live_stats();
@@ -5305,9 +5353,10 @@ mod tests {
                  decline is silent to an operator"
             );
             assert_eq!(
-                (s.rows_served, s.batches_received),
-                (0, 0),
-                "{case}: nothing was drained from the declined stream"
+                (s.rows_served, s.bytes_materialized, s.batches_received),
+                (0, 0, 0),
+                "{case}: nothing was drained from the declined stream, so the \
+                 provider's own (11, 22, 33) must not survive into the live slot"
             );
         }
     }
@@ -5362,7 +5411,12 @@ mod tests {
             let base_name = "f1-0_0-1-1_001.parquet";
             write_parquet_file(tmp.path(), base_name, &on_disk);
 
-            let provider = StubDataProvider::serving(vec![served]);
+            // Reports drain counters it has no business reporting. A conforming
+            // provider leaves them at zero, which is exactly why the plain
+            // `serving` stub cannot test the zeroing on the decline path: with the
+            // fixture at `Default::default()`, deleting all three assignments
+            // leaves any "they are zero" assertion passing.
+            let provider = StubDataProvider::serving_with_drain_counters(vec![served]);
             let mut reader =
                 reader_with_provider(tmp.path(), base_name, schema.clone(), provider.clone()).await;
             let live = reader.base_file_provider_live_stats();
@@ -5393,6 +5447,12 @@ mod tests {
                 (s.files_served, s.storage_fallbacks),
                 (0, 1),
                 "{case}: a declined serve is reclassified as the storage fallback it became"
+            );
+            assert_eq!(
+                (s.rows_served, s.bytes_materialized, s.batches_received),
+                (0, 0, 0),
+                "{case}: and the provider's own (11, 22, 33) must not survive the \
+                 decline — nothing was drained from that stream"
             );
         }
     }
