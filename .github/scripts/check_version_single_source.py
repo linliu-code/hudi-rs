@@ -106,9 +106,11 @@ SECTION = re.compile(r"^\[([^\[\]]+)\]$")
 ARRAY_SECTION = re.compile(r"^\[\[([^\[\]]+)\]\]$")
 DEP_KINDS = ("dependencies", "dev-dependencies", "build-dependencies")
 ENTRY = re.compile(r"""^("[^"]*"|'[^']*'|[A-Za-z0-9_.-]+)\s*=\s*(.*)$""")
-KEY_PATH = re.compile(r'(?<![A-Za-z0-9_-])path\s*=\s*"([^"]*)"')
-KEY_VERSION = re.compile(r'(?<![A-Za-z0-9_-])version\s*=\s*"([^"]*)"')
-KEY_PACKAGE = re.compile(r'(?<![A-Za-z0-9_-])package\s*=\s*"([^"]*)"')
+# Values may be basic ("...") or literal ('...') strings; exactly one of the two groups matches.
+_STRING = r"""(?:"([^"]*)"|'([^']*)')"""
+KEY_PATH = re.compile(r"(?<![A-Za-z0-9_-])path\s*=\s*" + _STRING)
+KEY_VERSION = re.compile(r"(?<![A-Za-z0-9_-])version\s*=\s*" + _STRING)
+KEY_PACKAGE = re.compile(r"(?<![A-Za-z0-9_-])package\s*=\s*" + _STRING)
 # A dependency that names a registry or a git source is not the workspace's own crate, whatever
 # its name.
 KEY_ELSEWHERE = re.compile(r"(?<![A-Za-z0-9_-])(git|registry)\s*=")
@@ -129,6 +131,44 @@ class Dep(NamedTuple):
     name: str
     spec: str
     version_line: int | None
+
+
+def string_value(m: re.Match) -> tuple[str, int, int]:
+    """(value, start, end) of whichever string group of a KEY_* match matched."""
+    g = 1 if m.group(1) is not None else 2
+    return m.group(g), m.start(g), m.end(g)
+
+
+def blank_strings(code: str) -> str:
+    """Returns `code` with the contents of quoted strings replaced by spaces (same length).
+
+    Used to count brackets and braces, which must not be counted inside a string such as
+    `package = "a{b"`.
+    """
+    out, quote, i = [], None, 0
+    while i < len(code):
+        ch = code[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(code):
+                out.append("  ")
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+                out.append(ch)
+            else:
+                out.append(" ")
+        else:
+            if ch in "\"'":
+                quote = ch
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def depth(code: str, opener: str, closer: str) -> int:
+    bare = blank_strings(code)
+    return bare.count(opener) - bare.count(closer)
 
 
 def code_part(line: str) -> str:
@@ -276,6 +316,23 @@ def dep_entries(text: str):
             continue
         key, value = split_key(m.group(1)), m.group(2).strip()
         name = unquote(key[0])
+        if value.startswith("["):
+            # A multi-line array (`name.features = [` ... `]`): consume its continuation lines.
+            start = i
+            level = depth(value, "[", "]")
+            while level > 0 and i + 1 < len(lines) and not header(lines[i + 1]):
+                i += 1
+                level += depth(code_part(lines[i]), "[", "]")
+            if level > 0:
+                yield Dep(UNPARSED, f"[{table}] {name} has an unterminated array", "", None)
+                i += 1
+                continue
+            if len(key) == 2:
+                dotted.setdefault(name, []).append(start)
+            else:
+                yield Dep(UNPARSED, f"[{table}] {name} = {value}", "", None)
+            i += 1
+            continue
         if len(key) == 2:
             dotted.setdefault(name, []).append(i)
             i += 1
@@ -286,11 +343,14 @@ def dep_entries(text: str):
             continue
         if value.startswith("{"):
             start = i
-            depth = value.count("{") - value.count("}")
-            while depth > 0 and i + 1 < len(lines):
+            level = depth(value, "{", "}")
+            while level > 0 and i + 1 < len(lines) and not header(lines[i + 1]):
                 i += 1
-                nxt = code_part(lines[i])
-                depth += nxt.count("{") - nxt.count("}")
+                level += depth(code_part(lines[i]), "{", "}")
+            if level > 0:
+                yield Dep(UNPARSED, f"[{table}] {name} has an unterminated inline table", "", None)
+                i += 1
+                continue
             spec = "\n".join([value] + [code_part(lines[k]) for k in range(start + 1, i + 1)])
             yield Dep(table, name, spec, version_line_in(lines, range(start, i + 1)))
         elif STRING_VALUE.match(value):
@@ -309,7 +369,8 @@ def rewrite_version(line: str, want: str) -> str:
     rest = line[len(code):]
     m = KEY_VERSION.search(code)
     if m:
-        return code[:m.start(1)] + want + code[m.end(1):] + rest
+        _, start, end = string_value(m)
+        return code[:start] + want + code[end:] + rest
     key, eq, value = code.partition("=")
     sm = STRING_VALUE.match(value.strip())
     if not eq or not sm:
@@ -330,7 +391,7 @@ def workspace_members() -> list[str]:
     its own unrelated version on purpose and is none of this checker's business: it is not part of
     this workspace and nothing published from here derives from it.
     """
-    text = (ROOT / "Cargo.toml").read_text()
+    text = "\n".join(code_part(line) for line in (ROOT / "Cargo.toml").read_text().splitlines())
     block = re.search(r"^\[workspace\]\s*$(.*?)(?=^\[)", text, re.M | re.S)
     if not block:
         raise SystemExit("Cargo.toml has no [workspace] section, so rule 0 cannot know what the "
@@ -470,7 +531,9 @@ def main() -> int:
         if Path(rel).name != "Cargo.toml":
             continue
         in_workspace = rel == "Cargo.toml" or rel in members
-        text = (ROOT / rel).read_text()
+        # Bytes, not read_text(): universal newlines would turn a CRLF manifest into LF on --fix.
+        text = (ROOT / rel).read_bytes().decode("utf-8")
+        lines_kept = text.splitlines(keepends=True)
         rewrites: dict[int, str] = {}
         for section, name, spec, version_line in dep_entries(text):
             if section == UNPARSED:
@@ -481,38 +544,38 @@ def main() -> int:
                 )
                 continue
             renamed = KEY_PACKAGE.search(spec)
+            renamed = string_value(renamed)[0] if renamed else None
             # A bare `tpch = "0.3"` from the registry would still read as the member `tpch` here; no
             # such dependency exists, and one would be reported loudly rather than skipped.
             names_member = (in_workspace and not KEY_ELSEWHERE.search(spec)
-                            and (renamed.group(1) if renamed else name) in member_names)
+                            and (renamed or name) in member_names)
             if not KEY_PATH.search(spec) and not names_member:
                 continue  # not an intra-workspace dependency
             got = KEY_VERSION.search(spec)
+            got = string_value(got)[0] if got else None
             if got is None:
                 continue  # path-only: cargo resolves it by path, there is no literal to drift
             checked_deps += 1
-            if got.group(1) == want:
+            if got == want:
                 continue
             if fix:
-                lines = text.splitlines(keepends=True)
-                line = lines[version_line] if version_line is not None else ""
+                line = lines_kept[version_line] if version_line is not None else ""
                 body = line.rstrip("\r\n")
                 new = rewrite_version(body, want)
                 if version_line is None or new == body:
                     failures.append(f"{rel}: [{section}] {name} could not be rewritten")
                 else:
                     rewrites[version_line] = new + line[len(body):]
-                    fixed.append(f"{rel}: [{section}] {name} {got.group(1)} -> {want}")
+                    fixed.append(f"{rel}: [{section}] {name} {got} -> {want}")
             else:
                 failures.append(
-                    f"{rel}: [{section}] {name} requests version \"{got.group(1)}\" "
+                    f"{rel}: [{section}] {name} requests version \"{got}\" "
                     f"but the authority is \"{want}\""
                 )
         if rewrites:
-            lines = text.splitlines(keepends=True)
             for index, new_line in rewrites.items():
-                lines[index] = new_line
-            (ROOT / rel).write_text("".join(lines))
+                lines_kept[index] = new_line
+            (ROOT / rel).write_bytes("".join(lines_kept).encode("utf-8"))
 
     # ---- Rule 2: nothing else carries a copy of a project version. ----
     for rel in tracked:

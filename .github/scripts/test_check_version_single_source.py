@@ -185,6 +185,13 @@ class ReleaseBumps(CheckerTestCase):
 
 
 class Rule0Members(CheckerTestCase):
+    def test_a_comment_in_the_members_list_does_not_hide_members(self):
+        count = re.search(r"checked: (\d+) workspace member", self.tree.check().stdout).group(1)
+        self.tree.sub("Cargo.toml", r'^    "crates/\*",$', '    "crates/*", # see [notes]')
+        result = self.tree.check()
+        self.assertPasses(result)
+        self.assertIn(f"checked: {count} workspace member", result.stdout)
+
     def test_a_member_declaring_its_own_version_fails(self):
         self.tree.sub("crates/core/Cargo.toml", r"^version\.workspace = true$", f'version = "{dev("0.5.0")}"')
         self.assertFails(self.tree.check(), "crates/core/Cargo.toml: workspace member declares its own version")
@@ -277,6 +284,46 @@ class Rule1Dependencies(CheckerTestCase):
         manifest = self.tree.read("crates/hudi/Cargo.toml")
         self.assertIn('foo = { version = "1.2", features = ["x"] } # {', manifest)
         self.assertIn(f'hudi-core = {{ version = "{self.want}"', manifest)
+
+    def test_a_brace_in_a_string_does_not_merge_entries_and_fix_rewrites_the_right_one(self):
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
+                      'foo = { version = "1.2", package = "a{b" }\n'
+                      'hudi-core = { version = "0.5.0", path = "../core", default-features = false }')
+        self.assertFails(self.tree.check(), 'hudi-core requests version "0.5.0"')
+        self.assertPasses(self.tree.check("--fix"))
+        manifest = self.tree.read("crates/hudi/Cargo.toml")
+        self.assertIn('foo = { version = "1.2", package = "a{b" }', manifest)
+        self.assertIn(f'hudi-core = {{ version = "{self.want}"', manifest)
+
+    def test_single_quoted_values_are_read_and_rewritten(self):
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
+                      "hudi-core = { version = '0.5.0', path = '../core', default-features = false }")
+        self.assertFails(self.tree.check(), 'hudi-core requests version "0.5.0"')
+        self.assertPasses(self.tree.check("--fix"))
+        self.assertIn(f"hudi-core = {{ version = '{self.want}'", self.tree.read("crates/hudi/Cargo.toml"))
+        self.assertPasses(self.tree.check())
+
+    def test_a_single_quoted_sub_table_is_read(self):
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
+                      "[dependencies.hudi-core]\nversion = '0.5.0'\npath = '../core'\n\n[dependencies]")
+        self.assertFails(self.tree.check(), 'hudi-core requests version "0.5.0"')
+
+    def test_fix_keeps_crlf_line_endings(self):
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
+                      f'hudi-core = {{ version = "{dev("0.5.0")}", path = "../core", default-features = false }}')
+        path = self.tree.dir / "crates/hudi/Cargo.toml"
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        lines = path.read_bytes().count(b"\r\n")
+        self.assertPasses(self.tree.check("--fix"))
+        after = path.read_bytes()
+        self.assertEqual(after.count(b"\r\n"), lines)
+        self.assertEqual(after.count(b"\n"), lines)
+        self.assertIn(f'hudi-core = {{ version = "{self.want}"'.encode(), after)
+
+    def test_a_multi_line_array_under_a_dotted_key_passes(self):
+        self.tree.sub("crates/hudi/Cargo.toml", r"^\[dependencies\]$",
+                      '[dependencies]\nlog.workspace = true\nlog.features = [\n    "std", # ] not the end\n]')
+        self.assertPasses(self.tree.check())
 
     def test_a_commented_out_version_is_neither_read_nor_rewritten(self):
         self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
