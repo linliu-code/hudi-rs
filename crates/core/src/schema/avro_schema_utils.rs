@@ -152,7 +152,10 @@ pub(crate) fn avro_schema_json_equivalent(a_json: &str, b_json: &str) -> crate::
 /// evolution added. The defaults are the reader's, so they are read from the
 /// reader schema.
 ///
-/// A name that does not resolve, or a union whose branch count disagrees with
+/// Names resolve exactly as arrow-avro resolves them (`(namespace, name)`, a
+/// record's children in the record's namespace), because the Arrow schema is
+/// arrow-avro's. A null default is not stamped: it fills the same null as no
+/// default. A name that does not resolve, or a union whose branch count disagrees with
 /// the Arrow union, is left unstamped rather than guessed at: the fill then
 /// behaves as it would with no default declared. A recursive reference stops at
 /// the first repeat.
@@ -171,44 +174,45 @@ pub(crate) fn with_avro_defaults(
         "null", "boolean", "int", "long", "float", "double", "bytes", "string",
     ];
 
-    fn full_name(name: &str, namespace: Option<&str>) -> String {
-        match namespace {
-            Some(ns) if !name.contains('.') && !ns.is_empty() => format!("{ns}.{name}"),
-            _ => name.to_string(),
-        }
-    }
-
-    /// The namespace a named type's own children resolve names against.
-    fn own_namespace<'a>(
+    /// The namespace a node's children resolve names in, as arrow-avro assigns
+    /// it: a record's own `namespace` attribute, else the enclosing one. Nothing
+    /// else — not a dotted name, not an array or map — sets one.
+    fn child_namespace<'a>(
         node: &'a serde_json::Map<String, Value>,
         enclosing: Option<&'a str>,
     ) -> Option<&'a str> {
-        let name = node.get("name").and_then(Value::as_str);
-        match (
-            node.get("namespace").and_then(Value::as_str),
-            name.and_then(|n| n.rsplit_once('.')),
-        ) {
-            (_, Some((ns, _))) => Some(ns),
-            (Some(ns), None) => Some(ns),
-            (None, None) => enclosing,
+        match node.get("type").and_then(Value::as_str) {
+            Some("record" | "error") => node.get("namespace").and_then(Value::as_str).or(enclosing),
+            _ => enclosing,
         }
     }
 
-    /// Every named type (record, enum, fixed) by full name.
-    fn register<'a>(
-        node: &'a Value,
-        namespace: Option<&'a str>,
-        named: &mut HashMap<String, &'a Value>,
-    ) {
+    /// The key arrow-avro registers a named type under, and resolves a
+    /// reference to: `(namespace, name)`, where a dotted reference names its own
+    /// namespace. There is no fallback to a bare name, because arrow-avro has none.
+    fn named_key(name: &str, namespace: Option<&str>) -> (String, String) {
+        match name.rsplit_once('.') {
+            Some((ns, n)) => (ns.to_string(), n.to_string()),
+            None => (namespace.unwrap_or("").to_string(), name.to_string()),
+        }
+    }
+
+    type Named<'a> = HashMap<(String, String), (&'a Value, Option<&'a str>)>;
+
+    /// Every record by the key arrow-avro registers it under, with the namespace
+    /// its fields resolve names in.
+    fn register<'a>(node: &'a Value, namespace: Option<&'a str>, named: &mut Named<'a>) {
         match node {
             Value::Array(branches) => branches.iter().for_each(|b| register(b, namespace, named)),
             Value::Object(map) => {
-                let inner = own_namespace(map, namespace);
-                if let (Some(name), Some("record" | "error" | "enum" | "fixed")) = (
+                let inner = child_namespace(map, namespace);
+                if let (Some(name), Some("record" | "error")) = (
                     map.get("name").and_then(Value::as_str),
                     map.get("type").and_then(Value::as_str),
                 ) {
-                    named.entry(full_name(name, inner)).or_insert(node);
+                    named
+                        .entry((inner.unwrap_or("").to_string(), name.to_string()))
+                        .or_insert((node, inner));
                 }
                 if let Some(Value::Array(fields)) = map.get("fields") {
                     for field in fields {
@@ -228,8 +232,8 @@ pub(crate) fn with_avro_defaults(
     }
 
     struct Stamper<'a> {
-        named: HashMap<String, &'a Value>,
-        in_progress: Vec<String>,
+        named: Named<'a>,
+        in_progress: Vec<(String, String)>,
     }
 
     impl<'a> Stamper<'a> {
@@ -253,7 +257,10 @@ pub(crate) fn with_avro_defaults(
                         None => field.data_type().clone(),
                     };
                     let mut metadata = field.metadata().clone();
-                    if let Some(default) = json.get("default") {
+                    // A null default is left off: filling with it and filling with
+                    // no default give the same null, and a stamp on a present
+                    // nested field would only make the rewrite rebuild its parent.
+                    if let Some(default) = json.get("default").filter(|d| !d.is_null()) {
                         metadata.insert(
                             crate::schema::batch_evolution::AVRO_FIELD_DEFAULT_KEY.to_string(),
                             default.to_string(),
@@ -286,14 +293,13 @@ pub(crate) fn with_avro_defaults(
             match ty {
                 Value::String(name) if PRIMITIVES.contains(&name.as_str()) => data_type.clone(),
                 Value::String(name) => {
-                    let key = [full_name(name, namespace), name.clone()]
-                        .into_iter()
-                        .find(|k| self.named.contains_key(k));
-                    match key {
-                        Some(key) if !self.in_progress.contains(&key) => {
-                            let definition = self.named[&key];
+                    let key = named_key(name, namespace);
+                    match self.named.get(&key).copied() {
+                        // Followed in the DEFINITION's namespace, which is where
+                        // arrow-avro built the type a reference returns.
+                        Some((definition, defined_in)) if !self.in_progress.contains(&key) => {
                             self.in_progress.push(key);
-                            let stamped = self.stamp_type(definition, data_type, namespace);
+                            let stamped = self.stamp_type(definition, data_type, defined_in);
                             self.in_progress.pop();
                             stamped
                         }
@@ -330,7 +336,7 @@ pub(crate) fn with_avro_defaults(
                     }
                 }
                 Value::Object(map) => {
-                    let inner = own_namespace(map, namespace);
+                    let inner = child_namespace(map, namespace);
                     match (map.get("type"), data_type) {
                         (Some(Value::String(kind)), DataType::Struct(fields))
                             if kind == "record" || kind == "error" =>
@@ -408,7 +414,7 @@ pub(crate) fn with_avro_defaults(
     };
     let mut named = HashMap::new();
     register(&reader, None, &mut named);
-    let namespace = reader.as_object().and_then(|m| own_namespace(m, None));
+    let namespace = reader.as_object().and_then(|m| child_namespace(m, None));
     let mut stamper = Stamper {
         named,
         in_progress: Vec::new(),
@@ -915,7 +921,7 @@ mod tests {
             "a record default whose field is named `doc` is data"
         );
     }
-    /// `with_avro_defaults` stamps each declared default as its JSON text at every
+    /// `with_avro_defaults` stamps each declared non-null default as its JSON text at every
     /// depth — record fields, array items, map values, nullable and general union
     /// branches, named types referenced by simple or full name anywhere after their
     /// definition — changes nothing else, and terminates on a recursive reference.
@@ -1047,7 +1053,11 @@ mod tests {
 
         assert_eq!(default_of(&top("id")), None);
         assert_eq!(default_of(&top("flag")).as_deref(), Some("true"));
-        assert_eq!(default_of(&top("note")).as_deref(), Some("null"));
+        assert_eq!(
+            default_of(&top("note")),
+            None,
+            "a null default is not stamped"
+        );
         let s_in_a = child(top("a").data_type(), "s");
         assert_eq!(
             default_of(&child(s_in_a.data_type(), "x")).as_deref(),
@@ -1082,10 +1092,7 @@ mod tests {
             Some("1.5")
         );
         let node = top("node");
-        assert_eq!(
-            default_of(&child(node.data_type(), "next")).as_deref(),
-            Some("null")
-        );
+        assert_eq!(default_of(&child(node.data_type(), "next")), None);
         assert_eq!(
             default_of(&child(node.data_type(), "d")).as_deref(),
             Some("0")
@@ -1134,5 +1141,54 @@ mod tests {
             )
         };
         assert_eq!(strip(&stamped), schema);
+    }
+    /// A reference is followed in the namespace its type was DEFINED in, as
+    /// arrow-avro builds it, not the namespace of the site that refers to it. Here
+    /// two records are both named `T`: `other.T` (default 1) and `top.T` (default
+    /// 2). `b` refers to `other.S`, whose field says just `"T"`, which is
+    /// `other.T`. Resolved in the referring namespace, the walk would stamp 2.
+    #[test]
+    fn with_avro_defaults_follows_a_reference_in_its_definition_namespace() {
+        use arrow_schema::DataType;
+        let reader = r#"{"type":"record","name":"R","namespace":"top","fields":[
+            {"name":"a","type":{"type":"record","name":"A","namespace":"other","fields":[
+                {"name":"t","type":{"type":"record","name":"T","fields":[
+                    {"name":"k","type":"int","default":1}]}},
+                {"name":"s","type":{"type":"record","name":"S","fields":[
+                    {"name":"t2","type":"T"}]}}]}},
+            {"name":"top_t","type":{"type":"record","name":"T","fields":[
+                {"name":"k","type":"int","default":2}]}},
+            {"name":"b","type":["null","other.S"],"default":null}
+        ]}"#;
+        let schema = crate::ffi_support::arrow_schema_from_avro_json(reader)
+            .expect("arrow-avro converts the reader schema");
+        let stamped = with_avro_defaults(&schema, reader).unwrap();
+        let struct_child = |dt: &DataType, name: &str| match dt {
+            DataType::Struct(fields) => fields
+                .iter()
+                .find(|f| f.name() == name)
+                .unwrap_or_else(|| panic!("no {name}"))
+                .clone(),
+            other => panic!("{other} is not a struct"),
+        };
+        let k_default = |dt: &DataType| {
+            struct_child(dt, "k")
+                .metadata()
+                .get("avro.field.default")
+                .cloned()
+        };
+        let b = stamped.field_with_name("b").unwrap();
+        let b_t2 = struct_child(b.data_type(), "t2");
+        assert_eq!(
+            k_default(b_t2.data_type()).as_deref(),
+            Some("1"),
+            "b.t2 is other.T"
+        );
+        let top_t = stamped.field_with_name("top_t").unwrap();
+        assert_eq!(
+            k_default(top_t.data_type()).as_deref(),
+            Some("2"),
+            "top_t is top.T"
+        );
     }
 }
