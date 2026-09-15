@@ -240,20 +240,22 @@ impl DataBlock {
 
         let kv = KeyValue::parse(&self.data, offset);
 
-        // Each length on its own, before any arithmetic on them. Both are big-endian
-        // `i32` read `as usize`, so a negative one (`FF FF FF FF`) is near
-        // `usize::MAX`; summing it into `record_size()` wrapped back to a small size
-        // in a release build, passed the bound below, and the iterator walked on
-        // emitting records read out of the corrupt one's bytes. `record_size()` now
-        // saturates as well, but a length larger than the block is corrupt on its
-        // own, and saying so here names the field rather than the sum.
+        // Each length on its own, before `record_size()` sums them. Both are
+        // big-endian `i32` read `as usize`, so a negative one (`FF FF FF FF`) is near
+        // `usize::MAX`; an unchecked sum wrapped back to a small size in a release
+        // build, passed the bound below, and the iterator walked on emitting records
+        // read out of the corrupt one's bytes. `record_size()` saturates, but a
+        // length larger than the block is corrupt on its own, and saying so here
+        // names the field rather than the sum.
         if kv.key_length() > self.content_end || kv.value_length() > self.content_end {
+            // Printed as the signed 4-byte values on disk, so a negative length reads
+            // as `-1` rather than as `usize::MAX`. Both came from an `i32`, so the
+            // cast back is exact.
             return Err(HFileError::InvalidFormat(format!(
                 "corrupt HFile data block: the record at offset {offset} declares key={} \
-                 value={} bytes, and neither can exceed the block content end {} (a negative \
-                 4-byte length reads as a length past any block)",
-                kv.key_length(),
-                kv.value_length(),
+                 value={} bytes, and neither can exceed the block content end {}",
+                kv.key_length() as i32,
+                kv.value_length() as i32,
                 self.content_end,
             )));
         }
@@ -684,8 +686,9 @@ mod tests {
         );
     }
 
-    /// A record whose 4-byte key length is `FF FF FF FF`, followed by a
-    /// well-formed record so the corrupt one is not at the end of the block.
+    /// A record whose 4-byte key or value length is negative (`FF FF FF FF` for
+    /// `-1`), followed by a well-formed record so the corrupt one is not at the
+    /// end of the block.
     ///
     /// Both lengths are big-endian `i32`, so `FF FF FF FF` is `-1`, which
     /// `as usize` turns into `usize::MAX`. `record_size()` then wrapped to 8 in a
@@ -708,10 +711,15 @@ mod tests {
         let err = block
             .read_key_value(0)
             .expect_err("a negative key length must not parse as a record");
-        assert!(
-            matches!(err, HFileError::InvalidFormat(_)),
-            "expected InvalidFormat, got: {err:?}"
-        );
+        // The length guard, not only the `record_size()` bound after it: it names
+        // the declared field, printed as the signed value on disk.
+        match err {
+            HFileError::InvalidFormat(msg) => assert!(
+                msg.contains("declares key=-1 value=0") && msg.contains("neither can exceed"),
+                "expected the length guard's message, got: {msg}"
+            ),
+            other => panic!("expected InvalidFormat, got: {other:?}"),
+        }
     }
 
     #[test]

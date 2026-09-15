@@ -309,9 +309,11 @@ impl KeyValue {
     /// Returns the total size of this key-value record including MVCC timestamp.
     ///
     /// Saturating: both lengths are read as `i32 as usize`, so a corrupt negative
-    /// length is near `usize::MAX`. A plain `+` wrapped that to a small, plausible
-    /// size in a release build and panicked in a debug one. `usize::MAX` instead
-    /// exceeds every bound a caller checks this against.
+    /// length is near `usize::MAX`, which an unchecked sum wraps to a small,
+    /// plausible size in a release build and panics on in a debug one. `usize::MAX`
+    /// instead exceeds every bound a caller checks this against. `value()` does not
+    /// bound its slice, so a record must pass `DataBlock::read_key_value`'s checks
+    /// before its value is read.
     pub fn record_size(&self) -> usize {
         // header (8) + key + value + mvcc timestamp (1)
         KEY_VALUE_HEADER_SIZE
