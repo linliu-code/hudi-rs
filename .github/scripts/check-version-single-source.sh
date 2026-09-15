@@ -26,4 +26,4 @@
 # remembered at the next bump, this asserts them against the authority and CI runs it.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
-exec python3 "$(pwd)/.github/scripts/check_version_single_source.py" "$@"
+exec python3 .github/scripts/check_version_single_source.py "$@"

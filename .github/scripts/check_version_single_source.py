@@ -42,7 +42,8 @@ ROOT = Path(__file__).resolve().parents[2]
 # under `[package.metadata]`, is deliberately NOT a failure: it is inert to cargo and to every
 # artifact this project publishes, and a rule broad enough to catch it would have to guess which
 # of a manifest's many versions is the project's own.
-LITERAL_ALLOWED_SUFFIXES = ("Cargo.toml", "Cargo.lock")
+# Compared with the file's NAME, so `fooCargo.toml` is swept like any other file.
+LITERAL_ALLOWED_NAMES = ("Cargo.toml", "Cargo.lock")
 
 # One prose file is exempt: crates/jni/README.md records the versions of carriers that were
 # actually published, which are history and must NOT be rewritten by a bump. The exemption is
@@ -69,11 +70,18 @@ MUST_DERIVE = {
     "cpp/CMakeLists.txt": "file(READ",
 }
 
-# Rule 2 sweeps for TWO patterns, because either alone has a hole:
+# Rule 2 sweeps for more than one pattern, because each alone has a hole:
 #   * the `-dev` shape catches any development version, including a STALE one left behind
 #     by a bump -- but it finds nothing at all once the project ships a non-dev version;
 #   * the authority string itself catches a fresh copy of the current version, which is
 #     the case the first pattern misses at a real release.
+# The authority is only swept for everywhere when the string is distinctive enough to be ours: a
+# pre-release version (`x.y.z-rc.1`), or any version followed by `.<short sha>`, the carrier form.
+# A bare `x.y.z` is not: at a release it collides with unrelated third-party versions -- a
+# changelog line bumping a dependency "from 0.6.0", an action pinned at `v0.9.0`, a tool config
+# at `1.0.0` -- and a check that fires on those turns red on every release branch over text that
+# is not a copy of anything. A bare `x.y.z` is therefore swept only in the MUST_DERIVE files below,
+# the sites that used to carry a copy and are the ones a re-hardcode would land in.
 # Left lookbehind rejects a preceding DIGIT or DOT, so a longer number is not read as a version
 # starting mid-way through it, but deliberately ALLOWS a letter so a `v`-prefixed copy is a hit --
 # `\b` would not be, because between `v` and the digit both sides are word characters.
@@ -81,51 +89,110 @@ MUST_DERIVE = {
 # ALLOWS a following dot, because the carrier form this check exists to catch is exactly
 # `<version>.<short sha>`.
 DEV_SHAPED = re.compile(r"(?<![\d.])\d+\.\d+\.\d+-dev(?![\w-])")
+
+
+def authority_patterns(want: str) -> tuple[re.Pattern, re.Pattern]:
+    """Returns (swept in every file, swept only in MUST_DERIVE files) for the authority `want`."""
+    exact = r"(?<![\d.])" + re.escape(want) + r"(?![\w-])"
+    carrier = r"(?<![\d.])" + re.escape(want) + r"\.[0-9a-f]{7,40}(?![\w-])"
+    everywhere = re.compile(exact if "-" in want else carrier)
+    return everywhere, re.compile(exact)
+
+
 SECTION = re.compile(r"^\[([^\[\]]+)\]\s*$")
 # `[[bench]]` / `[[bin]]` are array-of-table headers. Without matching them the previous
 # section stayed in force, so an inline table inside a `[[bench]]` that followed a
 # `[dependencies]` block was read AS a dependency -- a false failure, and under --fix a
 # rewrite of a line that is not a dependency requirement.
 ARRAY_SECTION = re.compile(r"^\[\[([^\[\]]+)\]\]\s*$")
-# A dependency can also be written as its own sub-table -- `[dependencies.hudi-core]` with its
-# keys on the lines that follow. That is legal Cargo and the repo already uses it
-# (`python/Cargo.toml` has `[dependencies.pyo3]`). It is PARSED here rather than refused: a shape
-# this checker skipped would let a drifted version be reported as clean, and a shape it refused
-# would demand the repo rewrite a perfectly good manifest to suit the checker.
-DEP_SUBTABLE = re.compile(r"^((?:target\.[^.]+\.)?(?:dev-|build-)?dependencies)\.(.+)$")
-ENTRY = re.compile(r"^\"?([A-Za-z0-9_.-]+)\"?\s*=\s*(.*)$")
+DEP_KINDS = ("dependencies", "dev-dependencies", "build-dependencies")
+ENTRY = re.compile(r"""^("[^"]*"|'[^']*'|[A-Za-z0-9_.-]+)\s*=\s*(.*)$""")
 KEY_PATH = re.compile(r'(?<![A-Za-z0-9_-])path\s*=\s*"([^"]*)"')
 KEY_VERSION = re.compile(r'(?<![A-Za-z0-9_-])version\s*=\s*"([^"]*)"')
+KEY_PACKAGE = re.compile(r'(?<![A-Za-z0-9_-])package\s*=\s*"([^"]*)"')
+# `name = "1.2.3"` and `name = '1.2.3'`: a dependency given as a bare version requirement.
+STRING_VALUE = re.compile(r"""^("([^"]*)"|'([^']*)')\s*(#.*)?$""")
+UNPARSED = "__UNPARSED__"
+
+
+def split_key(key: str) -> list[str]:
+    """Splits a dotted TOML key into its parts, honouring quotes.
+
+    `target.'cfg(target_env = "gnu.x")'.dependencies` is three parts, not four: a plain
+    `str.split(".")` would cut the quoted cfg expression at its dot.
+    """
+    parts, buf, quote = [], "", None
+    for ch in key.strip():
+        if quote:
+            buf += ch
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+            buf += ch
+        elif ch == ".":
+            parts.append(buf.strip())
+            buf = ""
+        else:
+            buf += ch
+    parts.append(buf.strip())
+    return parts
+
+
+def unquote(part: str) -> str:
+    return part[1:-1] if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'" else part
+
+
+def dep_table(section: str) -> tuple[str, str | None] | None:
+    """Classifies a section header as a dependency table.
+
+    Returns (table, None) for `[dependencies]`, `[target.<cfg>.dependencies]` and
+    `[workspace.dependencies]` (and the dev-/build- kinds), (table, name) for a dependency written
+    as its own sub-table such as `[dependencies.hudi-core]`, and None for any other section.
+    """
+    parts = split_key(section)
+    if parts[-1] in DEP_KINDS and (
+        len(parts) == 1 or (len(parts) == 3 and parts[0] == "target")
+        or (len(parts) == 2 and parts[0] == "workspace")
+    ):
+        return section, None
+    if len(parts) >= 2 and parts[-2] in DEP_KINDS and (
+        len(parts) == 2 or (len(parts) == 4 and parts[0] == "target")
+        or (len(parts) == 3 and parts[0] == "workspace")
+    ):
+        return ".".join(parts[:-1]), unquote(parts[-1])
+    return None
 
 
 def dep_entries(text: str):
-    """Yields (section, name, inline_table_text) for every dependency written as an inline table.
+    """Yields (section, name, spec, raw) for every dependency in a manifest.
 
-    Handles three shapes: `name = { ... }` inline tables, quoted keys, and `[dependencies.name]`
-    sub-tables. Yields ("__UNPARSED__", <what>, "") for anything else, so the caller fails loudly
-    instead of reporting a skipped dependency as a clean one.
+    `spec` is text KEY_PATH / KEY_VERSION / KEY_PACKAGE can be searched in, and `raw` is the exact
+    text the entry occupies in the manifest, so --fix can rewrite it in place. Handles four shapes:
+    `name = { ... }` inline tables (also split across lines), `name = "<requirement>"` bare
+    version strings, quoted keys, and `[dependencies.name]` sub-tables. Yields
+    (UNPARSED, <what>, "", "") for any other shape -- a dotted key such as
+    `hudi-core.version = "..."`, or a value that is neither a table nor a string -- so the caller
+    fails loudly instead of reporting a skipped dependency as a clean one.
 
     Hand-rolled rather than via `tomllib`, which only exists on Python 3.11+ -- this has to run
-    on whatever python3 a contributor's machine and the CI runner happen to have. It only needs
-    to recognise `name = { ... }` inside a `*dependencies` section, and it accumulates until the
-    braces balance so an entry split across lines is checked like any other.
+    on whatever python3 a contributor's machine and the CI runner happen to have.
     """
-    section = ""
+    table = None
     lines = text.splitlines()
     i = 0
     while i < len(lines):
-        line = lines[i]
-        stripped_line = line.strip()
-        m = ARRAY_SECTION.match(stripped_line)
+        stripped = lines[i].strip()
+        m = ARRAY_SECTION.match(stripped)
         if m:
-            section = m.group(1)
+            table = None
             i += 1
             continue
-        m = SECTION.match(stripped_line)
+        m = SECTION.match(stripped)
         if m:
-            section = m.group(1)
-            sub = DEP_SUBTABLE.match(section)
-            if sub:
+            kind = dep_table(m.group(1))
+            table = None
+            if kind and kind[1] is not None:
                 # Collect the sub-table's own keys, up to the next section header of any kind.
                 body, j = [], i + 1
                 while j < len(lines) and not (
@@ -133,29 +200,42 @@ def dep_entries(text: str):
                 ):
                     body.append(lines[j])
                     j += 1
-                yield sub.group(1), sub.group(2), "\n".join(body)
+                raw = "\n".join(body)
+                yield kind[0], kind[1], raw, raw
                 i = j
                 continue
+            if kind:
+                table = kind[0]
             i += 1
             continue
-        if not section.split(".")[-1].endswith("dependencies"):
-            i += 1
-            continue
-        stripped = line.strip()
-        if stripped.startswith("#") or not stripped:
+        if table is None or not stripped or stripped.startswith("#"):
             i += 1
             continue
         m = ENTRY.match(stripped)
-        if not m or not m.group(2).lstrip().startswith("{"):
+        if not m:
+            yield UNPARSED, f"[{table}] line `{stripped}`", "", ""
             i += 1
             continue
-        name, buf = m.group(1), m.group(2)
-        depth = buf.count("{") - buf.count("}")
-        while depth > 0 and i + 1 < len(lines):
+        key, value = split_key(m.group(1)), m.group(2).strip()
+        name = unquote(key[0])
+        if len(key) > 1:
+            yield UNPARSED, f"[{table}] {name} written as the dotted key `{m.group(1)}`", "", ""
             i += 1
-            buf += "\n" + lines[i]
-            depth += lines[i].count("{") - lines[i].count("}")
-        yield section, name, buf
+            continue
+        if value.startswith("{"):
+            raw = lines[i]
+            depth = raw.count("{") - raw.count("}")
+            while depth > 0 and i + 1 < len(lines):
+                i += 1
+                raw += "\n" + lines[i]
+                depth += lines[i].count("{") - lines[i].count("}")
+            yield table, name, raw[raw.index("=") + 1:], raw
+        elif STRING_VALUE.match(value):
+            sm = STRING_VALUE.match(value)
+            requirement = sm.group(2) if sm.group(2) is not None else sm.group(3)
+            yield table, name, f'version = "{requirement}"', lines[i]
+        else:
+            yield UNPARSED, f"[{table}] {name} = {value}", "", ""
         i += 1
 
 
@@ -188,8 +268,17 @@ def workspace_members() -> list[str]:
     return manifests
 
 
-def package_version_key(text: str) -> str | None:
-    """Returns the raw `version` line from a manifest's own `[package]` section, or None."""
+PACKAGE_VERSION_KEY = re.compile(r"^version\s*[.=]")
+# Both spellings Cargo accepts for inheriting the workspace version.
+INHERITS_VERSION = (
+    re.compile(r"^version\s*\.\s*workspace\s*=\s*true\s*(#.*)?$"),
+    re.compile(r"^version\s*=\s*\{\s*workspace\s*=\s*true\s*\}\s*(#.*)?$"),
+)
+PACKAGE_NAME = re.compile(r'^name\s*=\s*"([^"]+)"')
+
+
+def package_section(text: str):
+    """Yields the stripped lines of a manifest's own `[package]` section."""
     section = ""
     for line in text.splitlines():
         stripped = line.strip()
@@ -197,10 +286,30 @@ def package_version_key(text: str) -> str | None:
         if m:
             section = m.group(1)
             continue
-        if section != "package":
-            continue
-        if stripped.startswith("version.workspace") or stripped.startswith("version"):
+        if section == "package":
+            yield stripped
+
+
+def package_version_key(text: str) -> str | None:
+    """Returns the raw `version` line from a manifest's own `[package]` section, or None.
+
+    Matches the `version` key itself, not any key that merely starts with those letters.
+    """
+    for stripped in package_section(text):
+        if PACKAGE_VERSION_KEY.match(stripped):
             return stripped
+    return None
+
+
+def inherits_version(key: str) -> bool:
+    return any(p.match(key) for p in INHERITS_VERSION)
+
+
+def package_name(text: str) -> str | None:
+    for stripped in package_section(text):
+        m = PACKAGE_NAME.match(stripped)
+        if m:
+            return m.group(1)
     return None
 
 
@@ -241,6 +350,8 @@ def main() -> int:
     checked_deps = 0
 
     print(f"authority: [workspace.package] version = {want}  (Cargo.toml)")
+    tracked = tracked_files()
+    swept_everywhere, swept_in_derivation_sites = authority_patterns(want)
 
     # ---- Rule 0: every workspace member INHERITS the authority; none declares its own. ----
     # Without this, the authority is not single: a member can set a literal `version` in its
@@ -255,7 +366,7 @@ def main() -> int:
                 f"{rel}: workspace member has no `version` key in [package] -- it must read "
                 f"`version.workspace = true` so the authority stays single"
             )
-        elif not key.startswith("version.workspace"):
+        elif not inherits_version(key):
             failures.append(
                 f"{rel}: workspace member declares its own version (`{key}`) instead of "
                 f"`version.workspace = true` -- that is a SECOND authority; the version belongs "
@@ -268,21 +379,29 @@ def main() -> int:
             "checker is broken rather than the tree being clean"
         )
 
-    # ---- Rule 1: every intra-workspace path dependency requests exactly the authority. ----
-    # Read structurally with a TOML parser rather than by line, so a dependency written across
-    # several lines is checked like any other instead of being silently skipped.
-    for rel in tracked_files():
-        if not rel.endswith("Cargo.toml"):
+    # ---- Rule 1: every intra-workspace dependency requests exactly the authority. ----
+    # Read structurally rather than by line, so a dependency written across several lines is
+    # checked like any other instead of being silently skipped. A dependency is intra-workspace if
+    # it has a `path`, or if it sits in a workspace manifest and names a workspace member:
+    # `hudi-core = "0.5.0"` has no path, but it is still a second copy of the project's version in
+    # a published manifest. (A manifest outside the workspace, such as a demo app, may depend on a
+    # released version from the registry on purpose, so there only a `path` makes it ours.)
+    member_names = {package_name((ROOT / rel).read_text()) for rel in members} - {None}
+    for rel in tracked:
+        if Path(rel).name != "Cargo.toml":
             continue
-        for section, name, spec in dep_entries((ROOT / rel).read_text()):
-            if section == "__UNPARSED__":
+        in_workspace = rel == "Cargo.toml" or rel in members
+        for section, name, spec, raw in dep_entries((ROOT / rel).read_text()):
+            if section == UNPARSED:
                 failures.append(
                     f"{rel}: {name} is a Cargo shape this checker does not parse -- teach it to "
                     f"read this shape rather than skipping it, since a skipped dependency would "
                     f"let a drifted version be reported as clean"
                 )
                 continue
-            if not KEY_PATH.search(spec):
+            renamed = KEY_PACKAGE.search(spec)
+            names_member = in_workspace and (renamed.group(1) if renamed else name) in member_names
+            if not KEY_PATH.search(spec) and not names_member:
                 continue  # not an intra-workspace dependency
             got = KEY_VERSION.search(spec)
             if got is None:
@@ -293,7 +412,14 @@ def main() -> int:
             if fix:
                 path = ROOT / rel
                 before = path.read_text()
-                after = before.replace(spec, spec[:got.start(1)] + want + spec[got.end(1):], 1)
+                key_text, _, value = raw.partition("=")
+                if STRING_VALUE.match(value.strip()):
+                    new_raw = key_text + "=" + value.replace(got.group(1), want, 1)
+                else:
+                    new_raw = KEY_VERSION.sub(
+                        lambda v: v.group(0)[: v.start(1) - v.start(0)] + want + v.group(0)[v.end(1) - v.start(0):],
+                        raw, count=1)
+                after = before.replace(raw, new_raw, 1)
                 if after == before:
                     failures.append(f"{rel}: [{section}] {name} could not be rewritten")
                 else:
@@ -306,8 +432,8 @@ def main() -> int:
                 )
 
     # ---- Rule 2: nothing else carries a copy of a project version. ----
-    for rel in tracked_files():
-        if rel.endswith(LITERAL_ALLOWED_SUFFIXES) or rel in SWEEP_SKIP_FILES:
+    for rel in tracked:
+        if Path(rel).name in LITERAL_ALLOWED_NAMES or rel in SWEEP_SKIP_FILES:
             continue
         path = ROOT / rel
         if not path.is_file():
@@ -316,11 +442,14 @@ def main() -> int:
             text = path.read_text()
         except (UnicodeDecodeError, OSError):
             continue  # binary or unreadable: cannot contain a version literal we care about
-        authority_shaped = re.compile(r"(?<![\d.])" + re.escape(want) + r"(?![\w-])")
+        patterns = (DEV_SHAPED, swept_everywhere)
+        if rel in MUST_DERIVE:
+            patterns += (swept_in_derivation_sites,)
         for lineno, line in enumerate(text.splitlines(), 1):
-            # Both patterns match the same text when the authority is itself dev-shaped, so the
-            # hits are de-duplicated -- one line reported twice reads as two defects.
-            hits = {h for pattern in (DEV_SHAPED, authority_shaped) for h in pattern.findall(line)}
+            # The patterns overlap (a dev-shaped authority matches more than one), so the hits are
+            # de-duplicated -- one line reported twice reads as two defects.
+            hits = {h for pattern in patterns for h in pattern.findall(line)}
+            hits = {h for h in hits if not any(o.startswith(h + ".") for o in hits)}
             for hit in sorted(hits):
                 failures.append(
                     f"{rel} line {lineno}: hardcoded project version \"{hit}\" -- derive it from "
@@ -341,7 +470,7 @@ def main() -> int:
     # Absence is not success: say what was examined, so an empty result set cannot be mistaken
     # for a clean one.
     print(f"checked: {len(members)} workspace member(s), {checked_deps} intra-workspace "
-          f"dependency requirement(s), {len(tracked_files())} tracked file(s) swept, "
+          f"dependency requirement(s), {len(tracked)} tracked file(s) swept, "
           f"{len(MUST_DERIVE)} derivation site(s)")
 
     if checked_deps == 0:
