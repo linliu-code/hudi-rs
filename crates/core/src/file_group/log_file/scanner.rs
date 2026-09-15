@@ -258,7 +258,9 @@ impl LogFileScanner {
                             num_delete_batches += records.num_delete_batches();
                         }
                     }
-                    _ => {}
+                    // Enumerated, not `_ => {}`, so a new `BlockType` must be
+                    // classified here rather than silently left out of the count.
+                    BlockType::Command | BlockType::Corrupted | BlockType::HfileData => {}
                 }
             }
         }
