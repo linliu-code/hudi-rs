@@ -177,18 +177,18 @@ JNI_CLASSIFIER_ARG := -Dclassifier=$(JNI_OS)-$(JNI_ARCH)
 JNI_DEPLOY_COORD := io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH)
 endif
 
+# The staged copy is stripped. Measured on an aarch64 build: 74,330,712 B -> 55,604,776 B, and
+# byte-identical to a plain `strip` -- the flag makes the intent explicit, it does not change the
+# bytes. `.dynsym` is what JNI binds against and a strip must never touch it, so the recipe
+# asserts the two entry points survived instead of trusting the flag. The previous stage is
+# removed only once the build has succeeded, so a compile failure leaves it intact.
 .PHONY: jni-lib
 jni-lib: ## Build libhudi_jni.so (release) and stage a stripped copy under target/jni-native (refuses a dirty tree; JNI_ALLOW_DIRTY=1 overrides)
 	$(info --- Build hudi-jni (release) ---)
 	test -z "$$(git status --porcelain)" || { echo "dirty tree; set JNI_ALLOW_DIRTY=1 to override"; test "$(JNI_ALLOW_DIRTY)" = 1; }
-	rm -rf $(JNI_STAGE)
 	CARGO_TARGET_DIR=$(JNI_CARGO_TARGET_DIR) ./build-wrapper.sh cargo build -p hudi-jni --release
+	rm -rf $(JNI_STAGE)
 	mkdir -p $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH) $(JNI_STAGE)/META-INF
-	# D-29 (F-7): the staged copy is stripped. Measured on this branch's aarch64 build:
-	# 74,330,712 B -> 55,604,776 B, and byte-identical to the previous unflagged `strip`
-	# (md5 601f7e816ea64a3c0e347e3c1953e679 both ways) -- the flag makes the intent explicit,
-	# it does not change today's bytes. `.dynsym` is what JNI binds against and a strip must
-	# never touch it, so assert the two entry points survived instead of trusting the flag.
 	strip --strip-unneeded -o $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so $(JNI_CARGO_TARGET_DIR)/release/libhudi_jni.so
 	nm -D --defined-only $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so | grep -c ' T Java_' | grep -qx 2
 	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\nglibc.floor=%s\nmd5=%s\narch=%s-%s\nstripped=true\n' \
@@ -217,19 +217,36 @@ JNI_JAR_MULTI_PREREQ ?= jni-lib
 
 # The packaging body, shared by jni-jar-multi and jni-jar-multi-portable so the two can never
 # drift. $(JNI_STAGE)/$(JNI_OUT) are resolved per target (jni-jar-multi-portable sets JNI_OUT).
+#
+# It refuses, before writing anything, unless BOTH arches are present, each stripped and each
+# exporting the two Java_ entry points: the jar is published under the classifier-less
+# multi-arch coordinate, and `stripped=true` is a claim about bytes this target may only have
+# copied (JNI_EXTRA_NATIVE_DIR, or a stage packaged with JNI_JAR_MULTI_PREREQ=). The properties
+# are written in the same order as the workflow's package job, and the LICENSE/NOTICE/
+# THIRD-PARTY.txt come from the same script that job runs.
 define jni_package_multi
 	test -n "$(JNI_EXTRA_NATIVE_DIR)" || { echo "JNI_EXTRA_NATIVE_DIR is required"; exit 2; }
 	test -d "$(JNI_STAGE)/native" || { echo "no staged library under $(JNI_STAGE)/native -- run jni-lib or jni-lib-portable first, or point JNI_OUT/JNI_STAGE at an existing stage"; exit 2; }
 	cp -r $(JNI_EXTRA_NATIVE_DIR)/native/. $(JNI_STAGE)/native/
-	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\nstripped=true\n' "$$(git rev-parse HEAD)" \
+	for a in x86_64 aarch64; do \
+	  so=$(JNI_STAGE)/native/linux-$$a/libhudi_jni.so; \
+	  test -f "$$so" || { echo "$$so is missing: the multi-arch jar needs both linux-x86_64 and linux-aarch64 (one staged, the other in JNI_EXTRA_NATIVE_DIR)"; exit 2; }; \
+	  if readelf -S "$$so" | grep -q ' \.symtab'; then echo "$$so is not stripped (it has a .symtab); stage it with jni-lib or jni-lib-portable"; exit 2; fi; \
+	  n=$$(nm -D --defined-only "$$so" | grep -c ' T Java_'); \
+	  [ "$$n" = 2 ] || { echo "$$so exports $$n Java_ symbols, expected 2"; exit 2; }; \
+	done
+	mkdir -p $(JNI_STAGE)/META-INF
+	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\narch=linux-x86_64,linux-aarch64\n' "$$(git rev-parse HEAD)" \
 	  "$$(grep -o 'JNI_ABI_VERSION: u32 = [0-9]*' crates/jni/src/lib.rs | grep -o '[0-9]*$$')" \
 	  "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" > $(JNI_STAGE)/META-INF/hudi-jni-native.properties
-	archs=""; for a in x86_64 aarch64; do [ -d $(JNI_STAGE)/native/linux-$$a ] && archs="$${archs:+$$archs,}linux-$$a"; done; \
-	  printf 'arch=%s\n' "$$archs" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties
-	for a in x86_64 aarch64; do [ -d $(JNI_STAGE)/native/linux-$$a ] && printf 'md5.linux-%s=%s\n' "$$a" "$$(md5sum $(JNI_STAGE)/native/linux-$$a/libhudi_jni.so | cut -d' ' -f1)" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties; done
-	for a in x86_64 aarch64; do [ -d $(JNI_STAGE)/native/linux-$$a ] && printf 'glibc.floor.linux-%s=%s\n' "$$a" "$$(objdump -T $(JNI_STAGE)/native/linux-$$a/libhudi_jni.so | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)" >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties; done
+	for a in x86_64 aarch64; do \
+	  printf 'md5.linux-%s=%s\n' "$$a" "$$(md5sum $(JNI_STAGE)/native/linux-$$a/libhudi_jni.so | cut -d' ' -f1)"; \
+	done >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+	for a in x86_64 aarch64; do \
+	  printf 'glibc.floor.linux-%s=%s\n' "$$a" "$$(objdump -T $(JNI_STAGE)/native/linux-$$a/libhudi_jni.so | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)"; \
+	done >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+	printf 'stripped=true\n' >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties
 	cat $(JNI_STAGE)/META-INF/hudi-jni-native.properties
-	# F-8: the same LICENSE/NOTICE/THIRD-PARTY.txt the CI package job stages, from one script.
 	.github/jni-legal/stage-legal.sh $(JNI_STAGE)
 	rm -f $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar && jar cf $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar -C $(JNI_STAGE) . && unzip -l $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar
 endef

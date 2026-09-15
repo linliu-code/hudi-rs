@@ -98,7 +98,8 @@ if missing:
 sys.stdout.write("\n".join(out) + "\n")
 ' > "$STAGE/META-INF/THIRD-PARTY.txt"
 
-CRATE_COUNT=$(grep -c ' crates:$' "$STAGE/META-INF/THIRD-PARTY.txt" >/dev/null && sed -n 's/^\([0-9]*\) crates:$/\1/p' "$STAGE/META-INF/THIRD-PARTY.txt")
+CRATE_COUNT=$(sed -n 's/^\([0-9]*\) crates:$/\1/p' "$STAGE/META-INF/THIRD-PARTY.txt")
+[ -n "$CRATE_COUNT" ] || { echo "FAIL: THIRD-PARTY.txt has no '<n> crates:' line"; exit 1; }
 
 # --- NOTICE ---------------------------------------------------------------------------------
 {
@@ -136,4 +137,4 @@ NOTICE_TAIL
 
 echo "staged legal files into $STAGE/META-INF:"
 ls -l "$STAGE/META-INF/LICENSE" "$STAGE/META-INF/NOTICE" "$STAGE/META-INF/THIRD-PARTY.txt"
-echo "THIRD-PARTY.txt covers ${CRATE_COUNT:-?} crates"
+echo "THIRD-PARTY.txt covers $CRATE_COUNT crates"
