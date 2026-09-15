@@ -124,6 +124,12 @@ version-sync: ## Propagate [workspace.package] version to the manifests that can
 	$(info --- Sync the version from Cargo.toml ---)
 	@.github/scripts/check-version-single-source.sh --fix
 
+.PHONY: test-version-check
+test-version-check: ## Test the version single-source checker and the derived JNI_VERSION (python3; cmake for the CMake case)
+	$(info --- Test the version single-source checker ---)
+	python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+	.github/jni-tests/jni-version.sh
+
 .PHONY: check-rust
 check-rust: ## Run check on Rust
 	$(info --- Check Rust clippy ---)
@@ -320,12 +326,6 @@ test-jni-carrier: ## Test the carrier's Makefile rules: the default JNI_VERSION 
 	$(info --- Test the JNI carrier Makefile rules ---)
 	.github/jni-tests/jni-version.sh
 	.github/jni-tests/jni-package-multi.sh
-
-.PHONY: test-version-check
-test-version-check: ## Test the version single-source checker and the derived JNI_VERSION (python3; cmake for the CMake case)
-	$(info --- Test the version single-source checker ---)
-	python3 -m unittest discover -s .github/scripts -p 'test_*.py'
-	.github/jni-tests/jni-version.sh
 
 .PHONY: coverage
 coverage: coverage-rust ## Generate coverage report (alias for coverage-rust)
