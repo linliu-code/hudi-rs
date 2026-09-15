@@ -538,13 +538,15 @@ fn avro_byte_string(value: &serde_json::Value, bad: &dyn Fn(&str) -> CoreError) 
 /// pairing. Widening can never fail the rebuild, so it is admitted.
 ///
 /// Which direction a caller meets depends on its argument order. arrow-avro
-/// declares an Avro `array<long>`'s child non-null and a parquet base file
-/// declares `element` nullable. Where the SOURCE is an Avro log column and the
-/// target carries a parquet-style nullable child (`pad_partial_to_target`, output
-/// projection), that pairing widens; where the source is a parquet base row and
-/// the target a log record's type (`reconcile_defaults_from_prior`) it narrows,
-/// and is declined: the log value is kept, as it was before this predicate
-/// reconciled names there. Two arrow-avro-derived sides are simply equal.
+/// declares an Avro `array<long>`'s child non-null, while a parquet base file may
+/// declare `element` nullable (a writer that does not derive the file from that
+/// Avro schema, or a nullable-to-non-null evolution). Where the SOURCE is an Avro
+/// log column and the target carries a parquet-style nullable child
+/// (`pad_partial_to_target`, output projection), that pairing widens; where the
+/// source is such a parquet base row and the target a log record's type
+/// (`reconcile_defaults_from_prior`) it narrows, and is declined: the log value is
+/// kept, as it was before this predicate reconciled names there. Two
+/// arrow-avro-derived sides are simply equal.
 ///
 /// One caller deliberately does not use this rule:
 /// `overlay_partial_over_prior` keeps the nullability-blind reconciliation it had
@@ -2976,39 +2978,40 @@ mod tests {
         let fixed = |child: &str| DataType::FixedSizeList(f(child, DataType::Int64, true), 2);
 
         #[rustfmt::skip]
-        let rows: Vec<(&str, DataType, DataType, bool)> = vec![
+        // (label, source, target, is_name_reconcilable, is_name_reconcilable_ignoring_child_nullability)
+        let rows: Vec<(&str, DataType, DataType, bool, bool)> = vec![
             // --- reconcilable: names, metadata, and nullability that WIDENS ---
-            ("identical", list("item", DataType::Int64, true), list("item", DataType::Int64, true), true),
-            ("list child name", list("item", DataType::Int64, true), list("element", DataType::Int64, true), true),
-            ("large list child name", large("item", DataType::Int64, true), large("element", DataType::Int64, true), true),
-            ("map entries name", map("entries", true, false), map("key_value", true, false), true),
-            ("child metadata", with_md("item"), list("element", DataType::Int64, true), true),
-            ("struct child recursion", strukt(vec![("tags", list("item", DataType::Int64, true), true)]), strukt(vec![("tags", list("element", DataType::Int64, true), true)]), true),
-            ("list child non-null -> nullable", list("item", DataType::Int64, false), list("element", DataType::Int64, true), true),
-            ("map value non-null -> nullable", map("entries", false, false), map("key_value", true, false), true),
-            ("struct child non-null -> nullable", strukt(vec![("a", DataType::Int64, false)]), strukt(vec![("a", DataType::Int64, true)]), true),
+            ("identical", list("item", DataType::Int64, true), list("item", DataType::Int64, true), true, true),
+            ("list child name", list("item", DataType::Int64, true), list("element", DataType::Int64, true), true, true),
+            ("large list child name", large("item", DataType::Int64, true), large("element", DataType::Int64, true), true, true),
+            ("map entries name", map("entries", true, false), map("key_value", true, false), true, true),
+            ("child metadata", with_md("item"), list("element", DataType::Int64, true), true, true),
+            ("struct child recursion", strukt(vec![("tags", list("item", DataType::Int64, true), true)]), strukt(vec![("tags", list("element", DataType::Int64, true), true)]), true, true),
+            ("list child non-null -> nullable", list("item", DataType::Int64, false), list("element", DataType::Int64, true), true, true),
+            ("map value non-null -> nullable", map("entries", false, false), map("key_value", true, false), true, true),
+            ("struct child non-null -> nullable", strukt(vec![("a", DataType::Int64, false)]), strukt(vec![("a", DataType::Int64, true)]), true, true),
             // --- not reconcilable: nullability that NARROWS ---
-            ("list child nullable -> non-null", list("item", DataType::Int64, true), list("element", DataType::Int64, false), false),
-            ("large list child nullable -> non-null", large("item", DataType::Int64, true), large("element", DataType::Int64, false), false),
-            ("map value nullable -> non-null", map("entries", true, false), map("key_value", false, false), false),
-            ("struct child nullable -> non-null", strukt(vec![("a", DataType::Int64, true)]), strukt(vec![("a", DataType::Int64, false)]), false),
-            ("nested narrowing under a struct", strukt(vec![("tags", list("item", DataType::Int64, true), true)]), strukt(vec![("tags", list("element", DataType::Int64, false), true)]), false),
+            ("list child nullable -> non-null", list("item", DataType::Int64, true), list("element", DataType::Int64, false), false, true),
+            ("large list child nullable -> non-null", large("item", DataType::Int64, true), large("element", DataType::Int64, false), false, true),
+            ("map value nullable -> non-null", map("entries", true, false), map("key_value", false, false), false, true),
+            ("struct child nullable -> non-null", strukt(vec![("a", DataType::Int64, true)]), strukt(vec![("a", DataType::Int64, false)]), false, true),
+            ("nested narrowing under a struct", strukt(vec![("tags", list("item", DataType::Int64, true), true)]), strukt(vec![("tags", list("element", DataType::Int64, false), true)]), false, true),
             // --- not reconcilable: layout or value differences ---
-            ("list vs large list", list("item", DataType::Int64, true), large("item", DataType::Int64, true), false),
-            ("leaf Int64 vs Int32", DataType::Int64, DataType::Int32, false),
-            ("list child Int64 vs Int32", list("item", DataType::Int64, true), list("element", DataType::Int32, true), false),
-            ("struct field count", strukt(vec![("a", DataType::Int64, true)]), strukt(vec![("a", DataType::Int64, true), ("b", DataType::Int64, true)]), false),
-            ("struct field name", strukt(vec![("a", DataType::Int64, true)]), strukt(vec![("b", DataType::Int64, true)]), false),
-            ("map sorted flag", map("entries", true, false), map("key_value", true, true), false),
+            ("list vs large list", list("item", DataType::Int64, true), large("item", DataType::Int64, true), false, false),
+            ("leaf Int64 vs Int32", DataType::Int64, DataType::Int32, false, false),
+            ("list child Int64 vs Int32", list("item", DataType::Int64, true), list("element", DataType::Int32, true), false, false),
+            ("struct field count", strukt(vec![("a", DataType::Int64, true)]), strukt(vec![("a", DataType::Int64, true), ("b", DataType::Int64, true)]), false, false),
+            ("struct field name", strukt(vec![("a", DataType::Int64, true)]), strukt(vec![("b", DataType::Int64, true)]), false, false),
+            ("map sorted flag", map("entries", true, false), map("key_value", true, true), false, false),
             // Pinned, not endorsed: the rebuild could re-tag a FixedSizeList, but
             // neither arrow-avro nor the parquet reader produces one here.
-            ("fixed size list child name", fixed("item"), fixed("element"), false),
-            ("fixed size list vs list", fixed("item"), list("item", DataType::Int64, true), false),
+            ("fixed size list child name", fixed("item"), fixed("element"), false, false),
+            ("fixed size list vs list", fixed("item"), list("item", DataType::Int64, true), false, false),
         ];
         let wrong: Vec<String> = rows
             .iter()
-            .filter(|(_, source, target, want)| is_name_reconcilable(source, target) != *want)
-            .map(|(name, _, _, want)| format!("{name}: expected {want}"))
+            .filter(|(_, source, target, want, _)| is_name_reconcilable(source, target) != *want)
+            .map(|(name, _, _, want, _)| format!("{name}: expected {want}"))
             .collect();
         assert!(wrong.is_empty(), "rows answered wrongly: {wrong:#?}");
 
@@ -3016,13 +3019,8 @@ mod tests {
         use super::is_name_reconcilable_ignoring_child_nullability as blind;
         let wrong: Vec<String> = rows
             .iter()
-            .filter(|(name, source, target, want)| {
-                blind(source, target)
-                    != (*want
-                        || name.contains("nullable -> non-null")
-                        || name.contains("narrowing"))
-            })
-            .map(|(name, ..)| name.to_string())
+            .filter(|(_, source, target, _, want_blind)| blind(source, target) != *want_blind)
+            .map(|(name, _, _, _, want_blind)| format!("{name}: expected {want_blind}"))
             .collect();
         assert!(
             wrong.is_empty(),

@@ -1127,8 +1127,9 @@ fn reconcile_defaults_from_prior(
             // Reconciled to `field` — the LOG schema's field — because the rebuilt
             // batch below is constructed with `log_schema`.
             //
-            // Anything beyond a name difference (Int64 vs Int32, List vs LargeList)
-            // is still declined and the log value kept, exactly as before.
+            // Anything beyond a name difference (Int64 vs Int32, List vs LargeList,
+            // or a nested child whose nullability narrows) is still declined and the
+            // log value kept, exactly as before.
             if prior_col.data_type() == field.data_type() {
                 cols.push(prior_col.clone());
                 changed = true;
@@ -1315,7 +1316,10 @@ fn overlay_partial_over_prior(
             ) {
                 // Nullability-blind, as this path always was: a nested child
                 // nullability narrowing is left to the rebuild, whose error is
-                // propagated (see `is_name_reconcilable`).
+                // propagated (see `is_name_reconcilable`). `pad_partial_to_target`
+                // refuses the same narrowing outright, as it did before names were
+                // reconciled at all, so a log-only partial record with such a column
+                // reads here only when it has a prior row to overlay onto.
                 cols.push(reconcile_one_column(partial, pidx, field)?);
             } else {
                 return Err(crate::error::CoreError::Unsupported(format!(
@@ -1364,8 +1368,11 @@ fn overlay_partial_over_prior(
 /// Name-reconcile a single source column (`src.column(src_idx)`) to
 /// `target_field`'s type — nested child-field-name differences only (the same
 /// [`reconcile_batch_to_schema`] name-metadata reconcile the drain uses). Callers
-/// MUST gate with [`is_name_reconcilable`] first, since the underlying rebuild
-/// reinterprets buffers and is only byte-safe when the physical layouts match.
+/// MUST gate with [`is_name_reconcilable`] or
+/// [`is_name_reconcilable_ignoring_child_nullability`] first, since the underlying
+/// rebuild reinterprets buffers and is only byte-safe when the physical layouts
+/// match. After the nullability-blind gate the rebuild can still fail on a null
+/// the target child cannot hold, and the caller must propagate that error.
 fn reconcile_one_column(
     src: &RecordBatch,
     src_idx: usize,
@@ -7194,7 +7201,7 @@ mod tests {
     /// `reconcile_defaults_from_prior` must decline it and keep the log value, as
     /// it does for any other type difference.
     ///
-    /// The prior is a parquet base row (list child `element`, nullable) and the
+    /// The prior is a parquet base row whose list child `element` is nullable, and the
     /// winner came from an Avro `array<long>`, whose child arrow-avro declares
     /// non-null. Re-tagging the prior's list under the winner's type asserts that
     /// no element is null; with a null element present the rebuild fails, and the
@@ -7357,9 +7364,9 @@ mod tests {
     /// nullability rule existed, when the data holds no null element; with one,
     /// it fails loudly. It never drops the prior's value to a typed NULL.
     ///
-    /// This is the pairing a parquet base row (nullable `element`) meets under an
-    /// Avro `array<long>` table schema (non-null `item`). Refusing it outright
-    /// would null a column the partial update never touched.
+    /// This is the pairing a parquet base row declaring a nullable `element` meets
+    /// under an Avro `array<long>` table schema (non-null `item`). Refusing it
+    /// outright would null a column the partial update never touched.
     #[test]
     fn overlay_keeps_a_prior_list_whose_child_nullability_narrows_unless_it_holds_a_null() {
         use arrow_array::builder::{Int64Builder, ListBuilder};
