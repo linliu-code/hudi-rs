@@ -133,9 +133,10 @@ pub struct HoodieFileGroupReader {
     /// Both call shapes can read these back, by different routes.
     /// `read()`-based callers get them drained into [`Self::read_stats`]. A
     /// caller that streams through `open()` never calls `read()`, so that drain
-    /// never runs for it — keeping the reader alive would not change that. It
-    /// clones the handle via [`Self::stream_stats_handle`] instead, before it
-    /// drops the reader, and reads the shared sink after the stream drains; see
+    /// never runs for it — keeping the reader alive would not change that. A
+    /// streaming caller that wants them clones the handle via
+    /// [`Self::stream_stats_handle`] before it drops the reader and reads the
+    /// shared sink after the stream drains, as the C++ FFI does; see
     /// [`crate::ffi_support::stream_stats_handle`] for that contract.
     stream_stats: StreamStatsHandle,
 
@@ -2006,14 +2007,15 @@ impl HoodieFileGroupReader {
     ///
     /// Worth stating because the gap is silent and reads as data: a streaming
     /// read of a fixture with five deletes reports `num_deletes: 0` while
-    /// returning exactly the same rows as the eager read that reports five. No
-    /// production *streaming* caller reads these - only the test harness and
-    /// the benchmark do - but that is precisely where a zero would be believed.
-    /// The production caller of this accessor, the metadata-table read, reads
-    /// after [`Self::read`], where the values are complete. The FFI's streaming
-    /// route reads only `final_merge_us` and `output_build_us`, off the shared
-    /// sink via [`Self::stream_stats_handle`]; the insert/update/delete counts
-    /// have no production reader on either call shape.
+    /// returning exactly the same rows as the eager read that reports five.
+    /// Nothing calls this accessor after a streaming open today - the test
+    /// harness, the in-crate tests and the one production caller, the
+    /// metadata-table read, all call it after [`Self::read`], where the values
+    /// are complete - but a caller moved to a streaming open is precisely where
+    /// a zero would be believed. The FFI's streaming route reads only
+    /// `final_merge_us` and `output_build_us`, off the shared sink via
+    /// [`Self::stream_stats_handle`]; the insert/update/delete counts have no
+    /// production reader on either call shape.
     pub fn read_stats(&self) -> &HoodieReadStats {
         &self.read_stats
     }
