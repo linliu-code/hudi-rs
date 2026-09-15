@@ -535,10 +535,16 @@ fn avro_byte_string(value: &serde_json::Value, bad: &dyn Fn(&str) -> CoreError) 
 /// `source` child under a non-null `target` child asserts something the data need
 /// not satisfy. Re-tagged that way, the rebuild fails on the first batch holding a
 /// null element and succeeds on one without — so this predicate refuses the
-/// pairing. Widening is admitted rather than refused because it is the common
-/// pairing when an Avro log meets a parquet base: arrow-avro declares an Avro
-/// `array<long>`'s child non-null, while a parquet base file declares `element`
-/// nullable.
+/// pairing. Widening can never fail the rebuild, so it is admitted.
+///
+/// Which direction a caller meets depends on its argument order. arrow-avro
+/// declares an Avro `array<long>`'s child non-null and a parquet base file
+/// declares `element` nullable. Where the SOURCE is an Avro log column and the
+/// target carries a parquet-style nullable child (`pad_partial_to_target`, output
+/// projection), that pairing widens; where the source is a parquet base row and
+/// the target a log record's type (`reconcile_defaults_from_prior`) it narrows,
+/// and is declined: the log value is kept, as it was before this predicate
+/// reconciled names there. Two arrow-avro-derived sides are simply equal.
 ///
 /// One caller deliberately does not use this rule:
 /// `overlay_partial_over_prior` keeps the nullability-blind reconciliation it had
