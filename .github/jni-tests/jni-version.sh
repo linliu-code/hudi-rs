@@ -107,6 +107,16 @@ make -s --no-print-directory -C "$dir" -n check-rust >/dev/null 2>&1 \
   && ok "a non-JNI target does not evaluate the version" \
   || ko "a non-JNI target fails when the version script is broken"
 
+echo "== the commit cannot be read"
+dir="$WORK/tree-dev"
+if out=$(GIT_DIR="$WORK/no-such-git-dir" print_version "$dir" 2>&1); then
+  ko "make succeeded and printed '$out' instead of refusing"
+else
+  echo "$out" | grep -q 'git rev-parse' \
+    && ok "make refuses, naming git rev-parse" \
+    || ko "make failed without naming git rev-parse: $out"
+fi
+
 echo "== the manifest has no [workspace.package] version"
 dir="$WORK/tree-noversion"
 make_tree "$dir" "${BASE}-dev"

@@ -72,6 +72,8 @@ props() { cat "$1/out/stage/META-INF/hudi-jni-native.properties" 2>/dev/null || 
 # refused <case dir> <what the refusal must name> <description>
 refused() {
   local c=$1 needle=$2 what=$3
+  mkdir -p "$c/out/stage/native"
+  (cd "$c" && find out/stage/native -type f -exec md5sum {} + | sort > stage-before.md5)
   if package "$c"; then
     ko "$what: packaged anyway"
   elif ! grep -q -- "$needle" "$c/make.log"; then
@@ -80,6 +82,8 @@ refused() {
     ko "$what: refused, but only after writing a partial properties file"
   elif [ -e "$c/out/hudi-jni-native-test.jar" ]; then
     ko "$what: refused, but a jar was written"
+  elif ! (cd "$c" && find out/stage/native -type f -exec md5sum {} + | sort | cmp -s - stage-before.md5); then
+    ko "$what: refused, but the staged libraries were changed first"
   else
     ok "$what: refused, naming '$needle', before writing anything"
   fi
@@ -119,6 +123,13 @@ c="$WORK/unstripped"
 place "$c/out/stage" x86_64 "$WORK/two.so"
 place "$c/extra" aarch64 "$WORK/two-unstripped.so"
 refused "$c" "not stripped" "an unstripped aarch64 library"
+
+echo "== an unstripped extra library must not overwrite the staged one"
+c="$WORK/overwrite"
+place "$c/out/stage" x86_64 "$WORK/two.so"
+place "$c/extra" x86_64 "$WORK/two-unstripped.so"
+place "$c/extra" aarch64 "$WORK/two.so"
+refused "$c" "not stripped" "an unstripped x86_64 library in JNI_EXTRA_NATIVE_DIR"
 
 echo "== a library missing a Java_ export"
 c="$WORK/one-export"

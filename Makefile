@@ -147,8 +147,9 @@ test-python: ## Run tests on Python
 # <x.y.z>-dev.<short sha>, whatever pre-release suffix the workspace version carries. Both are
 # recursive (`=`), so only the targets that use the version evaluate it, and a version that
 # cannot be read stops those targets instead of minting a coordinate from an empty string.
-JNI_WORKSPACE_VERSION = $(or $(shell .github/scripts/workspace-version.sh 2>/dev/null),$(error cannot read [workspace.package] version with .github/scripts/workspace-version.sh; fix it or pass JNI_VERSION explicitly))
-JNI_VERSION ?= $(firstword $(subst -, ,$(JNI_WORKSPACE_VERSION)))-dev.$(shell git rev-parse --short HEAD)
+JNI_WORKSPACE_VERSION = $(or $(shell .github/scripts/workspace-version.sh),$(error cannot read [workspace.package] version with .github/scripts/workspace-version.sh; fix it or pass JNI_VERSION explicitly))
+JNI_SHORT_SHA = $(or $(shell git rev-parse --short HEAD),$(error cannot read the commit with git rev-parse; build from a git checkout or pass JNI_VERSION explicitly))
+JNI_VERSION ?= $(firstword $(subst -, ,$(JNI_WORKSPACE_VERSION)))-dev.$(JNI_SHORT_SHA)
 JNI_ARCH ?= $(shell uname -m | sed 's/arm64/aarch64/;s/amd64/x86_64/')
 JNI_OS ?= linux
 JNI_OUT ?= target/jni-native
@@ -224,8 +225,9 @@ JNI_JAR_MULTI_PREREQ ?= jni-lib
 # The packaging body, shared by jni-jar-multi and jni-jar-multi-portable so the two can never
 # drift. $(JNI_STAGE)/$(JNI_OUT) are resolved per target (jni-jar-multi-portable sets JNI_OUT).
 #
-# It refuses, before writing anything, unless BOTH arches are present, each stripped and each
-# exporting the two Java_ entry points: the jar is published under the classifier-less
+# It refuses, before copying or writing anything, unless BOTH arches -- each taken from
+# JNI_EXTRA_NATIVE_DIR if it has one, else from the stage -- are present, stripped and export the
+# two Java_ entry points: the jar is published under the classifier-less
 # multi-arch coordinate, and `stripped=true` is a claim about bytes this target may only have
 # copied (JNI_EXTRA_NATIVE_DIR, or a stage packaged with JNI_JAR_MULTI_PREREQ=). The properties
 # are written in the same order as the workflow's package job, and the LICENSE/NOTICE/
@@ -233,14 +235,15 @@ JNI_JAR_MULTI_PREREQ ?= jni-lib
 define jni_package_multi
 	test -n "$(JNI_EXTRA_NATIVE_DIR)" || { echo "JNI_EXTRA_NATIVE_DIR is required"; exit 2; }
 	test -d "$(JNI_STAGE)/native" || { echo "no staged library under $(JNI_STAGE)/native -- run jni-lib or jni-lib-portable first, or point JNI_OUT/JNI_STAGE at an existing stage"; exit 2; }
-	cp -r $(JNI_EXTRA_NATIVE_DIR)/native/. $(JNI_STAGE)/native/
 	for a in x86_64 aarch64; do \
-	  so=$(JNI_STAGE)/native/linux-$$a/libhudi_jni.so; \
-	  test -f "$$so" || { echo "$$so is missing: the multi-arch jar needs both linux-x86_64 and linux-aarch64 (one staged, the other in JNI_EXTRA_NATIVE_DIR)"; exit 2; }; \
-	  if readelf -S "$$so" | grep -q ' \.symtab'; then echo "$$so is not stripped (it has a .symtab); stage it with jni-lib or jni-lib-portable"; exit 2; fi; \
+	  so=$(JNI_EXTRA_NATIVE_DIR)/native/linux-$$a/libhudi_jni.so; \
+	  test -f "$$so" || so=$(JNI_STAGE)/native/linux-$$a/libhudi_jni.so; \
+	  test -f "$$so" || { echo "linux-$$a/libhudi_jni.so is missing: the multi-arch jar needs both linux-x86_64 and linux-aarch64 (one staged, the other in JNI_EXTRA_NATIVE_DIR)"; exit 2; }; \
+	  if readelf -S "$$so" | grep ' \.symtab' >/dev/null; then echo "$$so is not stripped (it has a .symtab); stage it with jni-lib or jni-lib-portable"; exit 2; fi; \
 	  n=$$(nm -D --defined-only "$$so" | grep -c ' T Java_'); \
 	  [ "$$n" = 2 ] || { echo "$$so exports $$n Java_ symbols, expected 2"; exit 2; }; \
 	done
+	cp -r $(JNI_EXTRA_NATIVE_DIR)/native/. $(JNI_STAGE)/native/
 	mkdir -p $(JNI_STAGE)/META-INF
 	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\narch=linux-x86_64,linux-aarch64\n' "$$(git rev-parse HEAD)" \
 	  "$$(grep -o 'JNI_ABI_VERSION: u32 = [0-9]*' crates/jni/src/lib.rs | grep -o '[0-9]*$$')" \
@@ -279,7 +282,7 @@ jni-jar-multi-portable: jni-lib-portable ## F-2/D-27: build this arch in the man
 # from the same script: glibc ceiling, no versioned GLIBCXX_/CXXABI_ imports, the NEEDED
 # allow-list, no undefined unwinder/C++ symbols, the two Java_ exports, and a stripped library.
 .PHONY: jni-lib-portable
-jni-lib-portable: ## D-27: build libhudi_jni.so inside a manylinux_2_28 container (static libstdc++/libgcc/libgcc_eh, -Wl,-z,defs) and assert .github/jni-portable/portability-floor.sh (glibc<=2.28, NEEDED allow-list, no undefined unwinder symbols, 2 Java_ exports); stages under target/jni-portable, never touches target/release
+jni-lib-portable: ## D-27: build libhudi_jni.so inside a manylinux_2_28 container (static libstdc++/libgcc/libgcc_eh, -Wl,-z,defs) and assert .github/jni-portable/portability-floor.sh (glibc<=2.28, NEEDED allow-list, no undefined unwinder symbols, 2 Java_ exports, stripped); stages under target/jni-portable, never touches target/release
 	mkdir -p $(JNI_PORTABLE_OUT)
 	docker run --rm -e CARGO_BUILD_JOBS -v "$$(pwd):/work" -w /work $(DOCKER_MANYLINUX_$(JNI_ARCH)) \
 	  .github/jni-portable/container-build.sh $(JNI_ARCH) $(JNI_PORTABLE_OUT) $(JNI_PORTABLE_OUT)/cargo-target

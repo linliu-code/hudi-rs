@@ -115,7 +115,10 @@ echo "exported Java_ symbols: $JAVASYMS (expected $EXPECT_JAVA_SYMS)"
 # 6. the library is stripped -----------------------------------------------------------------
 # The carrier's properties record `stripped=true`. A library that still has a .symtab was not
 # stripped, whichever job staged it, so the claim is checked on the bytes rather than assumed.
-if readelf -S "$SO" | grep -q ' \.symtab'; then
+# The section table is captured first: under pipefail, `readelf | grep -q` can fail with SIGPIPE
+# once grep has matched, which would read as "stripped".
+SECTIONS=$(readelf -S "$SO")
+if grep -q ' \.symtab' <<<"$SECTIONS"; then
   echo "FAIL: $SO is not stripped (it still has a .symtab section)"
   exit 1
 fi
