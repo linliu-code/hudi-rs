@@ -37,6 +37,14 @@ jobs:
       - name: Check license header
         uses: apache/skywalking-eyes/header@v0.9.0
 
+      # The carrier's Makefile rules build nothing here: stand-in libraries are compiled by the test
+      # itself, so this needs only gcc, binutils, cargo (for `cargo tree`) and a JDK's `jar`.
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+
+      - name: Test the JNI carrier Makefile rules
+        run: make test-jni-carrier
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
