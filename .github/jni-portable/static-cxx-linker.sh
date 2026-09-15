@@ -24,15 +24,13 @@
 # AUTOMATIC C++-runtime linking (what g++ adds implicitly when it decides a link is C++), and
 # have no effect on an explicit `-l` reference — measured empirically: `cc`/`gcc` (not `g++`)
 # is the linker driver rustc invokes, and even a `g++`-driven link with an explicit -lstdc++
-# still produces a dynamic libstdc++.so.6 NEEDED entry alongside -static-libstdc++. See
-# investigations/m3-carrier-glibc-floor/ (D-27 fix round 2) for that measurement.
+# still produces a dynamic libstdc++.so.6 NEEDED entry alongside -static-libstdc++.
 #
 # This wrapper rewrites `-lstdc++`/`-lgcc_s` IN PLACE (same position in the argument list, so
 # ordering relative to the .rlib archives that reference them — which `--as-needed` linking
 # depends on — is preserved) to force the static archives.
 #
-# fix round 3 (investigations/m3-carrier-unwinder-symbols/, run 34164782183): the FIRST version
-# of this wrapper mapped `-lgcc_s` -> `libgcc.a` alone. `libgcc.a` does NOT carry the unwinder
+# The FIRST version of this wrapper mapped `-lgcc_s` -> `libgcc.a` alone. `libgcc.a` does NOT carry the unwinder
 # (`_Unwind_*`) — that lives in `libgcc_eh.a` — so the resulting .so had 19 undefined
 # `_Unwind_*`/`__cxa_*` symbols and no `libgcc_s.so.1` NEEDED to resolve them dynamically
 # either. Nothing failed the LINK itself (a shared object links fine with undefined symbols by

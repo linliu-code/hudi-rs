@@ -20,8 +20,10 @@ name: JNI native carrier
 # commit to build. The default version is DERIVED from the one authority --
 # `[workspace.package] version` in the root Cargo.toml, read by
 # .github/scripts/workspace-version.sh -- so a version bump is a single edit there and never
-# leaves the published carrier disagreeing with the crates it was built from.
-# workflow_dispatch is kept for when this file reaches the default branch (AS-16).
+# leaves the carrier disagreeing with the crates it was built from.
+# workflow_dispatch is kept for when this file reaches the default branch.
+# This workflow builds, checks and packages the carrier and uploads it as a workflow artifact
+# (`hudi-jni-native-carrier`). It publishes nothing.
 on:
   push:
     tags:
@@ -29,16 +31,15 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "carrier version (default: the tag's suffix, else <workspace version>.<short sha>)"
+        description: "carrier version (default: the tag's suffix, else <x.y.z>-dev.<short sha> from the workspace version)"
         required: false
         default: ""
-# F-10: two tags pushed close together would otherwise race on the same CodeArtifact
-# coordinate. Serialise per ref; never cancel a run that may already have published.
+# Two runs for the same ref would otherwise race to produce the same artifacts. Serialise per ref,
+# and never cancel a run in progress.
 concurrency:
   group: jni-native-${{ github.ref }}
   cancel-in-progress: false
-# F-19: `id-token: write` is granted to the `package` job only -- it is the sole job that assumes
-# the publisher role. `build` runs untrusted-ish container workloads and needs no OIDC token.
+# Read-only: no job needs to write to the repository or to assume a cloud role.
 permissions:
   contents: read
 jobs:
@@ -51,7 +52,7 @@ jobs:
           - arch: x86_64
             runner: ubuntu-24.04
           - arch: aarch64
-            runner: ubuntu-24.04-arm   # T0 spike run 34157299135: aarch64, Ubuntu 24.04, cargo preinstalled (AS-18)
+            runner: ubuntu-24.04-arm   # aarch64, Ubuntu 24.04
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -67,39 +68,15 @@ jobs:
       # container (~2-3 min measured locally per arch), same as before this fix (the runner-side
       # cache was already continue-on-error and unverified on the ARC leg).
       - name: Build libhudi_jni.so (inside manylinux_2_28, D-27 — glibc<=2.28 floor)
+        # .github/jni-portable/container-build.sh is the container body `make jni-lib-portable`
+        # runs too, so a local portable build and this leg install the same toolchain (protoc
+        # pinned and checksummed) and run the same build. Here it stages under target/jni-native
+        # and builds into target/, the paths the steps below read.
         run: |
           set -euo pipefail
           test "$(uname -m)" = "${{ matrix.arch }}"
-          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work quay.io/pypa/manylinux_2_28_${{ matrix.arch }} bash -c '
-            set -euo pipefail
-            git config --global --add safe.directory /work
-            dnf install -y -q clang clang-devel
-            # AlmaLinux 8'"'"'s protobuf-compiler is 3.5.0 (predates --experimental_allow_proto3_optional,
-            # needed by lance-encoding/lance-file); download a modern protoc release instead.
-            ARCH=$(uname -m); [ "$ARCH" = aarch64 ] && PARCH=aarch_64 || PARCH=x86_64
-            curl -sL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-linux-${PARCH}.zip"
-            mkdir -p /usr/local/protoc && (cd /usr/local/protoc && unzip -q -o /tmp/protoc.zip)
-            ln -sf /usr/local/protoc/bin/protoc /usr/local/bin/protoc
-            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
-            export PATH="$HOME/.cargo/bin:$PATH"
-            # librocksdb-sys emits an explicit dynamic -lstdc++/-lgcc_s that
-            # -C link-arg=-static-libstdc++/-static-libgcc do NOT remove (measured; see
-            # .github/jni-portable/static-cxx-linker.sh for why) — force them static in place.
-            cp .github/jni-portable/static-cxx-linker.sh /usr/local/bin/static-cxx-linker.sh
-            chmod +x /usr/local/bin/static-cxx-linker.sh
-            export REAL_CC=$(command -v gcc)
-            export RUSTFLAGS="-C linker=/usr/local/bin/static-cxx-linker.sh"
-            # F-19: JNI_ALLOW_DIRTY=1 -- jni-lib refuses a dirty tree so a local build cannot be
-            # silently made from uncommitted code. In CI the tree is a pristine checkout of the
-            # tagged commit, but the container writes target/ under /work before jni-lib runs its
-            # own check, which `git status --porcelain` sees. The tag guard job, not this check,
-            # is what pins CI to a known commit.
-            make jni-lib JNI_ARCH=${{ matrix.arch }} JNI_ALLOW_DIRTY=1
-            # F-19: the container runs as root, so everything it wrote under /work is root-owned;
-            # later steps and actions/upload-artifact run as the runner user. Harmless on an
-            # ephemeral runner, but `make jni-lib-portable` chowns and this did not -- match it.
-            chown -R --reference=/work/Makefile /work/target
-          '
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work quay.io/pypa/manylinux_2_28_${{ matrix.arch }} \
+            .github/jni-portable/container-build.sh "${{ matrix.arch }}" target/jni-native target
           nm -D target/release/libhudi_jni.so | grep -c ' T Java_' | grep -qx 2
           file target/jni-native/stage/native/linux-${{ matrix.arch }}/libhudi_jni.so
       - name: Portability floor (D-27)
@@ -108,7 +85,8 @@ jobs:
         # ceiling, that no versioned GLIBCXX_/CXXABI_ import survived the static link, that every
         # NEEDED soname is on an ALLOW-list (the previous two-entry deny-list accepted any new
         # dynamic dependency a future crate might drag in), that no unwinder/C++ ABI symbol is
-        # left undefined (run 34164782183), and that the two Java_ exports survived the strip.
+        # left undefined, that the two Java_ exports survived the strip, and that the library
+        # is stripped.
         run: .github/jni-portable/portability-floor.sh target/jni-native/stage/native/linux-${{ matrix.arch }}/libhudi_jni.so
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '17' }
@@ -151,16 +129,22 @@ jobs:
           set -euo pipefail
           VERSION="$INPUT_VERSION"
           [ -n "$VERSION" ] || case "$GITHUB_REF" in refs/tags/jni-native/*) VERSION="${GITHUB_REF#refs/tags/jni-native/}";; esac
-          # The default is always a DEV coordinate, so it is built as <x.y.z>-dev.<sha> rather
-          # than by appending to the authority verbatim. Appending would produce
-          # `0.6.0.abc1234` the moment the workspace version stops carrying `-dev` -- a string
-          # the format check below rejects, which would break this workflow at exactly the
-          # release the single-sourcing exists to make safe.
+          # The default is always a DEV coordinate, <x.y.z>-dev.<short sha>, whatever pre-release
+          # suffix the workspace version carries. Appending to the workspace version verbatim
+          # would mint a release-looking <x.y.z>.<short sha> the moment it stops carrying `-dev`.
+          # The Makefile's JNI_VERSION derives the same string (.github/jni-tests/jni-version.sh).
           [ -n "$VERSION" ] || VERSION="$(.github/scripts/workspace-version.sh | sed 's/-.*//')-dev.$(git rev-parse --short HEAD)"
           mkdir -p stage/META-INF
           for arch in x86_64 aarch64; do
             mkdir -p stage/native/linux-$arch
             cp legs/libhudi_jni-linux-$arch/native/linux-$arch/libhudi_jni.so stage/native/linux-$arch/ 2>/dev/null || cp legs/libhudi_jni-linux-$arch/libhudi_jni.so stage/native/linux-$arch/
+          done
+          # Each leg's library is re-checked here, on the bytes this job is about to package,
+          # rather than trusting the leg: the same portability floor the legs assert (glibc
+          # ceiling, NEEDED allow-list, Java_ exports, stripped), so the properties below make no
+          # claim this job has not checked.
+          for arch in x86_64 aarch64; do
+            .github/jni-portable/portability-floor.sh stage/native/linux-$arch/libhudi_jni.so
           done
           ABI=$(grep -o 'JNI_ABI_VERSION: u32 = [0-9]*' crates/jni/src/lib.rs | grep -o '[0-9]*$')
           printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\narch=linux-x86_64,linux-aarch64\nmd5.linux-x86_64=%s\nmd5.linux-aarch64=%s\n' \
@@ -174,11 +158,11 @@ jobs:
               "$(objdump -T stage/native/linux-$arch/libhudi_jni.so | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)" \
               >> stage/META-INF/hudi-jni-native.properties
           done
-          # D-29 (F-7): the legs stage a `strip --strip-unneeded`ed library (Makefile jni-lib);
-          # record it so a consumer can tell a stripped carrier from an unstripped one.
+          # D-29: asserted by the portability floor above; record it so a consumer can tell a
+          # stripped carrier from an unstripped one.
           printf 'stripped=true\n' >> stage/META-INF/hudi-jni-native.properties
           cat stage/META-INF/hudi-jni-native.properties
-          # F-8: LICENSE / NOTICE / THIRD-PARTY.txt, from the same script `make jni-jar-multi`
+          # LICENSE / NOTICE / THIRD-PARTY.txt, from the same script `make jni-jar-multi`
           # runs, so a CI carrier and a locally assembled one carry identical legal files. It
           # needs cargo (`cargo tree` + `cargo metadata` for the hudi-jni dependency closure);
           # the ubuntu-24.04 image ships one, but install a toolchain if that ever changes rather
@@ -188,8 +172,8 @@ jobs:
             export PATH="$HOME/.cargo/bin:$PATH"
           }
           .github/jni-legal/stage-legal.sh stage
-          jar cf hudi-jni-native-$VERSION.jar -C stage .
-          unzip -l hudi-jni-native-$VERSION.jar; md5sum hudi-jni-native-$VERSION.jar | tee hudi-jni-native-$VERSION.jar.md5
+          jar cf "hudi-jni-native-$VERSION.jar" -C stage .
+          unzip -l "hudi-jni-native-$VERSION.jar"; md5sum "hudi-jni-native-$VERSION.jar" | tee "hudi-jni-native-$VERSION.jar.md5"
       - uses: actions/upload-artifact@v4
         with:
           name: hudi-jni-native-carrier

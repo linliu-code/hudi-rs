@@ -39,8 +39,8 @@ GLIBC_CEILING=${JNI_GLIBC_CEILING:-2.28}
 # F-5: an ALLOW-list, not a deny-list.  A deny-list of {libstdc++, libgcc_s} accepted any NEW
 # dynamic dependency a future Rust crate might drag in (libssl.so.3, libzstd.so.1, ...): those
 # carry no GLIBC_-versioned symbols, so the glibc-floor check cannot see them, and both smokes
-# run on hosts that may happen to provide them.  The shipped artifact's NEEDED set is provably
-# minimal today (evidence/m3-carrier-5fa3c21-listing.txt), so freeze it.
+# run on hosts that may happen to provide them.  The shipped artifact's NEEDED set is minimal
+# today (measured on a published carrier's two libraries), so freeze it.
 JNI_ALLOWED_NEEDED=${JNI_ALLOWED_NEEDED:-"libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 ld-linux-*.so.*"}
 EXPECT_JAVA_SYMS=${JNI_EXPECT_JAVA_SYMS:-2}
 
@@ -88,8 +88,7 @@ EOF
 }
 
 # 4. no undefined unwinder / C++ ABI symbols ------------------------------------------------
-# fix round 3 (investigations/m3-carrier-unwinder-symbols/, run 34164782183): a NEEDED list and
-# a glibc-symbol-version check alone missed 19 undefined _Unwind_*/__cxa_* symbols (libgcc.a
+# A NEEDED list and a glibc-symbol-version check alone missed 19 undefined _Unwind_*/__cxa_* symbols (libgcc.a
 # alone lacks the unwinder, which lives in libgcc_eh.a); the library loaded in this box's own
 # smoke only because the host JVM already had libgcc_s in its global scope — not proof of a
 # clean link.  Assert directly that no such symbol is left undefined.
@@ -113,4 +112,13 @@ nm -D --defined-only "$SO" | grep ' T Java_' || true
 echo "exported Java_ symbols: $JAVASYMS (expected $EXPECT_JAVA_SYMS)"
 [ "$JAVASYMS" -eq "$EXPECT_JAVA_SYMS" ] || { echo "FAIL: expected $EXPECT_JAVA_SYMS exported Java_ symbols, found $JAVASYMS"; exit 1; }
 
-echo "PASS: glibc floor $MAXGLIBC <= $GLIBC_CEILING; no versioned C++ runtime imports; NEEDED within the allow-list; no undefined unwinder/C++ symbols; $JAVASYMS Java_ symbols exported"
+# 6. the library is stripped -----------------------------------------------------------------
+# The carrier's properties record `stripped=true`. A library that still has a .symtab was not
+# stripped, whichever job staged it, so the claim is checked on the bytes rather than assumed.
+if readelf -S "$SO" | grep -q ' \.symtab'; then
+  echo "FAIL: $SO is not stripped (it still has a .symtab section)"
+  exit 1
+fi
+echo "stripped: no .symtab section"
+
+echo "PASS: glibc floor $MAXGLIBC <= $GLIBC_CEILING; no versioned C++ runtime imports; NEEDED within the allow-list; no undefined unwinder/C++ symbols; $JAVASYMS Java_ symbols exported; stripped"
