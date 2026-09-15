@@ -130,12 +130,13 @@ pub struct HoodieFileGroupReader {
     /// `FFI_ArrowArrayStream`); the lock is taken once per emitted chunk, so the
     /// cost is negligible against the per-chunk merge work.
     ///
-    /// Both call shapes read these back, by different routes. `read()`-based
-    /// callers get them drained into [`Self::read_stats`]. The FFI path cannot
-    /// use that route — it drops this reader as soon as `open()` returns the
-    /// stream — so it clones the handle via [`Self::stream_stats_handle`]
-    /// before that drop and reads the shared sink after the stream drains
-    /// (`cpp/src/lib.rs` `stream_stat`).
+    /// Both call shapes can read these back, by different routes.
+    /// `read()`-based callers get them drained into [`Self::read_stats`]. A
+    /// caller that streams through `open()` never calls `read()`, so that drain
+    /// never runs for it — keeping the reader alive would not change that. It
+    /// clones the handle via [`Self::stream_stats_handle`] instead, before it
+    /// drops the reader, and reads the shared sink after the stream drains; see
+    /// [`crate::ffi_support::stream_stats_handle`] for that contract.
     stream_stats: StreamStatsHandle,
 
     /// Valid block instants from log scanning.
