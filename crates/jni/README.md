@@ -147,40 +147,6 @@ it resolves from (and whether a classifier is present) changes:
   machine's arch must not be uploaded. That jar is uploaded as-is too, and the md5 to pin is
   `md5sum` of that jar.
 
-### Published carriers
-
-Recorded here rather than derived, because a published coordinate is **history**: it names bytes
-that already exist in CodeArtifact and must not be rewritten by a version bump. This file is the
-one place the single-source check exempts for exactly that reason.
-
-| coordinate | cut at | notes |
-|---|---|---|
-| `io.onehouse.hudi-rs:hudi-jni-native:0.6.0-dev.b3adac9` | `b3adac9`, tag `jni-native/0.6.0-dev.b3adac9` | **the `0.6.0-dev` carrier to pin** — and read the scope note below before assuming what it contains. |
-| `io.onehouse.hudi-rs:hudi-jni-native:0.6.0-dev.856dca2` | `856dca2`, tag `jni-native/0.6.0-dev.856dca2` | superseded — an interior commit of the same branch. Do not pin. |
-
-Two `0.6.0-dev` carriers exist and the tag list alone does not say which is current, so the row
-above is the answer rather than an invitation to guess. `b3adac9` is no longer the tip of any
-branch (the `m16` restack moved that branch); the commit is preserved by its tag and the published
-jar is immutable, so the coordinate remains correct.
-
-> **Scope — what `…b3adac9` does NOT contain.** It is the fork point plus this branch's CI-only
-> work. It is **not** a carrier for the delivery stack's native code:
->
-> ```
-> git merge-base --is-ancestor 919e730 b3adac9   # -> 1 (does NOT contain the m7.3 port landing)
-> git merge-base --is-ancestor f67db83 b3adac9   # -> 1 (does NOT contain the reader_v2 / provider work)
-> ```
->
-> Concretely, `cpp/src/cache_abi.rs` and `served_batch_stream` do not exist at `b3adac9`, so none of
-> the base-file-provider ABI or its correctness fixes are in those bytes. Pin this coordinate when
-> you need *a* `0.6.0-dev` carrier; do **not** pin it expecting the composed stack's native code.
->
-> **There is currently no carrier for the composed tip, by design.** `ALLOWED_BRANCHES` lists only
-> `main` and `davis/rli-native-hfile-read`, and the stack's tip is an ancestor of neither, so a
-> `jni-native/*` tag there is refused by the `guard` job. That is the control working as intended —
-> cutting one means landing the chain on `main` first, or a deliberate, temporary, per-branch
-> widening of the kind this file's `ALLOWED_BRANCHES` comment warns about.
-
 ## Building the carrier
 
 ### CI (`.github/workflows/jni-native.yml`)
