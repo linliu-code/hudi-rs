@@ -330,11 +330,16 @@ fn constant_array_from_avro_default(
             ))?;
             len
         ])),
-        DataType::Float32 => Arc::new(Float32Array::from(vec![
-            value.as_f64().ok_or_else(|| bad("a number"))?
-                as f32;
-            len
-        ])),
+        DataType::Float32 => {
+            let wide = value.as_f64().ok_or_else(|| bad("a number"))?;
+            let narrow = wide as f32;
+            // `as` saturates to infinity; a JSON number is always finite, so an
+            // infinite result is an out-of-range default, not a value.
+            if narrow.is_infinite() {
+                return Err(bad("in float32 range"));
+            }
+            Arc::new(Float32Array::from(vec![narrow; len]))
+        }
         DataType::Float64 => Arc::new(Float64Array::from(vec![
             value.as_f64().ok_or_else(
                 || bad("a number")
@@ -1963,6 +1968,43 @@ mod tests {
             err.contains("non-nullable struct child 'isTightBound' absent from the source"),
             "got: {err}"
         );
+    }
+
+    /// A `float` default out of `f32` range is refused, as every sibling arm
+    /// refuses an out-of-range default, rather than narrowed to infinity.
+    #[test]
+    fn a_float32_default_out_of_range_errs_rather_than_becoming_infinite() {
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        );
+        let target_with = |default: &str| -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                with_default(Field::new("f", DataType::Float32, false), default),
+            ]))
+        };
+        let err = project_batch_to_schema(&b, &target_with("1e40"))
+            .expect_err("1e40 does not fit a float")
+            .to_string();
+        assert!(err.contains("in float32 range"), "got: {err}");
+
+        let out = project_batch_to_schema(&b, &target_with("1.5")).unwrap();
+        let f = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(f.value(0), 1.5);
+        // Precision loss inside the range is what a float default means, not an
+        // error.
+        let out = project_batch_to_schema(&b, &target_with("0.1")).unwrap();
+        let f = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(f.value(0), 0.1f32);
     }
 
     #[test]
