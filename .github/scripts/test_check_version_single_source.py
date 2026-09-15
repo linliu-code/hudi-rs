@@ -338,7 +338,7 @@ class Rule1Dependencies(CheckerTestCase):
     def test_a_line_separator_in_a_comment_does_not_start_a_new_line(self):
         self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(),
                       f'hudi-core = {{ version = "{self.want}", path = "../core", default-features = false }}'
-                      ' # was hudi-core = { version = "0.5.0", path = "../core" }')
+                      ' # was\u2028hudi-core = { version = "0.5.0", path = "../core" }')
         self.assertPasses(self.tree.check())
 
     def test_a_manifest_that_is_not_utf8_fails_with_a_message(self):
@@ -386,6 +386,16 @@ class Rule1Dependencies(CheckerTestCase):
         self.assertIn('# hudi-core = "0.5.0"', manifest)
         self.assertIn(f'\nhudi-core = "{self.want}"', manifest)
         self.assertPasses(self.tree.check())
+
+    def test_a_quoted_git_key_is_not_ours_either(self):
+        self.tree.sub("crates/hudi/Cargo.toml", r"^\[dependencies\]$",
+                      '[dependencies]\ntpch = { "git" = "https://example.invalid/tpch", version = "0.3" }')
+        self.assertPasses(self.tree.check())
+
+    def test_a_member_name_written_with_single_quotes_is_still_a_member(self):
+        self.tree.sub("crates/core/Cargo.toml", r'^name = "hudi-core"$', "name = 'hudi-core'")
+        self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(), 'hudi-core = "0.5.0"')
+        self.assertFails(self.tree.check(), 'hudi-core requests version "0.5.0"')
 
     def test_a_git_or_registry_dependency_named_like_a_member_is_not_ours(self):
         self.tree.sub("crates/hudi/Cargo.toml", r"^\[dependencies\]$",

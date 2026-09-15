@@ -115,7 +115,7 @@ KEY_VERSION = re.compile(r"""(?<![A-Za-z0-9_-])(?:version|"version"|'version')\s
 KEY_PACKAGE = re.compile(r"""(?<![A-Za-z0-9_-])(?:package|"package"|'package')\s*=\s*""" + _STRING)
 # A dependency that names a registry or a git source is not the workspace's own crate, whatever
 # its name.
-KEY_ELSEWHERE = re.compile(r"(?<![A-Za-z0-9_-])(git|registry)\s*=")
+KEY_ELSEWHERE = re.compile(r"""(?<![A-Za-z0-9_-])(?:git|"git"|'git'|registry|"registry"|'registry')\s*=""")
 # `name = "1.2.3"` and `name = '1.2.3'`: a dependency given as a bare version requirement.
 STRING_VALUE = re.compile(r"""^("([^"]*)"|'([^']*)')$""")
 UNPARSED = "__UNPARSED__"
@@ -295,6 +295,10 @@ def dep_entries(text: str):
     string, whose quotes this line-based reader cannot track -- so the caller fails loudly instead
     of reporting a skipped dependency as a clean one.
 
+    Known limit: a triple-quoted string OUTSIDE a dependency table (say a `[package]` `readme`
+    whose text contains `[dependencies]` lines) is not recognised as a string, so lines inside it
+    are read as TOML. No manifest in this repository uses triple-quoted strings.
+
     Hand-rolled rather than via `tomllib`, which only exists on Python 3.11+ -- this has to run
     on whatever python3 a contributor's machine and the CI runner happen to have.
     """
@@ -406,7 +410,12 @@ def workspace_members() -> list[str]:
     its own unrelated version on purpose and is none of this checker's business: it is not part of
     this workspace and nothing published from here derives from it.
     """
-    text = "\n".join(code_part(line) for line in manifest_lines((ROOT / "Cargo.toml").read_text(encoding="utf-8")))
+    try:
+        raw = (ROOT / "Cargo.toml").read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        raise SystemExit("Cargo.toml is not valid UTF-8, which Cargo requires, so rule 0 cannot read "
+                         "its workspace members.")
+    text = "\n".join(code_part(line) for line in manifest_lines(raw))
     block = re.search(r"^\[workspace\]\s*$(.*?)(?=^\[)", text, re.M | re.S)
     if not block:
         raise SystemExit("Cargo.toml has no [workspace] section, so rule 0 cannot know what the "
@@ -429,7 +438,7 @@ INHERITS_VERSION = (
     re.compile(r"""^(version|"version"|'version')\s*\.\s*workspace\s*=\s*true$"""),
     re.compile(r"""^(version|"version"|'version')\s*=\s*\{\s*workspace\s*=\s*true\s*\}$"""),
 )
-PACKAGE_NAME = re.compile(r'^name\s*=\s*"([^"]+)"')
+PACKAGE_NAME = re.compile(r"""^(?:name|"name"|'name')\s*=\s*""" + _STRING)
 
 
 def package_section(text: str):
@@ -464,7 +473,7 @@ def package_name(text: str) -> str | None:
     for stripped in package_section(text):
         m = PACKAGE_NAME.match(stripped)
         if m:
-            return m.group(1)
+            return string_value(m)[0]
     return None
 
 
@@ -582,7 +591,7 @@ def main() -> int:
             renamed = string_value(renamed)[0] if renamed else None
             # A bare `tpch = "0.3"` from the registry would still read as the member `tpch` here; no
             # such dependency exists, and one would be reported loudly rather than skipped.
-            names_member = (in_workspace and not KEY_ELSEWHERE.search(spec)
+            names_member = (in_workspace and not find_key(KEY_ELSEWHERE, spec)
                             and (renamed or name) in member_names)
             if not find_key(KEY_PATH, spec) and not names_member:
                 continue  # not an intra-workspace dependency
