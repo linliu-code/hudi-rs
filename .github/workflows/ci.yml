@@ -415,6 +415,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # INTERNAL-FORK addition. Once ci_run.sh stopped swallowing the app's exit status, the apps
+      # really built, and a debug build of hudi (datafusion, lance, rocksdb) inside the runner
+      # container, plus the demo app's own target dir, ran the host out of disk: `No space left on
+      # device` compiling hudi-python, and on the datafusion leg a runner killed with no step logs
+      # (run 35031780895). Same reclaim as the cpp-ffi and python-tests jobs; df is printed before
+      # and after so the next failure here names what was available.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Pre-pull base images
@@ -440,6 +451,9 @@ jobs:
         run: |
           cd demo
           ./ci_run.sh ${{ matrix.app-path }}
+      - name: Disk after
+        if: always()
+        run: df -h /
       - name: Fix cache ownership before save
         if: always()
         run: |
