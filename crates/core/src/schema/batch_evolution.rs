@@ -537,21 +537,22 @@ fn avro_byte_string(value: &serde_json::Value, bad: &dyn Fn(&str) -> CoreError) 
 /// null element and succeeds on one without — so this predicate refuses the
 /// pairing. Widening can never fail the rebuild, so it is admitted.
 ///
-/// Which direction a caller meets depends on its argument order. arrow-avro
-/// declares an Avro `array<long>`'s child non-null and a parquet base file
-/// declares `element` nullable. Where the SOURCE is an Avro log column and the
-/// target carries a parquet-style nullable child (`pad_partial_to_target`, output
-/// projection), that pairing widens; where the source is a parquet base row and
-/// the target a log record's type (`reconcile_defaults_from_prior`) it narrows,
-/// and is declined: the log value is kept, as it was before this predicate
-/// reconciled names there. Two arrow-avro-derived sides are simply equal.
+/// Which direction a caller meets depends on its argument order and on where the
+/// target type came from. arrow-avro declares an Avro `array<long>`'s child
+/// non-null and a parquet base file declares `element` nullable; where an Avro
+/// log column is the source and the target carries a parquet-style nullable
+/// child (`pad_partial_to_target`, output projection), that pairing widens. Two
+/// arrow-avro-derived sides are simply equal.
 ///
-/// One caller deliberately does not use this rule:
-/// `overlay_partial_over_prior` keeps the nullability-blind reconciliation it had
-/// before the rule existed ([`is_name_reconcilable_ignoring_child_nullability`]),
-/// because refusing there drops a column the partial update never touched to a
-/// typed NULL. It propagates the rebuild's error, so a null element that cannot
-/// be re-tagged fails the read loudly rather than silently.
+/// Two callers deliberately do not use this rule, because both fill a value the
+/// merge would otherwise lose from a PRIOR row: `overlay_partial_over_prior` and
+/// `reconcile_defaults_from_prior`. There the prior is routinely a parquet base
+/// row under an arrow-avro-typed record, so the pairing narrows, and refusing it
+/// returns NULL for a column the base holds — where Java's partial merge takes the
+/// prior's value with no type check. Both use
+/// [`is_name_reconcilable_ignoring_child_nullability`] and propagate the rebuild's
+/// error, so a null element the target child cannot hold fails the read loudly
+/// rather than silently.
 ///
 /// `FixedSizeList` has no arm, although the rebuild could re-tag one: neither
 /// arrow-avro nor the parquet reader produces it on the paths that consult this,

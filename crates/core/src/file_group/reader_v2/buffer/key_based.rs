@@ -1129,11 +1129,22 @@ fn reconcile_defaults_from_prior(
             //
             // Anything beyond a name difference (Int64 vs Int32, List vs LargeList)
             // is still declined and the log value kept, exactly as before.
+            //
+            // Nullability-blind, with the rebuild's error propagated, as in
+            // `overlay_partial_over_prior`: a nested child the log type declares
+            // non-null accepts a prior whose data holds no null there, and fails
+            // loudly on one that does. Java's `reconcileDefaultValues` takes the
+            // lower record's value whenever the higher one holds the default, with
+            // no type check, so declining would return NULL where Java returns
+            // the prior's value.
             if prior_col.data_type() == field.data_type() {
                 cols.push(prior_col.clone());
                 changed = true;
                 continue;
-            } else if is_name_reconcilable(prior_col.data_type(), field.data_type()) {
+            } else if is_name_reconcilable_ignoring_child_nullability(
+                prior_col.data_type(),
+                field.data_type(),
+            ) {
                 cols.push(reconcile_one_column(&prior_row, pidx, field)?);
                 changed = true;
                 continue;
@@ -7190,29 +7201,47 @@ mod tests {
         )
     }
 
-    /// A nested child whose nullability NARROWS is not a name difference, and
-    /// `reconcile_defaults_from_prior` must decline it and keep the log value, as
-    /// it does for any other type difference.
+    /// `reconcile_defaults_from_prior` adopts a prior list whose child the winner's
+    /// type declares non-null while the prior's own child is nullable, when the
+    /// list holds no null element — and fails loudly when it holds one. It never
+    /// keeps the winner's NULL over a prior value, which is what Java's
+    /// `PartialUpdateHandler.reconcileDefaultValues` does too: it takes the lower
+    /// record's value whenever the higher one holds the default, with no type
+    /// check at all.
     ///
     /// The prior is a parquet base row (list child `element`, nullable) and the
     /// winner came from an Avro `array<long>`, whose child arrow-avro declares
-    /// non-null. Re-tagging the prior's list under the winner's type asserts that
-    /// no element is null; with a null element present the rebuild fails, and the
-    /// failure used to abort the whole read — and only on batches that happen to
-    /// hold a null element.
+    /// non-null. A null element cannot be represented under that type at all, so
+    /// that case is an error rather than a silently kept NULL.
     #[test]
-    fn reconcile_defaults_declines_a_list_child_whose_nullability_narrows() {
-        let prior = keyed_row(
-            DataType::List(Arc::new(Field::new("element", DataType::Int64, true))),
-            list_with_a_null_element("element"),
-        );
+    fn reconcile_defaults_adopts_a_prior_list_whose_child_nullability_narrows_unless_it_holds_a_null()
+     {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        let prior_type = DataType::List(Arc::new(Field::new("element", DataType::Int64, true)));
         let winner_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, false)));
-        let (out, changed) = reconcile_null_winner_from(winner_type, &prior)
-            .expect("a narrowing nullability difference must decline, not fail the read");
-        assert!(!changed, "the prior's value must not be adopted");
+
+        let mut b = ListBuilder::new(Int64Builder::new()).with_field(Arc::new(Field::new(
+            "element",
+            DataType::Int64,
+            true,
+        )));
+        b.values().append_value(1);
+        b.values().append_value(2);
+        b.append(true);
+        let prior = keyed_row(prior_type.clone(), Arc::new(b.finish()));
+        let (out, changed) = reconcile_null_winner_from(winner_type.clone(), &prior)
+            .expect("a prior list with no null element fits the winner's type");
         assert!(
-            out.get_record().unwrap().column(1).is_null(0),
-            "the log value is kept"
+            changed,
+            "the prior's value must be adopted, not the winner's NULL"
+        );
+        let batch = out.get_record().unwrap();
+        assert_eq!(batch.schema().field(1).data_type(), &winner_type);
+        assert!(!batch.column(1).is_null(0));
+
+        let prior = keyed_row(prior_type, list_with_a_null_element("element"));
+        reconcile_null_winner_from(winner_type, &prior).expect_err(
+            "a null element cannot be re-tagged non-null, and must not become a NULL list",
         );
     }
 
