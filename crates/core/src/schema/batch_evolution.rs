@@ -534,10 +534,18 @@ fn avro_byte_string(value: &serde_json::Value, bad: &dyn Fn(&str) -> CoreError) 
 /// widen: a non-null `source` child fits a nullable `target` child, but a nullable
 /// `source` child under a non-null `target` child asserts something the data need
 /// not satisfy. Re-tagged that way, the rebuild fails on the first batch holding a
-/// null element and succeeds on one without — so the pairing is refused outright.
-/// Widening is admitted rather than refused because it is the common pairing:
-/// arrow-avro declares an Avro `array<long>`'s child non-null, while a parquet
-/// base file declares `element` nullable.
+/// null element and succeeds on one without — so this predicate refuses the
+/// pairing. Widening is admitted rather than refused because it is the common
+/// pairing when an Avro log meets a parquet base: arrow-avro declares an Avro
+/// `array<long>`'s child non-null, while a parquet base file declares `element`
+/// nullable.
+///
+/// One caller deliberately does not use this rule:
+/// `overlay_partial_over_prior` keeps the nullability-blind reconciliation it had
+/// before the rule existed ([`is_name_reconcilable_ignoring_child_nullability`]),
+/// because refusing there drops a column the partial update never touched to a
+/// typed NULL. It propagates the rebuild's error, so a null element that cannot
+/// be re-tagged fails the read loudly rather than silently.
 ///
 /// `FixedSizeList` has no arm, although the rebuild could re-tag one: neither
 /// arrow-avro nor the parquet reader produces it on the paths that consult this,
@@ -546,11 +554,34 @@ pub(crate) fn is_name_reconcilable(
     source: &arrow_schema::DataType,
     target: &arrow_schema::DataType,
 ) -> bool {
+    name_reconcilable(source, target, false)
+}
+
+/// [`is_name_reconcilable`] with nested child nullability ignored in both
+/// directions. Admitting a narrowing hands the decision to the rebuild, which
+/// fails when the data holds a null the target child cannot: a caller must
+/// propagate that failure, never swallow it into a null.
+pub(crate) fn is_name_reconcilable_ignoring_child_nullability(
+    source: &arrow_schema::DataType,
+    target: &arrow_schema::DataType,
+) -> bool {
+    name_reconcilable(source, target, true)
+}
+
+fn name_reconcilable(
+    source: &arrow_schema::DataType,
+    target: &arrow_schema::DataType,
+    ignore_child_nullability: bool,
+) -> bool {
     use arrow_schema::DataType::{LargeList, List, Map, Struct};
-    fn child_reconcilable(source: &arrow_schema::Field, target: &arrow_schema::Field) -> bool {
-        (!source.is_nullable() || target.is_nullable())
-            && is_name_reconcilable(source.data_type(), target.data_type())
-    }
+    let child_reconcilable = |source: &arrow_schema::Field, target: &arrow_schema::Field| {
+        (ignore_child_nullability || !source.is_nullable() || target.is_nullable())
+            && name_reconcilable(
+                source.data_type(),
+                target.data_type(),
+                ignore_child_nullability,
+            )
+    };
     if source == target {
         return true;
     }
@@ -2974,5 +3005,22 @@ mod tests {
             .map(|(name, _, _, want)| format!("{name}: expected {want}"))
             .collect();
         assert!(wrong.is_empty(), "rows answered wrongly: {wrong:#?}");
+
+        // The nullability-blind variant differs exactly on the narrowing rows.
+        use super::is_name_reconcilable_ignoring_child_nullability as blind;
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter(|(name, source, target, want)| {
+                blind(source, target)
+                    != (*want
+                        || name.contains("nullable -> non-null")
+                        || name.contains("narrowing"))
+            })
+            .map(|(name, ..)| name.to_string())
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "nullability-blind rows answered wrongly: {wrong:#?}"
+        );
     }
 }

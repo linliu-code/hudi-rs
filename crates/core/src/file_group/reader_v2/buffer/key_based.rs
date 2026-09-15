@@ -63,7 +63,9 @@ use crate::file_group::reader_v2::record_merger::{
     BufferedRecordMergerFactory, should_keep_newer_record,
 };
 use crate::file_group::reader_v2::update_processor::{UpdateStats, create_update_processor};
-use crate::schema::batch_evolution::is_name_reconcilable;
+use crate::schema::batch_evolution::{
+    is_name_reconcilable, is_name_reconcilable_ignoring_child_nullability,
+};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, LargeBinaryArray,
     LargeStringArray, RecordBatch, StringArray,
@@ -1307,7 +1309,13 @@ fn overlay_partial_over_prior(
             let col = partial.column(pidx);
             if col.data_type() == field.data_type() {
                 cols.push(col.clone());
-            } else if is_name_reconcilable(col.data_type(), field.data_type()) {
+            } else if is_name_reconcilable_ignoring_child_nullability(
+                col.data_type(),
+                field.data_type(),
+            ) {
+                // Nullability-blind, as this path always was: a nested child
+                // nullability narrowing is left to the rebuild, whose error is
+                // propagated (see `is_name_reconcilable`).
                 cols.push(reconcile_one_column(partial, pidx, field)?);
             } else {
                 return Err(crate::error::CoreError::Unsupported(format!(
@@ -1328,7 +1336,13 @@ fn overlay_partial_over_prior(
             if col.data_type() == field.data_type() {
                 cols.push(col.clone());
                 continue;
-            } else if is_name_reconcilable(col.data_type(), field.data_type()) {
+            } else if is_name_reconcilable_ignoring_child_nullability(
+                col.data_type(),
+                field.data_type(),
+            ) {
+                // Nullability-blind, and the rebuild's error propagated: a
+                // narrowing the data cannot satisfy fails loudly, and one it can
+                // keeps the prior's value instead of a typed null.
                 cols.push(reconcile_one_column(prior_row, bidx, field)?);
                 continue;
             }
@@ -7336,6 +7350,54 @@ mod tests {
         let padded = pad_partial_to_target(&partial, &target)
             .expect("pad_partial_to_target must reconcile through the struct");
         assert_eq!(padded.schema().field(1).data_type(), &struct_of("element"));
+    }
+
+    /// The overlay keeps a prior list column whose child the TABLE schema declares
+    /// non-null while the prior's own child is nullable, as it did before the
+    /// nullability rule existed, when the data holds no null element; with one,
+    /// it fails loudly. It never drops the prior's value to a typed NULL.
+    ///
+    /// This is the pairing a parquet base row (nullable `element`) meets under an
+    /// Avro `array<long>` table schema (non-null `item`). Refusing it outright
+    /// would null a column the partial update never touched.
+    #[test]
+    fn overlay_keeps_a_prior_list_whose_child_nullability_narrows_unless_it_holds_a_null() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new(
+                "col",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+                true,
+            ),
+        ]));
+        let partial = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["k1"]))],
+        )
+        .unwrap();
+        let prior_type = DataType::List(Arc::new(Field::new("element", DataType::Int64, true)));
+
+        let mut b = ListBuilder::new(Int64Builder::new()).with_field(Arc::new(Field::new(
+            "element",
+            DataType::Int64,
+            true,
+        )));
+        b.values().append_value(1);
+        b.values().append_value(2);
+        b.append(true);
+        let prior = keyed_row(prior_type.clone(), Arc::new(b.finish()));
+        let out = overlay_partial_over_prior(&partial, &prior, &target)
+            .expect("a prior with no null element fits the narrower child");
+        assert_eq!(out.schema(), target);
+        assert!(
+            !out.column(1).is_null(0),
+            "the prior's list is kept, not dropped to a typed NULL"
+        );
+
+        let prior = keyed_row(prior_type, list_with_a_null_element("element"));
+        overlay_partial_over_prior(&partial, &prior, &target)
+            .expect_err("a null element cannot be re-tagged non-null, and must not be nulled");
     }
 
     /// A `LargeList` child name difference reconciles in the partial pad.
