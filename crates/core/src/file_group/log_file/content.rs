@@ -1414,9 +1414,10 @@ mod tests {
     /// The log rewrite path's targets must spell a UTC timestamp zone `UTC`, not
     /// `+00:00`.
     ///
-    /// Both targets come off the arrow-avro decoder, which spells that zone as
-    /// the offset, while `required_schema` and every parquet-derived base batch
-    /// spell it `UTC`. Arrow compares timezones as strings, so a target left
+    /// The required target comes off the arrow-avro conversion, which spells that
+    /// zone as the offset, while `required_schema` and every parquet-derived base
+    /// batch spell it `UTC`; the defaults carrier is stamped onto that same
+    /// normalised schema. Arrow compares timezones as strings, so a target left
     /// unnormalised makes a log batch and a base batch of the same table
     /// disagree by type. The rewrite branch is selected by giving the reader
     /// schema one more field than the writer's, which is what Java's
@@ -1452,7 +1453,7 @@ mod tests {
         assert_eq!(
             targets.len(),
             2,
-            "the rewrite runs through the resolved schema and then the required one"
+            "the rewrite runs through the defaults carrier and then the required schema"
         );
         for (i, target) in targets.iter().enumerate() {
             let ts = target.field_with_name("ts").expect("ts field");
@@ -1463,11 +1464,11 @@ mod tests {
                 ts.data_type()
             );
         }
-        // The resolved target is the one that carries the Avro defaults; the
-        // required target is the plain conversion. Both are normalised.
+        // The first target is the defaults carrier; the last is the plain
+        // required conversion. Both carry the reader-only field.
         assert!(
             targets[0].field_with_name("added").is_ok(),
-            "the resolved target carries the reader-only field"
+            "the defaults carrier carries the reader-only field"
         );
         Ok(())
     }

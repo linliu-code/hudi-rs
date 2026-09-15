@@ -414,6 +414,7 @@ mod tests {
         let result = create_base_file_reader(&storage, &BaseFileFormatValue::Lance);
         assert!(result.is_ok());
     }
+
     /// The default `read_schema` reports the file's schema whatever the options
     /// ask the READ to do: a `read_stream` that honours a projection or appends a
     /// row-index column must not shrink or widen the answer, while the reader

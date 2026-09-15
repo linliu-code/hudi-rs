@@ -143,22 +143,22 @@ pub(crate) fn avro_schema_json_equivalent(a_json: &str, b_json: &str) -> crate::
 /// schema it resolved and what [`project_batch_to_schema`] reads to fill a field
 /// the source never wrote. Nothing else about `schema` changes.
 ///
-/// This is what the log rewrite takes its defaults from. It used to take them
-/// from a schema `arrow-avro` resolved against the block's writer, which fails
-/// twice over: `arrow-avro` refuses to resolve exactly the evolutions the
-/// rewrite exists for (`int -> string`), and when it does resolve, a named type
-/// referenced after the record that defines it closes comes back in the
-/// WRITER's shape, without the fields — and so without the defaults — the
-/// evolution added. The defaults are the reader's, so they are read from the
-/// reader schema.
+/// This is what the log rewrite takes its defaults from. A schema `arrow-avro`
+/// resolved against the block's writer cannot serve: it refuses to resolve
+/// exactly the evolutions the rewrite exists for (`int -> string`), and when it
+/// does resolve, a named type referenced after the record that defines it closes
+/// comes back in the WRITER's shape, without the fields — and so without the
+/// defaults — the evolution added. The defaults are the reader's, so they are
+/// read from the reader schema.
 ///
 /// Names resolve exactly as arrow-avro resolves them (`(namespace, name)`, a
 /// record's children in the record's namespace), because the Arrow schema is
 /// arrow-avro's. A null default is not stamped: it fills the same null as no
 /// default. A name that does not resolve, or a union whose branch count disagrees with
 /// the Arrow union, is left unstamped rather than guessed at: the fill then
-/// behaves as it would with no default declared. A recursive reference stops at
-/// the first repeat.
+/// behaves as it would with no default declared. A reference to a record already
+/// being walked is not followed again, so the walk terminates even on a recursive
+/// schema (which `arrow-avro` cannot convert in the first place).
 ///
 /// [`project_batch_to_schema`]: crate::schema::batch_evolution::project_batch_to_schema
 pub(crate) fn with_avro_defaults(
@@ -882,6 +882,7 @@ mod tests {
         // Malformed input is an error, not a false "equivalent".
         assert!(avro_schema_json_equivalent(base, "{not json").is_err());
     }
+
     /// A `doc` key inside a DEFAULT value is data, not prose, and must count.
     ///
     /// A map- or record-typed field's default is a JSON object, and a key of that
@@ -921,6 +922,7 @@ mod tests {
             "a record default whose field is named `doc` is data"
         );
     }
+
     /// `with_avro_defaults` stamps each declared non-null default as its JSON text at every
     /// depth — record fields, array items, map values, nullable and general union
     /// branches, named types referenced by simple or full name anywhere after their
@@ -1142,6 +1144,7 @@ mod tests {
         };
         assert_eq!(strip(&stamped), schema);
     }
+
     /// A reference is followed in the namespace its type was DEFINED in, as
     /// arrow-avro builds it, not the namespace of the site that refers to it. Here
     /// two records are both named `T`: `other.T` (default 1) and `top.T` (default

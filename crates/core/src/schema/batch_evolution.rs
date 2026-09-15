@@ -40,14 +40,14 @@ use std::sync::Arc;
 /// micros→millis arithmetic conversion. Mirrors Java `DateTimeUtils.MICROS_PER_MILLIS`.
 const MICROS_PER_MILLIS: i64 = 1000;
 
-/// Where `arrow-avro` records a field's Avro `default`, as the default's raw
-/// JSON text (`"false"`, `"42"`, `"\"lorem ipsum\""`, `"null"`).
+/// Where a field's Avro `default` is carried, as the default's raw JSON text
+/// (`"false"`, `"42"`, `"\"lorem ipsum\""`, `"null"`).
 ///
-/// It is stamped only on a schema `arrow-avro` produced by RESOLVING a writer
-/// schema against a reader schema — converting a reader schema on its own does
-/// not carry defaults. That is exactly when it is needed here: a reader field
-/// the writer never wrote has to come from somewhere, and Avro says it comes
-/// from this.
+/// `arrow-avro` stamps it on a schema it produced by RESOLVING a writer schema
+/// against a reader schema, and `schema::avro_schema_utils::with_avro_defaults`
+/// stamps it from a reader schema directly; converting a reader schema on its
+/// own does not carry defaults. A reader field the writer never wrote has to
+/// come from somewhere, and Avro says it comes from this.
 pub(crate) const AVRO_FIELD_DEFAULT_KEY: &str = "avro.field.default";
 
 /// Project `batch` to `target` schema: reorder by name, null-fill missing

@@ -192,10 +192,10 @@ impl AvroBlockDecoder {
     /// writer-to-writer, then promote.
     ///
     /// Called more than once, the schemas apply in the order they were added.
-    /// That is how a rewrite reaches a schema whose Avro DEFAULTS it needs:
-    /// `arrow-avro` records a field's default only on a schema it produced by
-    /// resolving, so the resolved schema goes first and carries the defaults,
-    /// and the caller's own target follows to strip the metadata back off.
+    /// That is how a rewrite reaches a schema whose Avro DEFAULTS it needs: a
+    /// schema carrying each default as `avro.field.default` metadata goes first
+    /// (see `schema::avro_schema_utils::with_avro_defaults`), and the caller's
+    /// own target follows to strip the metadata back off.
     pub fn with_rewrite_to(mut self, schema: SchemaRef) -> Self {
         self.rewrite_to.push(schema);
         self
@@ -524,6 +524,7 @@ mod tests {
             &arrow_schema::DataType::Int32
         );
     }
+
     /// PINS arrow-avro behaviour that diverges from Java: a reader field the
     /// writer never wrote, declared as a null-first union with NO `default`, is
     /// resolved to NULL, and the resolved field is stamped with a
