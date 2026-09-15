@@ -413,14 +413,28 @@ fn constant_array_from_avro_default(
                     })?,
             )
         }
-        // Not handled specially: an Avro `uuid` logical type also maps to
-        // `FixedSizeBinary(16)`, but `arrow-avro` parses its default as a plain
-        // (36-char, hyphenated) string, not a code-point-encoded byte string. A
-        // 36-char default therefore fails loudly below on the width check (36 !=
-        // 16); a 16-char default would NOT fail the width check and would be
-        // mis-decoded as 16 raw bytes rather than a UUID. Refusing uuid defaults
-        // explicitly (e.g. by field name/metadata) is left for when the corpus
-        // actually has one.
+        // An Avro `uuid` also maps to `FixedSizeBinary(16)`, but its default is a
+        // UUID string, not a code-point byte string: arrow-avro parses it as one
+        // when it resolves, and marks the field `logicalType: uuid`. Read as a
+        // byte string, a hyphenated UUID would fail on its length and a
+        // 16-character string would be taken as its ASCII bytes.
+        DataType::FixedSizeBinary(16)
+            if target_field
+                .metadata()
+                .get("logicalType")
+                .is_some_and(|t| t == "uuid") =>
+        {
+            let bytes = value
+                .as_str()
+                .and_then(uuid_string_bytes)
+                .ok_or_else(|| bad("a UUID string"))?;
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(std::iter::repeat_n(bytes.as_slice(), len))
+                    .map_err(|e| {
+                        CoreError::Schema(format!("evolution: uuid default for '{name}': {e}"))
+                    })?,
+            )
+        }
         DataType::FixedSizeBinary(width) => {
             let bytes = avro_byte_string(value, &bad)?;
             if bytes.len() != usize::try_from(*width).unwrap_or(usize::MAX) {
@@ -453,6 +467,32 @@ fn constant_array_from_avro_default(
         }
     };
     Ok(array)
+}
+
+/// The 16 bytes of a UUID string, in the spellings arrow-avro's resolution
+/// accepts for a `uuid` default: hyphenated (`8-4-4-4-12`) or 32 bare hex
+/// digits, either optionally braced or behind `urn:uuid:`.
+fn uuid_string_bytes(text: &str) -> Option<[u8; 16]> {
+    let text = text.strip_prefix("urn:uuid:").unwrap_or(text);
+    let text = text
+        .strip_prefix('{')
+        .and_then(|t| t.strip_suffix('}'))
+        .unwrap_or(text);
+    let hex: Vec<u8> = match text.len() {
+        32 => text.bytes().collect(),
+        36 if [8, 13, 18, 23].iter().all(|&i| text.as_bytes()[i] == b'-') => {
+            text.bytes().filter(|&b| b != b'-').collect()
+        }
+        _ => return None,
+    };
+    if hex.len() != 32 || !hex.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (byte, pair) in out.iter_mut().zip(hex.chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Avro spells a `bytes`/`fixed`/decimal default as a string whose code points
@@ -2183,10 +2223,10 @@ mod tests {
 
     #[test]
     fn test_project_a_36_char_uuid_default_on_fixed_size_binary_16_errs_with_the_width_message() {
-        // An Avro `uuid` logical type also maps to FixedSizeBinary(16), but
-        // `arrow-avro` parses its default as a plain hyphenated string (36
-        // chars), not a code-point-encoded byte string. That default must fail
-        // loudly on the width check, not be silently mis-decoded.
+        // A plain `fixed(16)` (no `logicalType: uuid`, see
+        // `a_uuid_default_fills_the_bytes_arrow_avro_resolution_gives_it`) reads
+        // its default as a code-point byte string, so a 36-char hyphenated
+        // string must fail loudly on the width check, not be silently mis-decoded.
         let b = batch(
             vec![Field::new("id", DataType::Int32, true)],
             vec![Arc::new(Int32Array::from(vec![1]))],
@@ -2615,5 +2655,100 @@ mod tests {
             vec!["l".to_string()],
             "and so must one inside a list"
         );
+    }
+    /// Every spelling `uuid_string_bytes` accepts gives the same bytes; anything
+    /// else is refused.
+    #[test]
+    fn uuid_string_bytes_accepts_the_uuid_spellings_and_nothing_else() {
+        use super::uuid_string_bytes;
+        let want = Some([
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ]);
+        for ok in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "550E8400-E29B-41D4-A716-446655440000",
+            "550e8400e29b41d4a716446655440000",
+            "{550e8400-e29b-41d4-a716-446655440000}",
+            "urn:uuid:550e8400-e29b-41d4-a716-446655440000",
+        ] {
+            assert_eq!(uuid_string_bytes(ok), want, "{ok}");
+        }
+        for bad in [
+            "0123456789abcdef",
+            "550e8400-e29b-41d4-a716-44665544000g",
+            "550e8400+e29b+41d4+a716+446655440000",
+            "+50e8400e29b41d4a716446655440000",
+            "",
+        ] {
+            assert_eq!(uuid_string_bytes(bad), None, "{bad}");
+        }
+    }
+
+    /// An Avro `uuid` default fills a rewritten field with the same 16 bytes
+    /// arrow-avro's own resolving decoder gives it.
+    ///
+    /// arrow-avro reads a `uuid` default as a UUID string, and marks the field
+    /// `logicalType: uuid`. The rewrite fill used to read every
+    /// `FixedSizeBinary(16)` default as an Avro code-point byte string instead, so
+    /// a valid hyphenated UUID default failed the read on its length and a
+    /// 16-character string default was taken as its 16 ASCII bytes, where the
+    /// resolving decoder refuses it.
+    #[test]
+    fn a_uuid_default_fills_the_bytes_arrow_avro_resolution_gives_it() {
+        use crate::file_group::log_file::avro::AvroBlockDecoder;
+        let writer = r#"{"type":"record","name":"R","fields":[{"name":"id","type":"long"}]}"#;
+        let reader_with = |default: &str| {
+            format!(
+                r#"{{"type":"record","name":"R","fields":[{{"name":"id","type":"long"}},{{"name":"u","type":{{"type":"string","logicalType":"uuid"}},"default":"{default}"}}]}}"#
+            )
+        };
+        let writer_schema = apache_avro::Schema::parse_str(writer).unwrap();
+        let mut record = apache_avro::types::Record::new(&writer_schema).unwrap();
+        record.put("id", 1i64);
+        let body = apache_avro::to_avro_datum(&writer_schema, record).unwrap();
+        let writer_batch = batch(
+            vec![Field::new("id", DataType::Int64, false)],
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1]))],
+        );
+
+        // Valid: the rewrite fill equals the resolving decode.
+        let reader = reader_with("550e8400-e29b-41d4-a716-446655440000");
+        let mut resolving =
+            AvroBlockDecoder::try_new_with_reader(writer, Some(&reader), 1).unwrap();
+        let resolved = resolving.decode(&body).unwrap().expect("one-row batch");
+        let rewritten = project_batch_to_schema(&writer_batch, &resolved.schema())
+            .expect("a valid UUID default must fill, as resolution does");
+        assert_eq!(
+            rewritten.column(1).as_ref(),
+            resolved.column(1).as_ref(),
+            "the rewrite and the resolution must agree on the bytes"
+        );
+        let uuid = rewritten
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap()
+            .value(0)
+            .to_vec();
+        assert_eq!(
+            uuid,
+            [
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00
+            ]
+        );
+
+        // Not a UUID: resolution refuses it, and so must the rewrite, rather than
+        // storing the string's ASCII bytes.
+        let reader = reader_with("0123456789abcdef");
+        let mut resolving =
+            AvroBlockDecoder::try_new_with_reader(writer, Some(&reader), 1).unwrap();
+        assert!(resolving.decode(&body).is_err(), "resolution refuses it");
+        let target = resolving.schema();
+        let err = project_batch_to_schema(&writer_batch, &target)
+            .expect_err("a 16-character non-UUID default must not fill")
+            .to_string();
+        assert!(err.contains("a UUID string"), "got: {err}");
     }
 }
