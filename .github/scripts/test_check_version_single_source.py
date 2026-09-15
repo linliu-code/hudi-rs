@@ -185,6 +185,29 @@ class ReleaseBumps(CheckerTestCase):
 
 
 class Rule0Members(CheckerTestCase):
+    def test_default_members_listed_first_does_not_shrink_the_member_set(self):
+        count = re.search(r"checked: (\d+) workspace member", self.tree.check().stdout).group(1)
+        self.tree.sub("Cargo.toml", r"^\[workspace\]$", '[workspace]\ndefault-members = ["crates/hudi"]')
+        result = self.tree.check()
+        self.assertPasses(result)
+        self.assertIn(f"checked: {count} workspace member", result.stdout)
+        self.tree.sub("crates/core/Cargo.toml", r"^version\.workspace = true$", f'version = "{dev("0.5.0")}"')
+        self.assertFails(self.tree.check(), "crates/core/Cargo.toml: workspace member declares its own version")
+
+    def test_single_quoted_members_entries_are_read(self):
+        count = re.search(r"checked: (\d+) workspace member", self.tree.check().stdout).group(1)
+        self.tree.sub("Cargo.toml", r'^    "crates/\*",$', "    'crates/*',")
+        result = self.tree.check()
+        self.assertPasses(result)
+        self.assertIn(f"checked: {count} workspace member", result.stdout)
+
+    def test_a_root_manifest_that_is_not_utf8_stops_with_a_message(self):
+        path = self.tree.dir / "Cargo.toml"
+        path.write_bytes(path.read_bytes() + b"\n# \xe9\n")
+        result = self.tree.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Cargo.toml is not valid UTF-8", result.stdout + result.stderr)
+
     def test_a_comment_in_the_members_list_does_not_hide_members(self):
         count = re.search(r"checked: (\d+) workspace member", self.tree.check().stdout).group(1)
         self.tree.sub("Cargo.toml", r'^    "crates/\*",$', '    "crates/*", # see [notes]')
@@ -397,7 +420,12 @@ class Rule1Dependencies(CheckerTestCase):
         self.tree.sub("crates/hudi/Cargo.toml", self.hudi_core_dep(), 'hudi-core = "0.5.0"')
         self.assertFails(self.tree.check(), 'hudi-core requests version "0.5.0"')
 
-    def test_a_git_or_registry_dependency_named_like_a_member_is_not_ours(self):
+    def test_a_registry_dependency_named_like_a_member_is_not_ours(self):
+        self.tree.sub("crates/hudi/Cargo.toml", r"^\[dependencies\]$",
+                      '[dependencies]\ntpch = { version = "0.3", \'registry\' = "my-registry" }')
+        self.assertPasses(self.tree.check())
+
+    def test_a_git_dependency_named_like_a_member_is_not_ours(self):
         self.tree.sub("crates/hudi/Cargo.toml", r"^\[dependencies\]$",
                       '[dependencies]\ntpch = { version = "0.3", git = "https://example.invalid/tpch" }')
         self.assertPasses(self.tree.check())

@@ -420,11 +420,13 @@ def workspace_members() -> list[str]:
     if not block:
         raise SystemExit("Cargo.toml has no [workspace] section, so rule 0 cannot know what the "
                          "members are. This checker assumes a workspace root.")
-    listing = re.search(r"members\s*=\s*\[(.*?)\]", block.group(1), re.S)
+    # Anchored so `default-members = [...]` (a subset, often listed first) is not read as `members`.
+    listing = re.search(r"(?<![A-Za-z0-9_-])members\s*=\s*\[(.*?)\]", block.group(1), re.S)
     if not listing:
         raise SystemExit("[workspace] has no `members` list, so rule 0 cannot know what to check.")
     manifests: list[str] = []
-    for pattern in re.findall(r'"([^"]+)"', listing.group(1)):
+    for m in re.finditer(_STRING, listing.group(1)):
+        pattern = string_value(m)[0]
         for d in sorted(ROOT.glob(pattern)):
             manifest = d / "Cargo.toml"
             if manifest.is_file():
