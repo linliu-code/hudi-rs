@@ -409,20 +409,22 @@ pub fn forward_scan_pass1(
         }
     }
 
-    // Level rule for this reader: narration -- a line per log block, per log
-    // file, per instant, or per step of the scan -- is `trace!`, since a file
-    // group can carry thousands of blocks and a gate skip is as frequent as an
-    // accept; the one completion summary per pass is `debug!`, and carries the
-    // counts that narration would otherwise be needed for. A corrupt block keeps
-    // its `warn!` at Gate 1: it is an exception, not per-block volume.
+    // Level rule for the log scan in this file: a line emitted once per log
+    // block, per log file or per instant is `trace!`, since a file group can
+    // carry thousands of blocks and a gate skip is as frequent as an accept, and
+    // so is a line that repeats a summary already at `debug!`. A few lines emitted
+    // once per scan -- this Pass 1 summary, the Pass 2 summary, Pass 3's window
+    // plan -- are `debug!`, and carry the counts and the rolled-back instants the
+    // per-block lines would otherwise be needed for. A corrupt block keeps its
+    // `warn!` at Gate 1: it is an exception, not per-block volume.
     log::debug!(
         "[Pass1] complete: ordered_instants={ordered_instants_list:?} \
          total_blocks={total_log_blocks} corrupt={total_corrupt_blocks} \
-         rollbacks={total_rollbacks} skipped_future={skipped_future} \
-         skipped_uncommitted={skipped_uncommitted} skipped_out_of_range={skipped_out_of_range}",
+         rollbacks={total_rollbacks} rolled_back={target_rollback_instants:?} \
+         skipped_future={skipped_future} skipped_uncommitted={skipped_uncommitted} \
+         skipped_out_of_range={skipped_out_of_range}",
     );
-    // Guarded so the loop, and the `Vec` of block types each iteration builds,
-    // is not run at all unless `trace!` is enabled.
+    // Guarded so the loop itself is skipped unless `trace!` is enabled.
     if log::log_enabled!(log::Level::Trace) {
         for (instant, blocks) in &instant_to_blocks_map {
             log::trace!(
