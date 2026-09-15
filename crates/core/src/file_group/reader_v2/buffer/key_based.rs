@@ -7130,6 +7130,101 @@ mod tests {
         );
     }
 
+    /// A one-row `(key, col)` batch whose `col` column has `col_type`.
+    fn keyed_row(col_type: DataType, col: ArrayRef) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("col", col_type, true),
+            ])),
+            vec![Arc::new(StringArray::from(vec!["k1"])) as ArrayRef, col],
+        )
+        .unwrap()
+    }
+
+    /// `[[1, null]]` as a `List<Int64>` whose child is `child`, nullable.
+    fn list_with_a_null_element(child: &str) -> ArrayRef {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        let mut b = ListBuilder::new(Int64Builder::new()).with_field(Arc::new(Field::new(
+            child,
+            DataType::Int64,
+            true,
+        )));
+        b.values().append_value(1);
+        b.values().append_null();
+        b.append(true);
+        Arc::new(b.finish())
+    }
+
+    /// Run `reconcile_defaults_from_prior` for a winner whose `col` is NULL (so
+    /// the prior's value is wanted) against `prior`.
+    fn reconcile_null_winner_from(
+        winner_col_type: DataType,
+        prior: &RecordBatch,
+    ) -> Result<(BufferedRecord, bool)> {
+        let winner = keyed_row(
+            winner_col_type.clone(),
+            arrow_array::new_null_array(&winner_col_type, 1),
+        );
+        reconcile_defaults_from_prior(
+            BufferedRecord::new_data("k1".to_string(), winner, None),
+            prior,
+            0,
+            &HashMap::new(),
+            &["key".to_string()],
+        )
+    }
+
+    /// A nested child whose nullability NARROWS is not a name difference, and
+    /// `reconcile_defaults_from_prior` must decline it and keep the log value, as
+    /// it does for any other type difference.
+    ///
+    /// The prior is a parquet base row (list child `element`, nullable) and the
+    /// winner came from an Avro `array<long>`, whose child arrow-avro declares
+    /// non-null. Re-tagging the prior's list under the winner's type asserts that
+    /// no element is null; with a null element present the rebuild fails, and the
+    /// failure used to abort the whole read — and only on batches that happen to
+    /// hold a null element.
+    #[test]
+    fn reconcile_defaults_declines_a_list_child_whose_nullability_narrows() {
+        let prior = keyed_row(
+            DataType::List(Arc::new(Field::new("element", DataType::Int64, true))),
+            list_with_a_null_element("element"),
+        );
+        let winner_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, false)));
+        let (out, changed) = reconcile_null_winner_from(winner_type, &prior)
+            .expect("a narrowing nullability difference must decline, not fail the read");
+        assert!(!changed, "the prior's value must not be adopted");
+        assert!(
+            out.get_record().unwrap().column(1).is_null(0),
+            "the log value is kept"
+        );
+    }
+
+    /// The other direction reconciles: a prior whose child is non-null fits a
+    /// winner whose child is nullable, whatever the data holds.
+    #[test]
+    fn reconcile_defaults_adopts_a_list_child_whose_nullability_widens() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        let mut b = ListBuilder::new(Int64Builder::new()).with_field(Arc::new(Field::new(
+            "item",
+            DataType::Int64,
+            false,
+        )));
+        b.values().append_value(1);
+        b.append(true);
+        let prior = keyed_row(
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+            Arc::new(b.finish()),
+        );
+        let winner_type = DataType::List(Arc::new(Field::new("element", DataType::Int64, true)));
+        let (out, changed) = reconcile_null_winner_from(winner_type.clone(), &prior).unwrap();
+        assert!(changed, "the prior's value must be adopted");
+        let batch = out.get_record().unwrap();
+        assert_eq!(batch.schema().field(1).data_type(), &winner_type);
+        assert!(!batch.column(1).is_null(0));
+    }
+
     /// An `IS_PARTIAL` log block carries Hudi meta columns
     /// (`_hoodie_commit_time`, `_hoodie_record_key`, …) alongside the updated data
     /// column. The projected reader (target) schema may have pruned those meta
