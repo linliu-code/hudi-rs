@@ -1537,6 +1537,10 @@ mod tests {
     }
 
     #[tokio::test]
+    // `Table::new` copies every `AWS_*` / `AZURE_*` / `GOOGLE_*` environment
+    // variable into the storage options. The env-var tests set some of them,
+    // one to the empty string, and this test asserts every value is non-empty.
+    #[serial(env_vars)]
     async fn test_hudi_table_get_storage_options() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
