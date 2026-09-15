@@ -223,7 +223,9 @@ impl DataBlock {
     /// `KeyValue::parse` itself cannot make this check: it takes a byte slice and
     /// knows only `bytes.len()`, while the bound that matters is the block's
     /// `content_end`, which only the block knows. So `parse` stays infallible and
-    /// clamping, and this is the layer that refuses to call it out of bounds.
+    /// clamping, and this is the layer that refuses to call it out of bounds, and
+    /// that refuses a record whose declared lengths -- a negative one included --
+    /// do not fit inside the block.
     pub fn read_key_value(&self, offset: usize) -> Result<KeyValue> {
         // Room for the 4-byte key length and 4-byte value length. `saturating_add`
         // to match the arithmetic below rather than for a reachable overflow --
@@ -237,6 +239,24 @@ impl DataBlock {
         }
 
         let kv = KeyValue::parse(&self.data, offset);
+
+        // Each length on its own, before any arithmetic on them. Both are big-endian
+        // `i32` read `as usize`, so a negative one (`FF FF FF FF`) is near
+        // `usize::MAX`; summing it into `record_size()` wrapped back to a small size
+        // in a release build, passed the bound below, and the iterator walked on
+        // emitting records read out of the corrupt one's bytes. `record_size()` now
+        // saturates as well, but a length larger than the block is corrupt on its
+        // own, and saying so here names the field rather than the sum.
+        if kv.key_length() > self.content_end || kv.value_length() > self.content_end {
+            return Err(HFileError::InvalidFormat(format!(
+                "corrupt HFile data block: the record at offset {offset} declares key={} \
+                 value={} bytes, and neither can exceed the block content end {} (a negative \
+                 4-byte length reads as a length past any block)",
+                kv.key_length(),
+                kv.value_length(),
+                self.content_end,
+            )));
+        }
 
         // `KeyValue::parse` clamps a record that overruns the block to the block
         // end rather than failing, so without this an overrun surfaces as a
@@ -661,6 +681,67 @@ mod tests {
         assert!(
             results[0].is_err(),
             "the only item must be the truncation error"
+        );
+    }
+
+    /// A record whose 4-byte key length is `FF FF FF FF`, followed by a
+    /// well-formed record so the corrupt one is not at the end of the block.
+    ///
+    /// Both lengths are big-endian `i32`, so `FF FF FF FF` is `-1`, which
+    /// `as usize` turns into `usize::MAX`. `record_size()` then wrapped to 8 in a
+    /// release build, the bound on `offset + record_size()` passed, and the
+    /// iterator walked on in 8-byte steps emitting garbage records as `Ok`. In a
+    /// debug build the same add was an overflow panic.
+    fn block_with_negative_length(key_length: i32, value_length: i32) -> DataBlock {
+        let mut data = Vec::new();
+        data.extend_from_slice(&key_length.to_be_bytes());
+        data.extend_from_slice(&value_length.to_be_bytes());
+        data.extend_from_slice(&one_key_value(b"abc", b"xy"));
+        let content_end = data.len();
+        DataBlock { data, content_end }
+    }
+
+    #[test]
+    fn test_read_key_value_errs_on_a_negative_key_length() {
+        let block = block_with_negative_length(-1, 0);
+
+        let err = block
+            .read_key_value(0)
+            .expect_err("a negative key length must not parse as a record");
+        assert!(
+            matches!(err, HFileError::InvalidFormat(_)),
+            "expected InvalidFormat, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_key_value_errs_on_a_negative_value_length() {
+        let block = block_with_negative_length(3, -1);
+
+        let err = block
+            .read_key_value(0)
+            .expect_err("a negative value length must not parse as a record");
+        assert!(
+            matches!(err, HFileError::InvalidFormat(_)),
+            "expected InvalidFormat, got: {err:?}"
+        );
+    }
+
+    /// Through the iterator: one `Err` and then the end, not a run of `Ok`
+    /// records read out of the corrupt one's bytes.
+    #[test]
+    fn test_data_block_iterator_errs_on_a_negative_key_length() {
+        let block = block_with_negative_length(-1, 0);
+
+        let results: Vec<Result<KeyValue>> = block.iter().collect();
+        assert_eq!(
+            results.len(),
+            1,
+            "a negative length must be reported once, not walked past"
+        );
+        assert!(
+            matches!(results[0], Err(HFileError::InvalidFormat(_))),
+            "the only item must be the corrupt-record error"
         );
     }
 }
