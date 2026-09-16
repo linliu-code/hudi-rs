@@ -87,112 +87,20 @@ pub extern "C" fn hudi_parquet_schema_cache_clear() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use hudi_test::QuickstartTripsTable;
-
-    /// The exports reach the REAL cache, in the right slots, and `clear()`
-    /// actually clears.
-    ///
-    /// Every assertion is against a POPULATED cache with `hits` and `misses` at
-    /// DIFFERENT values. A version of this that only read a cold cache asserted
-    /// `0 == 0` three times: swapping `hits`/`misses` in the marshaller passed,
-    /// and so did making `clear()` a no-op. That is this workspace's recurring
-    /// defect — an assertion that cannot fail — reappearing inside the test
-    /// written to close it.
-    ///
-    /// `clear()` is proven BEHAVIOURALLY, by the next read missing again, not by
-    /// `entries` dropping to zero: moka's `entry_count` is documented as lagging
-    /// recent inserts and invalidations, so an assertion on it is about timing.
-    /// hudi-core's own `clear()` test takes the same shape for the same reason.
-    ///
-    /// EVERY assertion is monotone-safe, because the cache is PROCESS-WIDE and
-    /// four other tests in this binary read parquet concurrently with it. It was
-    /// briefly `#[serial_test::serial]`, which was a fiction: `serial` serialises
-    /// a test only against OTHER `#[serial]` tests, and there are none here — so
-    /// it bought nothing while adding a dev-dependency to `cpp/Cargo.toml`, a file
-    /// the charter assigns to another milestone. Removed.
-    ///
-    /// Monotone-safe means every assertion survives another test moving these
-    /// counters underneath it: `hits` and `misses` only ever INCREASE, so the
-    /// assertions are `>` and `>=` rather than `==`. The one exact assertion this
-    /// test used to make — that a warm read leaves `misses` untouched — was racy
-    /// and is gone.
-    #[test]
-    fn the_c_exports_read_and_clear_the_real_cache() {
-        let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
-
-        // ── cold: a footer is fetched, so `misses` moves ────────────────────
-        hudi_parquet_schema_cache_clear();
-        let base = hudi_parquet_schema_cache_stats();
-        crate::tests::provider_e2e::read_once(&table_path);
-        let cold = hudi_parquet_schema_cache_stats();
-        assert!(
-            cold.misses > base.misses,
-            "a read after clear() must MISS: {} -> {}",
-            base.misses,
-            cold.misses
-        );
-
-        // ── warm: the same file again hits ──────────────────────────────────
-        //
-        // SIX warm reads, not one, for two reasons. One cold plus one warm leaves
-        // hits == misses == 1, and the fixture check below — which exists
-        // precisely to catch that — fired on the first run of this test. And the
-        // swap check further down needs hits to be comfortably LARGER than
-        // misses, not merely different.
-        for _ in 0..6 {
-            crate::tests::provider_e2e::read_once(&table_path);
-        }
-        let warm = hudi_parquet_schema_cache_stats();
-        assert!(
-            warm.hits > cold.hits,
-            "a second read of the same file must HIT: {} -> {}",
-            cold.hits,
-            warm.hits
-        );
-
-        // ── the two views are the same cache, slot for slot ─────────────────
-        //
-        // `hits` and `misses` are now DIFFERENT numbers, which is what makes the
-        // two slots distinguishable — without that, a marshaller that swapped
-        // them would compare equal.
-        // C FIRST, Rust SECOND, and compared with `>=` rather than `==`. Both
-        // counters only increase, so a concurrent read between the two calls can
-        // only make the later (Rust) value larger — which `>=` tolerates and `==`
-        // would fail on. Exact equality here was a latent flake.
-        let c = hudi_parquet_schema_cache_stats();
-        let rust = hudi_dep::storage::parquet_schema_cache_stats();
-        assert!(
-            rust.hits > rust.misses,
-            "fixture check: hits must be comfortably ABOVE misses ({} vs {}), or \
-             the swap check below cannot tell one slot from the other",
-            rust.hits,
-            rust.misses
-        );
-        assert!(
-            rust.hits >= c.hits && rust.misses >= c.misses,
-            "the C view must be the same cache, in the same slots: C \
-             (hits {}, misses {}) vs Rust (hits {}, misses {}). Swapping the two \
-             u64s in the marshaller puts the large hit count into `misses`, which \
-             this comparison cannot absorb",
-            c.hits,
-            c.misses,
-            rust.hits,
-            rust.misses
-        );
-
-        // ── clear() really clears, proven by behaviour rather than by count ──
-        hudi_parquet_schema_cache_clear();
-        let before_third = hudi_parquet_schema_cache_stats();
-        crate::tests::provider_e2e::read_once(&table_path);
-        let third = hudi_parquet_schema_cache_stats();
-        assert!(
-            third.misses > before_third.misses,
-            "after clear() the SAME file must miss again ({} -> {}) — a no-op \
-             clear leaves a remediated file being read against its pre-rewrite \
-             footer, which is the whole reason this export exists",
-            before_third.misses,
-            third.misses
-        );
-    }
+    // The behavioural test for these exports — that they read the REAL cache, in
+    // the right slots, and that `clear()` actually clears — lives in
+    // `cpp/tests/parquet_schema_cache_abi.rs`, not here.
+    //
+    // It cannot live in this binary. The counters are process-global, and six
+    // other tests in the unit-test binary read the same fixture table at the same
+    // URL with the same empty option map, i.e. the same cache key, concurrently.
+    // Asserting an exact delta here is a race; asserting only `>` (which is what
+    // this test used to do to cope) makes the assertion that matters unable to
+    // fail for the right reason — a neighbour's cold read satisfies "clear()
+    // really cleared", so a no-op `clear()` is not deterministically killed.
+    //
+    // Cargo gives each integration-test file its own process, so over there the
+    // statics belong to that file alone and the deltas are exact.
+    // `crates/core/tests/parquet_schema_cache_stats.rs` is isolated for the same
+    // reason.
 }

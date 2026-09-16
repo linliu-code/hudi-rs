@@ -2449,14 +2449,6 @@ pub(crate) mod tests {
                 .expect("build FFI reader")
         }
 
-        /// One full provider-less read of `table_path`, for a test that needs the
-        /// SIDE EFFECTS of a real read rather than its rows — `cache_abi`'s, which
-        /// has to warm the parquet schema cache through the ordinary path rather
-        /// than by reaching into it.
-        pub(crate) fn read_once(table_path: &str) {
-            let _ = reader(table_path, 0).read_record_batch().expect("read");
-        }
-
         /// Baseline: without a provider the file group reads its two rows off
         /// storage and every provider counter is zero. Pins what the two tests
         /// below are measured against, so a change in the fixture cannot make
