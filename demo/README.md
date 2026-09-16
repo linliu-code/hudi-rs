@@ -21,6 +21,16 @@
 
 This directory contains demo applications showcasing Hudi-rs APIs across different programming languages. The demos run on Docker Compose and also serve as integration tests in the CI pipeline (see [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
 
+## Running a demo
+
+```bash
+cd demo
+./ci_run.sh <app-path>   # e.g. ./ci_run.sh datafusion
+```
+
+The script brings the Compose stack up, runs that app inside the runner container, always tears the stack down, and
+exits with the app's status - so a failing app fails the command (and the CI job).
+
 ## Infrastructure
 
 The demo infrastructure is defined in [`compose.yaml`](compose.yaml).

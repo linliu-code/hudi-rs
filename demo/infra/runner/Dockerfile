@@ -25,6 +25,7 @@ ADD https://astral.sh/uv/install.sh /uv-installer.sh
 # and its managed Python outside /root where that user can reach them
 ENV UV_INSTALL_DIR=/usr/local/bin
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+ENV UV_PYTHON_BIN_DIR=/usr/local/bin
 
 RUN sh /uv-installer.sh && rm /uv-installer.sh
 

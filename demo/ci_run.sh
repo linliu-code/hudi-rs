@@ -23,7 +23,7 @@ set -e
 # Always tear down the compose stack to release file locks and avoid cache save issues,
 # then exit with the status of the step that ended the script
 teardown() {
-  status=$?
+  local status=$?
   docker compose down -v || echo 'Warning: Failed to tear down compose stack' >&2
   if [ $status -ne 0 ]; then
     echo "ci_run.sh failed with exit status $status" >&2
@@ -40,25 +40,32 @@ export COMPOSE_DOCKER_CLI_BUILD=1
 export HOST_UID=$(id -u)
 export HOST_GID=$(id -g)
 
+app_path=$1
+if [ -z "$app_path" ]; then
+  echo "Usage: $0 <path_to_app>"
+  exit 1
+fi
+
 docker compose up --build -d
 
 max_attempts=30
 attempt=0
+runner_ready=false
 
-until [ "$(docker inspect -f '{{.State.Status}}' runner)" = "running" ] || [ $attempt -eq $max_attempts ]; do
-  attempt=$(( $attempt + 1 ))
+until [ "$(docker inspect -f '{{.State.Status}}' runner 2>/dev/null)" = "running" ] || [ $attempt -eq $max_attempts ]; do
+  attempt=$(( attempt + 1 ))
   echo "Waiting for container... (attempt $attempt of $max_attempts)"
   sleep 1
 done
 
-if [ $attempt -eq $max_attempts ]; then
-  echo "Container failed to become ready in time"
-  exit 1
+# Track readiness with a flag: inferring it from the counter reports a failure when the
+# container becomes ready on exactly the last attempt
+if [ "$(docker inspect -f '{{.State.Status}}' runner 2>/dev/null)" = "running" ]; then
+  runner_ready=true
 fi
 
-app_path=$1
-if [ -z "$app_path" ]; then
-  echo "Usage: $0 <path_to_app>"
+if [ "$runner_ready" != true ]; then
+  echo "Container failed to become ready in time"
   exit 1
 fi
 
@@ -88,7 +95,7 @@ elif [ "$app_path" = "hudi-file-group-api/cpp" ]; then
   docker compose exec -T runner /bin/bash -c "
     cd /opt/hudi-rs/cpp && ../build-wrapper.sh cargo build --release && \
     cd $app_path_in_container && \
-    mkdir build && cd build && \
+    rm -rf build && mkdir build && cd build && \
     cmake .. && \
     make && \
     ./file_group_api_cpp

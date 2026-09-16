@@ -424,7 +424,8 @@ jobs:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/share/swift /usr/local/lib/node_modules || true
           df -h /
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -444,9 +445,13 @@ jobs:
             .cargo/git
             python/target
             .uv-cache
-          key: integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml', 'demo/infra/runner/Dockerfile') }}
+          # Keyed per matrix leg: the legs build different things now that the apps really
+          # compile, and one shared key means three of the four lose the race to save it
+          # ("Unable to reserve cache with key ..., another job may be creating this cache")
+          # and throw ~35 minutes of compilation away every run.
+          key: integration-${{ runner.os }}-${{ matrix.app-path }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml', 'demo/infra/runner/Dockerfile') }}
           restore-keys: |
-            integration-${{ runner.os }}-
+            integration-${{ runner.os }}-${{ matrix.app-path }}-
       - name: Integration test - ${{ matrix.app-path }}
         run: |
           cd demo
