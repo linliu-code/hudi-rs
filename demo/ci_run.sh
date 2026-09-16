@@ -24,14 +24,13 @@ set -e
 # then exit with the status of the step that ended the script
 teardown() {
   local status=$?
+  trap - EXIT INT TERM
   docker compose down -v || echo 'Warning: Failed to tear down compose stack' >&2
   if [ $status -ne 0 ]; then
     echo "ci_run.sh failed with exit status $status" >&2
   fi
   exit $status
 }
-trap teardown EXIT
-
 # Enable BuildKit for faster, cache-friendly builds
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
@@ -45,6 +44,10 @@ if [ -z "$app_path" ]; then
   echo "Usage: $0 <path_to_app>" >&2
   exit 1
 fi
+
+# Armed only now, after the argument check: this tears the stack down with -v, and before the
+# script has brought one up that stack would be one the developer started by hand
+trap teardown EXIT INT TERM
 
 docker compose up --build -d
 

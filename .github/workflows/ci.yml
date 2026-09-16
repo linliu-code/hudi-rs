@@ -413,6 +413,9 @@ jobs:
         matrix:
           app-path: [ 'datafusion', 'hudi-file-group-api/cpp', 'hudi-table-api/rust' , 'hudi-table-api/python' ]
     runs-on: ubuntu-latest
+    # `compose up` now waits for mc to finish seeding, so a wedged seed blocks rather than letting
+    # the app fail fast. The slowest leg takes ~26 minutes warm and ~45 cold.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       # INTERNAL-FORK addition. Once ci_run.sh stopped swallowing the app's exit status, the apps
@@ -449,14 +452,18 @@ jobs:
             python/target
             .uv-cache
           # Keyed by what the leg actually builds, not by the leg: the three `make setup develop`
-          # legs produce the same target dir (measured: 1162 MB each, identical), while the cpp
+          # legs produce target dirs that measured 1162 MB each and are interchangeable in
+          # practice (the shared CARGO_HOME registry may differ by a few app-specific crates,
+          # so a leg that loses the save race re-downloads those, rather than rebuilding), while the cpp
           # leg builds --release and produces a different one (661 MB). One key for all four made
           # three of them lose the race to save it ("Unable to reserve cache with key ...,
           # another job may be creating this cache"); one key EACH quadrupled what this job holds
           # to 4.1 GB of the repo's 10 GB cache quota, which evicts other jobs' caches. Two
           # content groups keep the useful cache and the footprint at ~1.8 GB.
           # Note: the '**/Cargo.lock' term matches nothing - the root lockfile is gitignored - so
-          # the hash really varies with python/Cargo.toml and the runner Dockerfile.
+          # the hash really varies with python/Cargo.toml and the runner Dockerfile, and a plain
+          # dependency bump does not rotate the key. Deliberate: cargo recompiles what changed
+          # anyway, and a key that rotated often would write a new ~1.2 GB entry each time.
           key: integration-${{ runner.os }}-${{ matrix.app-path == 'hudi-file-group-api/cpp' && 'cpp' || 'rust-python' }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml', 'demo/infra/runner/Dockerfile') }}
           # Group-scoped restore only. A bare `integration-${{ runner.os }}-` fallback looks like a
           # free warm start, but it lets one group restore the other's target dir and then save it
