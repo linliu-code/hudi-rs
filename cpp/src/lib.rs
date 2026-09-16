@@ -627,6 +627,10 @@ pub(crate) fn counting_row_filter_builder(
 /// `pushed_filter` alone and would still be pushed, so the referenced columns pass
 /// through as candidates and each file's footer decides.
 ///
+/// Fails closed when `pushed_filter` is absent too, and for a different reason —
+/// see the body. Briefly: an injected provider applies the CALLER's predicate,
+/// not ours, so "we have no predicate" does not mean "nothing is filtered".
+///
 /// Standalone rather than inline in `new_file_group_reader_with_context` so the
 /// production activation path is reachable from a test — reader-level tests inject
 /// `ReaderContext::repair_risk_columns` by hand and cannot see a regression here.
@@ -635,7 +639,67 @@ pub(crate) fn repair_risk_columns_for(
     table_schema: Option<&arrow_schema::SchemaRef>,
 ) -> Vec<String> {
     let Some(pf) = pushed_filter else {
-        return Vec::new();
+        // NO DECODED PREDICATE — which is not the same as "nothing will be
+        // filtered", and the difference is a correctness one.
+        //
+        // hudi-rs's own read is safe here: `row_filter` and `row_group_selector`
+        // are both built from `pushed_filter`, so with none there is nothing
+        // pushed and the base read returns every row. But an injected provider is
+        // told `can_push_predicate` regardless, and it holds the CALLER's copy of
+        // the predicate — Velox decodes its own filter and applies it whether or
+        // not the substrait blob round-tripped to us. Decode failure is a
+        // tolerated, logged path (`new_file_group_reader_with_context` drops the
+        // filter and relies on Velox's post-scan filter), so this is reached in
+        // normal operation, not only on malformed input.
+        //
+        // Returning an empty set there disarmed the repair gate and handed the
+        // provider an unconditional "safe to push" for a file whose footer may
+        // carry the #18132 mislabel — the provider then filters micros-labelled,
+        // millis-stored values, reads matching rows as 1970 and drops them, and
+        // nothing downstream can restore them. The gate was most confident
+        // exactly where hudi-rs knew least.
+        //
+        // So when the predicate is opaque, fall back to the TABLE: every column
+        // the repair could reinterpret is a candidate, and each file's footer
+        // still decides. That costs a footer comparison on tables that have such
+        // a column AND a predicate we could not read — both conditions, so in
+        // practice rarely — and never costs correctness.
+        return match table_schema {
+            Some(table_schema) => {
+                let every_column: Vec<String> = table_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+                let at_risk = hudi_dep::schema::batch_evolution::repair_risk_columns(
+                    table_schema,
+                    &every_column,
+                );
+                if !at_risk.is_empty() {
+                    log::warn!(
+                        "[ENG-48206] no decoded predicate, so the repair gate cannot \
+                         be scoped to the columns actually filtered; treating every \
+                         repair-eligible column in the table as at risk \
+                         ({at_risk:?}). An injected provider may still be applying \
+                         the caller's own predicate to these."
+                    );
+                }
+                at_risk
+            }
+            None => {
+                // Neither a predicate nor a table schema: there is nothing to
+                // enumerate, so the gate cannot arm. An injected provider is then
+                // told the base read's merge verdict alone. Narrow — it needs the
+                // substrait decode to fail AND `data_schema` to be absent or
+                // unparseable — but it is the one shape this function cannot
+                // screen, and it is better named than discovered.
+                log::warn!(
+                    "[ENG-48206] neither a decoded predicate nor a table schema; \
+                     the #18132 repair gate cannot be armed for this read"
+                );
+                Vec::new()
+            }
+        };
     };
     let referenced = pf.referenced_columns();
     match table_schema {
@@ -1969,6 +2033,56 @@ pub(crate) mod tests {
             .expect("gt is a known function, so it must decode")
     }
 
+    /// An OPAQUE predicate must arm the gate from the table, not disarm it.
+    ///
+    /// Velox decodes and applies its own filter whether or not the substrait blob
+    /// round-trips to us, and an injected provider acts on `can_push_predicate`.
+    /// So "we could not decode a predicate" cannot mean "nothing is filtered" —
+    /// returning an empty set here handed the provider an unconditional
+    /// "safe to push" over a file whose footer may carry the #18132 mislabel.
+    ///
+    /// This replaces `gate_one_is_empty_without_a_pushed_filter`, which asserted
+    /// the opposite on the premise that "no predicate means nothing can be
+    /// misread, whatever the table schema says". That premise holds for hudi-rs's
+    /// OWN read — it pushes nothing without a decoded filter — and fails for the
+    /// injected provider, which was not a consumer when it was written.
+    #[test]
+    fn gate_one_arms_from_the_table_when_the_predicate_is_opaque() {
+        let table_schema = repair_table_schema(&["ts", "created_at"], &["other"]);
+
+        assert_eq!(
+            repair_risk_columns_for(None, Some(&table_schema)),
+            vec!["ts".to_string(), "created_at".to_string()],
+            "with no decoded predicate every repair-eligible column in the table \
+             is a candidate; the per-file footer check still decides"
+        );
+    }
+
+    /// The complement, so the fix above cannot be "arm on everything, always".
+    ///
+    /// A table with no repair-eligible column has nothing for the gate to screen,
+    /// so an opaque predicate costs it nothing — the provider keeps its pushdown.
+    #[test]
+    fn an_opaque_predicate_over_a_table_with_no_risky_column_stays_disarmed() {
+        let table_schema = repair_table_schema(&[], &["other", "id"]);
+
+        assert!(
+            repair_risk_columns_for(None, Some(&table_schema)).is_empty(),
+            "no column here can carry the mislabel, so there is nothing to withdraw \
+             pushdown for"
+        );
+    }
+
+    /// Both absent: the one shape this function cannot screen, pinned so it is a
+    /// recorded limit rather than an assumption.
+    #[test]
+    fn with_neither_a_predicate_nor_a_table_schema_the_gate_cannot_arm() {
+        assert!(
+            repair_risk_columns_for(None, None).is_empty(),
+            "nothing to enumerate; the warning logged here is the only signal"
+        );
+    }
+
     #[test]
     fn gate_one_arms_on_a_tz_aware_millis_predicate_column() {
         // `pushdown_gt_filter_bytes` references field 0 only, so this is `ts > 100`.
@@ -2031,16 +2145,6 @@ pub(crate) mod tests {
             vec!["ts".to_string()],
             "no table schema means no pre-screen, so every referenced column is a candidate"
         );
-    }
-
-    #[test]
-    fn gate_one_is_empty_without_a_pushed_filter() {
-        let table_schema = repair_table_schema(&["ts"], &[]);
-        assert!(
-            repair_risk_columns_for(None, Some(&table_schema)).is_empty(),
-            "no predicate means nothing can be misread, whatever the table schema says"
-        );
-        assert!(repair_risk_columns_for(None, None).is_empty());
     }
 
     #[test]
@@ -2447,6 +2551,47 @@ pub(crate) mod tests {
         fn reader(table_path: &str, handle: u64) -> Box<HoodieFileGroupReader> {
             new_file_group_reader_with_context(base_only_context(table_path, handle))
                 .expect("build FFI reader")
+        }
+
+        /// A REFUSED `read_record_batch` must leave the set-once stats cell
+        /// unclaimed.
+        ///
+        /// The tokio re-entry guard sits above the reader build and above the
+        /// stats claim deliberately: a call that is going to be refused should do
+        /// nothing on the way to refusing it. Moving the guard back below them
+        /// passes the entire `hudi-cpp` suite, so the ordering was justified in a
+        /// comment and pinned by nothing.
+        ///
+        /// It matters because the cell is `OnceLock` — written exactly once. If a
+        /// refused call claims it, every later successful call on the same reader
+        /// writes its counters into a slot bound to a read that never happened,
+        /// and `OnceLock` gives no way to take it back.
+        #[tokio::test]
+        async fn a_refused_read_record_batch_leaves_the_stats_cell_unclaimed() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let reader = reader(&table_path, 0);
+
+            assert!(
+                reader.base_file_provider_stats.get().is_none(),
+                "fixture check: the cell must start unclaimed"
+            );
+
+            // Inside `#[tokio::test]`, so this is the re-entrant case the guard
+            // exists to refuse.
+            let err = reader
+                .read_record_batch()
+                .expect_err("a re-entrant call must be refused, not panic across FFI");
+            assert!(
+                err.contains("must not be called from within a tokio runtime"),
+                "unexpected error text: {err}"
+            );
+
+            assert!(
+                reader.base_file_provider_stats.get().is_none(),
+                "a refused call must not claim the set-once cell — once claimed it \
+                 cannot be reclaimed, and every later read would report into a slot \
+                 bound to a read that never happened"
+            );
         }
 
         /// Baseline: without a provider the file group reads its two rows off

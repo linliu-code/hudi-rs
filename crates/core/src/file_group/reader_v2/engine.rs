@@ -465,7 +465,9 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// nullability and schema/field metadata: a provider that widens a non-null
 /// column to nullable, or that carries extra key-value metadata through its own
 /// transport, is still serving the right data, and declining it would cost a
-/// re-read for nothing.
+/// re-read for nothing. A name, a position, a type or a count is the shape the
+/// read is about to interpret the buffers as, so any of those differing means
+/// the batches are not what was asked for.
 ///
 /// That exemption is TOP-LEVEL ONLY, and the asymmetry is worth stating because
 /// the code reads as though it were uniform. Only `name()` and `data_type()` are
@@ -480,9 +482,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// included) and loosening it would mean walking every nested `DataType` arm to
 /// rebuild it with children normalised, which is a real behaviour change on a
 /// path whose whole job is to refuse anything it cannot vouch for. Pinned by
-/// `the_shape_checks_nullability_exemption_is_top_level_only`. A name, a position, a type or a count is the shape the
-/// read is about to interpret the buffers as, so any of those differing means
-/// the batches are not what was asked for.
+/// `the_shape_checks_nullability_exemption_is_top_level_only`.
 ///
 /// Types are compared EXACTLY, dictionary encoding included: `Dictionary(Int32,
 /// Utf8)` where `Utf8` was requested is a different physical layout, and the
@@ -1506,9 +1506,15 @@ impl HoodieFileGroupReader {
         // inside a stream the caller did not write (ISSUES OI-22).
         //
         // Decline the provider instead. Falling back to the object-store read is
-        // the same degradation an unimportable stream or a wrong schema gets, it
-        // produces the right answer, and it is counted, so the lost benefit is
-        // visible rather than mysterious. Checked HERE rather than in
+        // the same degradation an unimportable stream or a wrong schema gets and
+        // produces the right answer — but note it is NOT counted: this check
+        // short-circuits the whole provider block, so `record_provider_stats`
+        // never runs and every counter stays zero, which is indistinguishable
+        // from "no provider was injected". The `warn!` below is the only signal,
+        // and `off_a_tokio_runtime_the_provider_is_declined_rather_than_panicking`
+        // pins that (0, 0). Deliberate: a `storage_fallbacks` bump here would
+        // read as "the provider declined this file" when in fact the provider was
+        // never asked. Checked HERE rather than in
         // `served_batch_stream` because by then the provider has already done the
         // work of serving the file.
         //
@@ -2868,6 +2874,69 @@ mod tests {
             0,
             "a merge-gate refusal is not a repair withdrawal, and the counters \
              exist to tell them apart"
+        );
+    }
+
+    /// A merge-gate refusal must not ALSO arm the repair gate.
+    ///
+    /// `repair_gate_is_armed` is `pushdown_is_safe && !repair_risk_columns
+    /// .is_empty()`. Dropping the first conjunct survived the whole suite,
+    /// because every fixture that refuses on the merge gate leaves
+    /// `repair_risk_columns` empty — so the second conjunct was doing all the
+    /// work and the first was pinned by nothing.
+    ///
+    /// This fixture arms BOTH: a merging split with a non-PK predicate (the merge
+    /// gate refuses) over a file that genuinely carries the #18132 mislabel (so
+    /// the repair gate would find a real conflict if it were armed). With the
+    /// conjunct the gate stays disarmed and `pushdown_suppressed_by_repair` stays
+    /// zero; without it the gate fires, finds the conflict, and attributes a
+    /// merge-gate refusal to the repair — which is exactly the mis-keying the
+    /// two counters exist to keep apart.
+    #[tokio::test]
+    async fn a_merge_gate_refusal_does_not_also_arm_the_repair_gate() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        // THE LIE: micros declared, millis stored.
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            straddling_table_schema(),
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        reader.schema_handler.table_schema = Some(straddling_table_schema());
+        // A log file on the split with a non-PK predicate: the MERGE gate refuses
+        // before the repair gate is ever consulted.
+        reader.input_split = InputSplit::new(
+            Some(base_name.to_string()),
+            Some("20240101120000000".to_string()),
+            vec![".f1-0_20240101130000000.log.1_0-1-1".to_string()],
+            String::new(),
+        );
+
+        let volume = reader.storage.read_volume();
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            invocations.load(Relaxed),
+            0,
+            "fixture check: the merge gate must have refused the pushdown, or this \
+             test is not exercising the conjunct at all"
+        );
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            0,
+            "a merge-gate refusal is not a repair withdrawal — the repair gate must \
+             not arm once pushdown is already gone"
         );
     }
 

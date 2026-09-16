@@ -225,13 +225,26 @@ impl PushedFilter {
     /// that column. That would be the unsafe direction if anything downstream still
     /// pushed the predicate.
     ///
-    /// Nothing does. `build_row_filter` refuses the same unresolvable plan outright,
-    /// so no filter is installed and there is nothing for a disarmed guard to
-    /// misread. That is the compensating control — NOT
-    /// `references_only_primary_keys`, which an earlier version of this comment
-    /// named: `base_read_pushdown_is_safe()` short-circuits to `true` on any split
-    /// with no log files, so the primary-key gate never runs on a CoW or base-only
-    /// slice, which is precisely where a disarmed guard would over-drop.
+    /// There are THREE consumers of that decision, and each is covered differently:
+    ///
+    /// * the row filter — `build_row_filter` refuses the same unresolvable plan
+    ///   outright, so no filter is installed and there is nothing for a disarmed
+    ///   guard to misread. This is the compensating control, and NOT
+    ///   `references_only_primary_keys`, which an earlier version of this comment
+    ///   named: `base_read_pushdown_is_safe()` short-circuits to `true` on any
+    ///   split with no log files, so the primary-key gate never runs on a CoW or
+    ///   base-only slice, which is precisely where a disarmed guard would
+    ///   over-drop.
+    /// * the row-group selector — built directly from `pushed_filter`, NOT through
+    ///   `build_row_filter`, so the control above does not reach it. It is safe
+    ///   only incidentally: `comparison_can_match` never prunes a `Timestamp`
+    ///   column, so a mislabelled one cannot cost row groups. That is a property
+    ///   of the pruning code, not of this function, and it is worth naming because
+    ///   it is the kind of thing a later optimisation quietly removes.
+    /// * the injected provider — applies the CALLER's predicate, not ours, so
+    ///   neither control above touches it. Covered instead in
+    ///   `repair_risk_columns_for`: when the predicate is opaque to us the risk set
+    ///   is taken from the table schema rather than left empty.
     pub fn referenced_columns(&self) -> Vec<String> {
         self.referenced_field_indices()
             .into_iter()
