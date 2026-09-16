@@ -1373,16 +1373,47 @@ impl HoodieFileGroupReader {
         // absent from the projection is still decoded and still misread, because a
         // `RowFilter` builder derives its own `ProjectionMask` from the parquet
         // schema rather than from `intersection`.
-        let repair_conflict = self.repair_conflict_from(
-            &file_schema,
-            Some(
-                self.schema_handler
-                    .table_schema
-                    .as_ref()
-                    .unwrap_or(&required_schema),
-            ),
-            pushdown_is_safe,
-        )?;
+        //
+        // With no table schema, `required_schema` may stand in — but ONLY when it
+        // carries every repair-risk column.
+        //
+        // It used to stand in unconditionally, which silently inverted the rule the
+        // paragraph above states. `reinterpreted_columns` skips any candidate missing
+        // from either side, so a risk column pruned out of the projection produced an
+        // EMPTY conflict — the gate answering "nothing to repair" about a file it had
+        // simply not been shown the column of, and the row filter surviving on exactly
+        // the mislabelled file it exists to disarm.
+        //
+        // Withdrawing whenever the table schema is absent would close that, and is
+        // what an earlier cut of this did, but it is too blunt: `cpp/` leaves
+        // `table_schema` unset whenever `data_schema` is absent or unparseable, so
+        // every such read would lose pushdown and full-scan even on an honestly
+        // labelled file. The coverage test is the precise line — when the projection
+        // carries all the risk columns it IS a sound table side for the only
+        // comparison the gate makes, and when it does not, there is no answer and the
+        // fail-safe arm is correct.
+        //
+        // Pinned in both directions by
+        // `an_out_of_projection_filter_column_withdraws_pushdown_with_no_table_schema`
+        // (missing risk column, must withdraw) and
+        // `base_read_keeps_pushdown_when_the_file_is_honestly_labelled` (covered risk
+        // column, must keep).
+        let table_side = match self.schema_handler.table_schema.as_deref() {
+            Some(table) => Some(table),
+            None => {
+                let mut covers_every_risk_column = true;
+                for col in &self.reader_context.repair_risk_columns {
+                    if crate::schema::batch_evolution::index_of_ci(&required_schema, col)?.is_none()
+                    {
+                        covers_every_risk_column = false;
+                        break;
+                    }
+                }
+                covers_every_risk_column.then(|| required_schema.as_ref())
+            }
+        };
+        let repair_conflict =
+            self.repair_conflict_from(&file_schema, table_side, pushdown_is_safe)?;
 
         // ONE verdict, THREE consumers — but reaching them by two mechanisms, and
         // the difference matters to anyone editing this.
@@ -1677,12 +1708,20 @@ impl HoodieFileGroupReader {
     /// The columns of THIS file whose declared type the apache/hudi#18132 repair
     /// reinterprets on read — the per-file half of the gate.
     ///
-    /// `table_side` is `None` only when the read has no table schema AND no
-    /// required schema to fall back on, which is reachable on the unprojected
-    /// path. The question then cannot be answered, and the only safe answer is
-    /// "assume every candidate reinterprets": withdrawing pushdown costs a
-    /// full scan, keeping it costs rows that match and cannot be recovered by the
-    /// post-merge filter.
+    /// `table_side` is `None` when the read has no table schema AND nothing sound
+    /// to substitute. `required_schema` is only a legal substitute when it carries
+    /// every `repair_risk_column`: it is the PROJECTION, so a risk column pruned
+    /// out of it is absent from the table side while still being decoded and still
+    /// being misread, and `reinterpreted_columns` skips any candidate absent from
+    /// either schema — substituting it blindly answers "no conflict" for the one
+    /// shape the gate exists to catch. The caller does that coverage test; by the
+    /// time it reaches here, a `Some` is a table side sound for every column this
+    /// function will look up.
+    ///
+    /// With no table side the question cannot be answered, and the only safe
+    /// answer is "assume every candidate reinterprets": withdrawing pushdown
+    /// costs a full scan, keeping it costs rows that match and cannot be
+    /// recovered by the post-merge filter.
     fn repair_conflict_from(
         &self,
         file_schema: &arrow_schema::Schema,
@@ -4032,6 +4071,75 @@ mod tests {
              projection is still decoded and still misread"
         );
         assert_eq!(out.num_rows(), 2);
+    }
+
+    /// The two conditions the tests above hold apart, crossed: a MISLABELLED file,
+    /// a filter column pruned out of the projection, AND no table schema.
+    ///
+    /// `base_read_declines_pushdown_for_an_unprojected_predicate_column` supplies a
+    /// table schema, and `with_no_table_schema_the_unprojected_path_withdraws_pushdown_anyway`
+    /// drops the table schema but keeps `ts` inside the schema it passes as
+    /// `required`. Neither reaches the shape where the projected path has no table
+    /// side AND the risk column is outside the projection — which is exactly the
+    /// shape `cpp/` produces whenever `fgrc.data_schema` is absent or fails to
+    /// parse while `requested_schema` still does, since `repair_risk_columns` is
+    /// computed fail-closed from the predicate and arrives populated anyway.
+    ///
+    /// Falling back to `required_schema` for the table side answers "no conflict"
+    /// here — `reinterpreted_columns` skips `ts` because it is missing from that
+    /// side — so the `RowFilter` is pushed against micros-labelled millis, sees
+    /// 1970, and drops `k1`. The read returns 1 row and reports success.
+    #[tokio::test]
+    async fn an_out_of_projection_filter_column_withdraws_pushdown_with_no_table_schema() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        // THE LIE: micros declared, millis stored.
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        // Projection keeps only the key; `ts` is filtered on but never returned.
+        let required: SchemaRef =
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "_hoodie_record_key",
+                arrow_schema::DataType::Utf8,
+                true,
+            )]));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            required,
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        // The crossing condition: no table side at all on the PROJECTED path.
+        reader.schema_handler.table_schema = None;
+
+        let volume = reader.storage.read_volume();
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            1,
+            "with no table side the projected path must withdraw, not fall back to \
+             the projection and conclude there is nothing to repair"
+        );
+        assert_eq!(
+            invocations.load(Relaxed),
+            0,
+            "the filter must not have been pushed against a mislabelled column"
+        );
+        assert_eq!(
+            out.num_rows(),
+            2,
+            "both rows survive; pushing here would have dropped the ABOVE_MS row"
+        );
     }
 
     /// A withdrawal takes the row-group selector with it, and is counted on both
