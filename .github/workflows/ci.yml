@@ -419,13 +419,16 @@ jobs:
       # really built, and a debug build of hudi (datafusion, lance, rocksdb) inside the runner
       # container, plus the demo app's own target dir, ran the host out of disk: `No space left on
       # device` compiling hudi-python, and on the datafusion leg a runner killed with no step logs
-      # (run 35031780895). Same reclaim as the cpp-ffi and python-tests jobs; df is printed before
-      # and after so the next failure here names what was available.
+      # (run 35031780895). A superset of the cpp-ffi and python-tests reclaim - those two do not
+      # build inside a container on top of a restored target dir - and the npm shims go with
+      # node_modules, so a later step gets "not installed" rather than a dangling symlink. df is
+      # printed before and after so the next failure here names what was available.
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
-                      /usr/share/swift /usr/local/lib/node_modules || true
+                      /usr/share/swift /usr/local/lib/node_modules \
+                      /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack || true
           df -h /
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -445,13 +448,19 @@ jobs:
             .cargo/git
             python/target
             .uv-cache
-          # Keyed per matrix leg: the legs build different things now that the apps really
-          # compile, and one shared key means three of the four lose the race to save it
-          # ("Unable to reserve cache with key ..., another job may be creating this cache")
-          # and throw ~35 minutes of compilation away every run.
-          key: integration-${{ runner.os }}-${{ matrix.app-path }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml', 'demo/infra/runner/Dockerfile') }}
+          # Keyed by what the leg actually builds, not by the leg: the three `make setup develop`
+          # legs produce the same target dir (measured: 1162 MB each, identical), while the cpp
+          # leg builds --release and produces a different one (661 MB). One key for all four made
+          # three of them lose the race to save it ("Unable to reserve cache with key ...,
+          # another job may be creating this cache"); one key EACH quadrupled what this job holds
+          # to 4.1 GB of the repo's 10 GB cache quota, which evicts other jobs' caches. Two
+          # content groups keep the useful cache and the footprint at ~1.8 GB.
+          # Note: the '**/Cargo.lock' term matches nothing - the root lockfile is gitignored - so
+          # the hash really varies with python/Cargo.toml and the runner Dockerfile.
+          key: integration-${{ runner.os }}-${{ matrix.app-path == 'hudi-file-group-api/cpp' && 'cpp' || 'rust-python' }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml', 'demo/infra/runner/Dockerfile') }}
           restore-keys: |
-            integration-${{ runner.os }}-${{ matrix.app-path }}-
+            integration-${{ runner.os }}-${{ matrix.app-path == 'hudi-file-group-api/cpp' && 'cpp' || 'rust-python' }}-
+            integration-${{ runner.os }}-
       - name: Integration test - ${{ matrix.app-path }}
         run: |
           cd demo

@@ -42,7 +42,7 @@ export HOST_GID=$(id -g)
 
 app_path=$1
 if [ -z "$app_path" ]; then
-  echo "Usage: $0 <path_to_app>"
+  echo "Usage: $0 <path_to_app>" >&2
   exit 1
 fi
 
@@ -50,7 +50,6 @@ docker compose up --build -d
 
 max_attempts=30
 attempt=0
-runner_ready=false
 
 until [ "$(docker inspect -f '{{.State.Status}}' runner 2>/dev/null)" = "running" ] || [ $attempt -eq $max_attempts ]; do
   attempt=$(( attempt + 1 ))
@@ -58,14 +57,11 @@ until [ "$(docker inspect -f '{{.State.Status}}' runner 2>/dev/null)" = "running
   sleep 1
 done
 
-# Track readiness with a flag: inferring it from the counter reports a failure when the
-# container becomes ready on exactly the last attempt
-if [ "$(docker inspect -f '{{.State.Status}}' runner 2>/dev/null)" = "running" ]; then
-  runner_ready=true
-fi
-
-if [ "$runner_ready" != true ]; then
-  echo "Container failed to become ready in time"
+# Re-read the state rather than inferring it from the counter, which reported a failure when the
+# container became ready on exactly the last attempt, and report what was actually observed
+runner_state=$(docker inspect -f '{{.State.Status}}' runner 2>/dev/null || echo "absent")
+if [ "$runner_state" != "running" ]; then
+  echo "Runner container is not running after $attempt attempts (state: $runner_state)" >&2
   exit 1
 fi
 
@@ -101,6 +97,6 @@ elif [ "$app_path" = "hudi-file-group-api/cpp" ]; then
     ./file_group_api_cpp
     "
 else
-  echo "Unknown app path: $app_path"
+  echo "Unknown app path: $app_path" >&2
   exit 1
 fi
