@@ -458,9 +458,11 @@ jobs:
           # Note: the '**/Cargo.lock' term matches nothing - the root lockfile is gitignored - so
           # the hash really varies with python/Cargo.toml and the runner Dockerfile.
           key: integration-${{ runner.os }}-${{ matrix.app-path == 'hudi-file-group-api/cpp' && 'cpp' || 'rust-python' }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml', 'demo/infra/runner/Dockerfile') }}
+          # Group-scoped restore only. A bare `integration-${{ runner.os }}-` fallback looks like a
+          # free warm start, but it lets one group restore the other's target dir and then save it
+          # back merged - measured: the cpp cache went from 661 MB to 1639 MB that way.
           restore-keys: |
             integration-${{ runner.os }}-${{ matrix.app-path == 'hudi-file-group-api/cpp' && 'cpp' || 'rust-python' }}-
-            integration-${{ runner.os }}-
       - name: Integration test - ${{ matrix.app-path }}
         run: |
           cd demo
