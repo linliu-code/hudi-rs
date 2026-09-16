@@ -465,7 +465,22 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// nullability and schema/field metadata: a provider that widens a non-null
 /// column to nullable, or that carries extra key-value metadata through its own
 /// transport, is still serving the right data, and declining it would cost a
-/// re-read for nothing. A name, a position, a type or a count is the shape the
+/// re-read for nothing.
+///
+/// That exemption is TOP-LEVEL ONLY, and the asymmetry is worth stating because
+/// the code reads as though it were uniform. Only `name()` and `data_type()` are
+/// compared here, so a top-level `nullable` or metadata difference cannot reach
+/// the comparison at all. Inside a nested type it can: `DataType`'s own
+/// `PartialEq` compares the child `Field`s, and `Field::eq` includes `nullable`
+/// and `metadata`. So a `Struct` whose child differs only in nullability IS
+/// declined, while the same difference on a flat column is served.
+///
+/// Left as it stands rather than normalised recursively: the strictness is
+/// harmless (a conforming provider echoes the schema it was handed, children
+/// included) and loosening it would mean walking every nested `DataType` arm to
+/// rebuild it with children normalised, which is a real behaviour change on a
+/// path whose whole job is to refuse anything it cannot vouch for. Pinned by
+/// `the_shape_checks_nullability_exemption_is_top_level_only`. A name, a position, a type or a count is the shape the
 /// read is about to interpret the buffers as, so any of those differing means
 /// the batches are not what was asked for.
 ///
@@ -5611,8 +5626,36 @@ mod tests {
         )
         .unwrap();
 
+        // ACCEPTED: metadata on the SCHEMA itself rather than on a field. The doc
+        // says "schema/field metadata", but every fixture here varied only the
+        // FIELD half — so bolting a `served.metadata() != wanted.metadata()` check
+        // onto the comparator passed this test, and the whole workspace with it.
+        let schema_level_metadata = RecordBatch::try_new(
+            Arc::new(
+                Schema::new(vec![
+                    Field::new("id", DataType::Int32, false),
+                    Field::new("tag", DataType::Utf8, true),
+                ])
+                .with_metadata(
+                    [("provider".to_string(), "irrelevant".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            ),
+            vec![
+                Arc::new(Int32Array::from(vec![7, 8])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .unwrap();
+
         for (case, served, expect_served) in [
             ("widened nullability + extra metadata", widened, true),
+            (
+                "metadata on the schema itself, not on a field",
+                schema_level_metadata,
+                true,
+            ),
             (
                 "dictionary-encoded where plain was asked for",
                 dictionary_encoded,
@@ -5657,6 +5700,92 @@ mod tests {
                 assert_eq!((s.files_served, s.storage_fallbacks), (0, 1), "{case}");
             }
         }
+    }
+
+    /// The nullability exemption is TOP-LEVEL ONLY — pinned, not fixed.
+    ///
+    /// `served_schema_mismatch` compares `got.data_type() != want.data_type()`.
+    /// On a flat column that cannot see `nullable` at all, which is what makes the
+    /// documented exemption true. On a nested one it delegates to `DataType`'s
+    /// `PartialEq`, which compares the child `Field`s — and `Field::eq` includes
+    /// `nullable` and `metadata`. So the exact difference the test above proves is
+    /// IGNORED on `id` is ENFORCED one level down inside a `Struct`.
+    ///
+    /// No fixture in this file used a nested column, so nothing expressed that
+    /// asymmetry and the doc read as though the exemption were uniform. This pins
+    /// the behaviour the code actually has; the doc now says the same thing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_shape_checks_nullability_exemption_is_top_level_only() {
+        use arrow_array::{ArrayRef, Int32Array, StructArray};
+        use arrow_schema::{DataType, Field, Fields, Schema};
+
+        let child_non_null = Arc::new(Field::new("inner", DataType::Int32, false));
+        let child_nullable = Arc::new(Field::new("inner", DataType::Int32, true));
+
+        let on_disk_fields = Fields::from(vec![child_non_null.clone()]);
+        let on_disk_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(on_disk_fields.clone()),
+            true,
+        )]));
+        let on_disk = RecordBatch::try_new(
+            on_disk_schema.clone(),
+            vec![Arc::new(StructArray::new(
+                on_disk_fields,
+                vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+                None,
+            ))],
+        )
+        .unwrap();
+
+        // The CHILD widened to nullable — the same widening the flat `id` column
+        // is served for two tests above.
+        let served_fields = Fields::from(vec![child_nullable.clone()]);
+        let served = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                DataType::Struct(served_fields.clone()),
+                true,
+            )])),
+            vec![Arc::new(StructArray::new(
+                served_fields,
+                vec![Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef],
+                None,
+            ))],
+        )
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::serving(vec![served]);
+        let mut reader = reader_with_provider(
+            tmp.path(),
+            base_name,
+            on_disk_schema.clone(),
+            provider.clone(),
+        )
+        .await;
+        let live = reader.base_file_provider_live_stats();
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert!(
+            provider.seen().is_some(),
+            "fixture check — the provider must have been offered the file"
+        );
+        assert_eq!(
+            out.num_rows(),
+            2,
+            "the file's two rows must reach the caller either way"
+        );
+        let s = live.lock().unwrap();
+        assert_eq!(
+            (s.files_served, s.storage_fallbacks),
+            (0, 1),
+            "a child-only nullability widening IS declined: the exemption the doc              promises is top-level only, because `Field::eq` inside a nested              `DataType` compares `nullable`"
+        );
     }
 
     /// The control for the test above: the SAME fixture, with the schema the

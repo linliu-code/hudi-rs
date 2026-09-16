@@ -45,6 +45,17 @@ pub struct HudiParquetSchemaCacheStats {
     /// Cold reads that fetched a footer. Monotonic since process start.
     pub misses: u64,
     /// Entries currently held.
+    ///
+    /// **Deliberately unpinned by the mutation ledger, unlike `hits` and
+    /// `misses`.** moka's `entry_count` is documented as lagging recent inserts
+    /// and invalidations, so any assertion on this field is an assertion about
+    /// when the cache's internal bookkeeping catches up rather than about the
+    /// marshalling below. `hits`/`misses` are monotonic counters and carry the
+    /// same "is this the same cache, in the same slots" proof without that
+    /// timing dependence, which is why they are the ones pinned. Swapping this
+    /// field with either of them would therefore not be caught here — it is
+    /// caught by `hits`/`misses` disagreeing, since all three are distinct
+    /// numbers in the test's populated-cache state.
     pub entries: u64,
 }
 /// Read the parquet schema cache counters, for an embedder to export through its
