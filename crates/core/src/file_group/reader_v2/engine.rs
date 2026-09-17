@@ -3253,6 +3253,65 @@ mod tests {
         );
     }
 
+    /// A file the INSTANT RANGE excludes is not a withdrawal either.
+    ///
+    /// The withdrawal sits below `base_file_in_range` for the same reason the
+    /// provider offer does — `base_file_provider_is_not_offered_a_file_outside_the_instant_range`
+    /// settles that half. An excluded file contributes no rows to anything, so it
+    /// had no pushdown to lose, and counting it made the counter climb once per
+    /// excluded file on an incremental query over a legacy tz-millis table: the
+    /// reads where the repair gate cost precisely nothing are the reads where it
+    /// would have looked most expensive.
+    ///
+    /// Without this test the ordering is free: moving the withdrawal back above
+    /// the range gate passes all 1697 tests.
+    #[tokio::test]
+    async fn a_file_outside_the_instant_range_is_not_counted_as_a_withdrawal() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // The base file's own commit instant is "001" (…_001.parquet).
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        let mut reader =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, straddling_table_schema())
+                .await;
+        reader.schema_handler.table_schema = Some(straddling_table_schema());
+        let provider = StubDataProvider::not_serving();
+        reader.base_file_provider = Some(provider.clone());
+        {
+            let ctx = Arc::get_mut(&mut reader.reader_context).expect("sole owner in this test");
+            // Armed: this file really does carry the mislabel, so the gate finds a
+            // conflict — the withdrawal path is reached, not skipped.
+            ctx.repair_risk_columns = vec!["ts".to_string()];
+            // ...but the range EXCLUDES instant "001": open start "100" > "001".
+            ctx.instant_range = Some(InstantRange::within_open_closed("100", "999", "UTC"));
+        }
+
+        let volume = reader.storage.read_volume();
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            out.num_rows(),
+            0,
+            "fixture check: the range must actually exclude this file, or there is \
+             a real read here and the assertion below proves nothing"
+        );
+        assert!(
+            provider.seen().is_none(),
+            "fixture check: an excluded file is never offered, so the provider had \
+             no verdict to narrow"
+        );
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            0,
+            "a file the range drops whole had no pushdown to withdraw — counting \
+             it reports the repair gate costing pushdown on exactly the reads \
+             where it cost nothing"
+        );
+    }
+
     /// A merge-gate refusal must not ALSO arm the repair gate.
     ///
     /// `repair_gate_is_armed` is `pushdown_is_safe && !repair_risk_columns
