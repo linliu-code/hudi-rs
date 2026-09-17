@@ -1377,9 +1377,13 @@ impl HoodieFileGroupReader {
                     self.schema_handler.table_schema.as_deref(),
                     pushdown_is_safe,
                 )?;
+                // `false`: this branch reads and returns below without ever
+                // reaching the provider block, so an injected provider is not
+                // offered this file and has no pushdown here to lose.
                 self.withdraw_pushdown_for_repair(
                     &path,
                     &repair_conflict,
+                    false,
                     &mut row_filter,
                     &mut row_group_selector,
                 );
@@ -1578,12 +1582,6 @@ impl HoodieFileGroupReader {
         // the branch, is what the provider request reads: it is the same
         // narrowing internal `reader/mod.rs` applies, expressed for this tree.
         let pushdown_is_safe = pushdown_is_safe && repair_conflict.is_empty();
-        self.withdraw_pushdown_for_repair(
-            &path,
-            &repair_conflict,
-            &mut row_filter,
-            &mut row_group_selector,
-        );
 
         let base_read_schema: SchemaRef = if use_position {
             let mut fields: Vec<arrow_schema::FieldRef> =
@@ -1604,6 +1602,27 @@ impl HoodieFileGroupReader {
         if !self.base_file_in_range()? {
             return Ok(BaseSource::empty(base_read_schema));
         }
+
+        // Withdrawn HERE, below the instant-range gate rather than beside the
+        // footer read that produced `repair_conflict`, for the same reason the
+        // provider is offered below it: a file the range excludes contributes no
+        // rows to anything, so nothing of its was pushed and nothing of its is
+        // withdrawn. Above the gate this recorded a withdrawal per excluded file.
+        //
+        // `row_filter` / `row_group_selector` are read by `base_read_options`
+        // further down, and `pushdown_is_safe` — the provider's copy of the same
+        // decision — was narrowed above, before the request below. So both
+        // consumers still see the conflict; only the accounting moved.
+        let provider_will_be_offered = self.base_file_provider.is_some()
+            && !use_position
+            && Self::provider_can_be_driven_here();
+        self.withdraw_pushdown_for_repair(
+            &path,
+            &repair_conflict,
+            provider_will_be_offered,
+            &mut row_filter,
+            &mut row_group_selector,
+        );
 
         // ── Injected base-file data provider (base file only) ───────────────
         // Offer the base file to an injected provider before the object-store
@@ -1808,6 +1827,19 @@ impl HoodieFileGroupReader {
             .unwrap_or_default()
     }
 
+    /// Is the executor polling us one a served stream could be driven on?
+    ///
+    /// The bare condition behind [`Self::provider_is_usable_here`], without its
+    /// `warn!`. Split out because the repair gate needs the same answer one step
+    /// earlier — to decide whether withdrawing the provider's pushdown is a
+    /// withdrawal that happened — and asking through `provider_is_usable_here`
+    /// there would emit a second decline warning per file for a question, not a
+    /// decision. Two hand-written copies of the check could drift, and a drift
+    /// means the counter describes an offer the reader never makes.
+    fn provider_can_be_driven_here() -> bool {
+        tokio::runtime::Handle::try_current().is_ok()
+    }
+
     /// Can an injected provider actually be used on the executor polling us?
     ///
     /// `served_batch_stream` moves the served reader onto `spawn_blocking`, which
@@ -1821,7 +1853,7 @@ impl HoodieFileGroupReader {
     /// groups off-runtime emits N, which is the right volume for a misconfiguration
     /// that silently costs the provider seam its entire benefit.
     fn provider_is_usable_here(&self, path: &str) -> bool {
-        if tokio::runtime::Handle::try_current().is_ok() {
+        if Self::provider_can_be_driven_here() {
             return true;
         }
         log::warn!(
@@ -1902,22 +1934,13 @@ impl HoodieFileGroupReader {
         &self,
         path: &str,
         repair_conflict: &[String],
+        provider_will_be_offered: bool,
         row_filter: &mut Option<RowFilterBuilder>,
         row_group_selector: &mut Option<RowGroupSelector>,
     ) {
         if repair_conflict.is_empty() {
             return;
         }
-        // Logged before anything is gated: a file that needs the repair is worth
-        // saying so about even on a read that pushed nothing, because the
-        // PROVIDER's verdict is narrowed by this same conflict and that decision
-        // is otherwise invisible.
-        log::debug!(
-            "base file '{path}' needs a value-reinterpreting logical-type repair \
-             on {repair_conflict:?} — skipping parquet RowFilter pushdown and \
-             row-group pruning (post-merge filter still runs)"
-        );
-
         // WAS any pushdown actually withdrawn? Three consumers can have one, and
         // the counter means "a pushdown was withdrawn", not "this table has a
         // mislabel-eligible column".
@@ -1931,11 +1954,32 @@ impl HoodieFileGroupReader {
         // alone made it invisible in both the counter and the log: an operator
         // whose Velox scan lost pushdown on every file of a legacy table saw
         // nothing anywhere.
+        //
+        // But it must be the provider that will actually be OFFERED this file,
+        // not merely one that is injected — the caller decides that (position
+        // merge and an off-runtime executor both skip the provider block
+        // outright), which is why it arrives as an argument rather than being
+        // read off `self` here. `self.base_file_provider.is_some()` over-counts
+        // every read that has a provider it never asks, and the convention this
+        // file already keeps for that case is
+        // `off_a_tokio_runtime_the_provider_is_declined_rather_than_panicking`'s
+        // (0, 0): a provider that was never asked did not fall back, and by the
+        // same token never had a pushdown to lose.
         let withdrew_local = row_filter.is_some() || row_group_selector.is_some();
-        let withdrew_provider = self.base_file_provider.is_some();
-        if !withdrew_local && !withdrew_provider {
+        if !withdrew_local && !provider_will_be_offered {
             return;
         }
+        // Logged only once something was really withdrawn, so the log and the
+        // counter below cannot disagree about what a withdrawal is, and named
+        // per consumer because "skipping RowFilter pushdown" is false on the
+        // provider-only read this branch exists to cover.
+        log::debug!(
+            "base file '{path}' needs a value-reinterpreting logical-type repair \
+             on {repair_conflict:?} — withdrawing its predicate pushdown \
+             (local row filter or row-group pruning: {withdrew_local}, injected \
+             base-file provider: {provider_will_be_offered}); the post-merge \
+             filter still runs, so no row is lost"
+        );
         let volume = self.storage.read_volume();
         // Counted for every withdrawal; `row_group_selector_suppressed` can
         // only speak for a selector the caller actually installed.
@@ -3140,6 +3184,72 @@ mod tests {
             1,
             "the provider's pushdown WAS withdrawn, so it must be counted — this is \
              the only signal an operator has that a legacy table is losing pushdown"
+        );
+    }
+
+    /// A provider that is never OFFERED the file is not a withdrawal either.
+    ///
+    /// The third direction of the same condition, and the one the first cut of it
+    /// got wrong: it asked `self.base_file_provider.is_some()`, which is true on
+    /// every read that HAS a provider — including the reads that never ask it.
+    /// Off a tokio runtime the provider block is short-circuited entirely
+    /// (`provider_is_usable_here`), so nothing is offered, nothing is narrowed,
+    /// and nothing is withdrawn — but the counter moved anyway.
+    ///
+    /// That is the same situation
+    /// `off_a_tokio_runtime_the_provider_is_declined_rather_than_panicking`
+    /// already settles for the provider's own counters, with its `(0, 0)` and its
+    /// "a provider that was never asked did not 'fall back'". This keeps the
+    /// repair counter on that same convention, so an embedder on a non-tokio
+    /// executor does not read a climbing `pushdown_suppressed_by_repair` as the
+    /// repair gate costing it pushdown it never had.
+    ///
+    /// Deliberately NOT `#[tokio::test]` — `futures::executor::block_on` is what
+    /// makes the provider undrivable, and
+    /// `a_provider_only_withdrawal_is_still_counted` is this same fixture on a
+    /// runtime, where the count IS 1.
+    #[test]
+    fn a_provider_that_is_never_offered_the_file_is_not_counted_as_a_withdrawal() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        let provider = StubDataProvider::not_serving();
+        let (rows, suppressed) = futures::executor::block_on(async {
+            let mut reader = test_file_group_reader_for_base_file(
+                tmp.path(),
+                base_name,
+                straddling_table_schema(),
+            )
+            .await;
+            reader.schema_handler.table_schema = Some(straddling_table_schema());
+            Arc::get_mut(&mut reader.reader_context)
+                .expect("sole owner in this test")
+                .repair_risk_columns = vec!["ts".to_string()];
+            reader.base_file_provider = Some(provider.clone());
+
+            let volume = reader.storage.read_volume();
+            let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+            (
+                out.num_rows(),
+                volume.pushdown_suppressed_by_repair.load(Relaxed),
+            )
+        });
+
+        assert!(
+            provider.seen().is_none(),
+            "fixture check: this executor cannot drive a served stream, so the \
+             provider must never be offered the file — if it were, there WOULD be \
+             a verdict to narrow and the count below would be right"
+        );
+        assert_eq!(rows, 2, "every row still reaches the caller");
+        assert_eq!(
+            suppressed, 0,
+            "no consumer had a pushdown on this read: no filter, no selector, and \
+             a provider that was never asked. Counting it reports a cost the read \
+             did not pay"
         );
     }
 

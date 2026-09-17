@@ -1944,6 +1944,17 @@ pub(crate) mod tests {
     /// comparison, so it clears the ENG-42276 selectivity gate and the only
     /// remaining reason to skip is column resolution.
     fn pushdown_gt_filter_bytes(names: &[&str]) -> Vec<u8> {
+        pushdown_gt_filter_bytes_at(0, names)
+    }
+
+    /// `pushdown_gt_filter_bytes`, but with the referenced field INDEX under the
+    /// test's control.
+    ///
+    /// A `field` at or beyond `names.len()` is the wire-format bug
+    /// `repair_risk_columns_for`'s completeness fallback exists for: a plan whose
+    /// expression references a column its own `base_schema.names` does not carry.
+    /// Substrait allows the bytes to say it, so the reader has to answer for it.
+    fn pushdown_gt_filter_bytes_at(field: i32, names: &[&str]) -> Vec<u8> {
         use prost::Message;
         use substrait::proto::{
             Expression, ExtendedExpression, FunctionArgument, NamedStruct,
@@ -1963,10 +1974,7 @@ pub(crate) mod tests {
                     reference_type: Some(field_reference::ReferenceType::DirectReference(
                         ReferenceSegment {
                             reference_type: Some(reference_segment::ReferenceType::StructField(
-                                Box::new(reference_segment::StructField {
-                                    field: 0,
-                                    child: None,
-                                }),
+                                Box::new(reference_segment::StructField { field, child: None }),
                             )),
                         },
                     )),
@@ -2647,6 +2655,45 @@ pub(crate) mod tests {
                 "the gate must be scoped to the REFERENCED column; arming on \
                  `other_ts` too would cost pushdown over a column the predicate \
                  never reads"
+            );
+        }
+
+        /// A predicate whose references do NOT all resolve falls back to the
+        /// TABLE, rather than screening against the truncated name list.
+        ///
+        /// `referenced_columns` resolves substrait field indices through
+        /// `base_schema.names` and silently drops any index that lands past the
+        /// end of it. That list is then SHORT of what the predicate really reads,
+        /// and screening the gate against it under-approximates: here the one
+        /// reference resolves to nothing at all, so a gate keyed on it sees an
+        /// empty reference set, finds no overlap with the table's repair-eligible
+        /// columns, and disarms — on a table where BOTH columns can carry the
+        /// #18132 mislabel and an injected provider is about to apply the caller's
+        /// own copy of that predicate to one of them.
+        ///
+        /// `build_row_filter` refuses this plan outright, so hudi-rs's own read is
+        /// safe either way; the exposure is the provider's, which is exactly what
+        /// the whole-table fallback covers. Deleting the `!referenced_columns_are_complete()`
+        /// branch passes the entire `hudi-cpp` suite without this test.
+        #[test]
+        fn a_predicate_with_an_unresolvable_reference_falls_back_to_the_whole_table() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let mut ctx = base_only_context(&table_path, 0);
+            ctx.data_schema_json = TWO_TZ_MILLIS_AVRO_JSON.to_string();
+            // Field 5 against a two-name base schema: the reference resolves to
+            // nothing, so `referenced_columns()` returns an EMPTY list.
+            ctx.substrait_filter_bytes = super::pushdown_gt_filter_bytes_at(5, &["ts", "other_ts"]);
+
+            let reader = new_file_group_reader_with_context(ctx).expect("build FFI reader");
+
+            let mut armed = reader.reader_context.repair_risk_columns.clone();
+            armed.sort();
+            assert_eq!(
+                armed,
+                vec!["other_ts".to_string(), "ts".to_string()],
+                "an unresolvable reference must widen the gate to every \
+                 repair-eligible column in the table, not narrow it to the empty \
+                 set the truncated name list produces"
             );
         }
 
