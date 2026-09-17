@@ -661,9 +661,15 @@ pub(crate) fn repair_risk_columns_for(
         //
         // So when the predicate is opaque, fall back to the TABLE: every column
         // the repair could reinterpret is a candidate, and each file's footer
-        // still decides. That costs a footer comparison on tables that have such
-        // a column AND a predicate we could not read — both conditions, so in
-        // practice rarely — and never costs correctness.
+        // still decides.
+        //
+        // The cost, stated honestly: on a table with such a column and a predicate
+        // we could not read, every file whose footer DOES mislabel loses the
+        // provider's pushdown — including when the predicate that failed to decode
+        // touched an entirely unrelated column and could never have been misread.
+        // That is the blunt direction, and it is the one to be blunt in: the
+        // alternative is dropping rows that match, silently, with no way to
+        // recover them downstream.
         return match table_schema {
             Some(table_schema) => {
                 let every_column: Vec<String> = table_schema
@@ -676,7 +682,12 @@ pub(crate) fn repair_risk_columns_for(
                     &every_column,
                 );
                 if !at_risk.is_empty() {
-                    log::warn!(
+                    // `debug!`, not `warn!`: this runs once per FILE GROUP, and it
+                    // fires on every predicate-free scan of any table with a
+                    // tz-aware-millis column — a completely benign read. At the
+                    // default `info` filter a 10k-split scan would emit 10k warnings
+                    // for nothing (CLAUDE.md §10: never warn per item).
+                    log::debug!(
                         "[ENG-48206] no decoded predicate, so the repair gate cannot \
                          be scoped to the columns actually filtered; treating every \
                          repair-eligible column in the table as at risk \
@@ -2551,6 +2562,62 @@ pub(crate) mod tests {
         fn reader(table_path: &str, handle: u64) -> Box<HoodieFileGroupReader> {
             new_file_group_reader_with_context(base_only_context(table_path, handle))
                 .expect("build FFI reader")
+        }
+
+        /// A table schema carrying a repair-eligible column, plus `id` so the
+        /// projection still resolves.
+        const TZ_MILLIS_AVRO_JSON: &str = r#"{"type":"record","name":"trip","fields":[{"name":"id","type":["null","int"],"default":null},{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}"#;
+
+        /// The opaque-predicate fallback must be WIRED, not merely implemented.
+        ///
+        /// `repair_risk_columns_for`'s own doc says it is standalone "so the
+        /// production activation path is reachable from a test" — but every test
+        /// of it called the function directly with a hand-built schema, so
+        /// replacing the argument at the call site with `None` reinstated the
+        /// exact gap the fallback closes while both suites stayed green.
+        ///
+        /// This drives the real builder: a table with a tz-aware-millis column and
+        /// NO substrait bytes, i.e. a predicate opaque to us. The gate must arm
+        /// from the table schema.
+        #[test]
+        fn an_opaque_predicate_arms_the_gate_through_the_production_builder() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let mut ctx = base_only_context(&table_path, 0);
+            ctx.data_schema_json = TZ_MILLIS_AVRO_JSON.to_string();
+            assert!(
+                ctx.substrait_filter_bytes.is_empty(),
+                "fixture check: the predicate must be opaque for this to test anything"
+            );
+
+            let reader = new_file_group_reader_with_context(ctx).expect("build FFI reader");
+
+            assert_eq!(
+                reader.reader_context.repair_risk_columns,
+                vec!["ts".to_string()],
+                "with no decoded predicate the gate must arm from the TABLE schema; \
+                 an empty set here hands an injected provider an unconditional \
+                 'safe to push' over a possibly-mislabelled file"
+            );
+        }
+
+        /// The complement, so the test above cannot be satisfied by arming always.
+        ///
+        /// Same opaque-predicate path over a table with no repair-eligible column:
+        /// nothing to screen, so the gate stays disarmed and the provider keeps its
+        /// pushdown.
+        #[test]
+        fn an_opaque_predicate_over_a_plain_table_leaves_the_gate_disarmed() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let ctx = base_only_context(&table_path, 0);
+            assert!(ctx.substrait_filter_bytes.is_empty(), "fixture check");
+
+            let reader = new_file_group_reader_with_context(ctx).expect("build FFI reader");
+
+            assert!(
+                reader.reader_context.repair_risk_columns.is_empty(),
+                "no column in this table can carry the mislabel, so there is nothing \
+                 to withdraw pushdown for"
+            );
         }
 
         /// A REFUSED `read_record_batch` must leave the set-once stats cell

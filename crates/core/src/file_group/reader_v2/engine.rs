@@ -1901,6 +1901,21 @@ impl HoodieFileGroupReader {
         if repair_conflict.is_empty() {
             return;
         }
+        // Nothing was pushed, so nothing was suppressed.
+        //
+        // Before the opaque-predicate fallback this was unreachable:
+        // `repair_risk_columns` came from the predicate, so an absent predicate
+        // gave an empty risk set and the gate never armed. Now the gate arms from
+        // the TABLE, so every read of a legacy tz-millis table reaches here —
+        // including reads that installed no filter and no selector. Counting
+        // those would make `pushdown_suppressed_by_repair` mean "this table has a
+        // mislabel-eligible column", not "a pushdown was withdrawn", and the
+        // counter exists to separate a repair withdrawal from a merge-gate
+        // refusal. The clearing below stays unconditional — it is idempotent on
+        // two `None`s — so only the ACCOUNTING is gated.
+        if row_filter.is_none() && row_group_selector.is_none() {
+            return;
+        }
         let volume = self.storage.read_volume();
         // Counted for every withdrawal; `row_group_selector_suppressed` can
         // only speak for a selector the caller actually installed.
@@ -3015,6 +3030,47 @@ mod tests {
             0,
             "a merge-gate refusal is not a repair withdrawal, and the counters \
              exist to tell them apart"
+        );
+    }
+
+    /// A read that pushed nothing must not be counted as a withdrawal.
+    ///
+    /// `pushdown_suppressed_by_repair` exists to separate a REPAIR withdrawal
+    /// from a merge-gate refusal, and its doc says it counts base files "where a
+    /// pushed predicate read a column THIS file mislabels". Once the gate began
+    /// arming from the table schema (for the opaque-predicate case), every read
+    /// of a legacy tz-millis table reaches the withdrawal path — including reads
+    /// that installed no filter and no selector at all. Counting those turns the
+    /// counter into "this table has a mislabel-eligible column", which is not a
+    /// withdrawal and not what an operator reading it concludes.
+    #[tokio::test]
+    async fn a_read_that_pushed_nothing_is_not_counted_as_a_repair_withdrawal() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        // Mislabelled, so the gate finds a real conflict...
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        // ...but NO row filter and NO row-group selector are installed, which is
+        // exactly the shape the table-derived risk set now reaches.
+        let mut reader =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, straddling_table_schema())
+                .await;
+        reader.schema_handler.table_schema = Some(straddling_table_schema());
+        Arc::get_mut(&mut reader.reader_context)
+            .expect("sole owner in this test")
+            .repair_risk_columns = vec!["ts".to_string()];
+
+        let volume = reader.storage.read_volume();
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(out.num_rows(), 2, "every row still reaches the caller");
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            0,
+            "nothing was pushed, so nothing was suppressed — this counter must \
+             mean 'a pushdown was withdrawn', not 'this table could have one'"
         );
     }
 
