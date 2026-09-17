@@ -3006,10 +3006,6 @@ mod tests {
         );
     }
 
-    /// The same selector on a slice that merges, with a predicate that is not
-    /// primary-key-safe. Pruning would drop base rows before the merge could
-    /// update them into a match, so the gate refuses it -- and counts the
-    /// refusal, because a suppressed selector otherwise reads as "no caller ever
     /// The third state of `row_group_selector_calls`: never installed.
     ///
     /// The counter exists to separate "ran and pruned nothing" from "never ran",
@@ -3048,6 +3044,61 @@ mod tests {
         );
     }
 
+    /// A merge-gate refusal with NO selector installed suppresses nothing.
+    ///
+    /// The other half of `a_selector_the_gate_refuses_is_counted_not_silently_dropped`.
+    /// The suppression site is guarded by
+    /// `self.reader_context.row_group_selector.is_some()`, and that guard was
+    /// free: removing it left the whole suite green. The nearest existing test,
+    /// `no_selector_installed_counts_neither_a_call_nor_a_suppression`, uses a
+    /// NON-merging split, so `pushdown_is_safe` is true and the `else` branch it
+    /// would have to enter is never reached.
+    ///
+    /// Pre-existing gap, not introduced by this PR (the guard is Lin's
+    /// `b0f89adf`); closed here because the repair gate's twin of this counter is
+    /// pinned in both directions and this one was pinned in one, and a reader
+    /// comparing the two would reasonably assume otherwise.
+    ///
+    /// Without it, an edit that drops the guard increments
+    /// `row_group_selector_suppressed` once per base file on every merging,
+    /// non-PK-safe scan — turning "a selector was refused" into "the merge gate
+    /// refused", which is the exact conflation the counter was added to resolve.
+    #[tokio::test]
+    async fn a_merge_gate_refusal_with_no_selector_suppresses_nothing() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (tmp, base_name, schema) = three_row_groups();
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), &base_name, schema).await;
+        let volume = reader.storage.read_volume();
+        // A merging split with a non-PK-safe predicate: the gate refuses, so the
+        // suppression branch IS entered...
+        reader.input_split = InputSplit::new(
+            Some(base_name.clone()),
+            Some("20240101120000000".to_string()),
+            vec![".f1-0_20240101130000000.log.1_0-1-1".to_string()],
+            String::new(),
+        );
+        assert!(
+            !reader.base_read_pushdown_is_safe(),
+            "fixture check: the merge gate must actually refuse, or the guard \
+             under test is never reached"
+        );
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(out.num_rows(), 3, "every base row still reaches the merge");
+        assert_eq!(
+            volume.row_group_selector_suppressed.load(Relaxed),
+            0,
+            "...but no selector was installed, so there was nothing to suppress — \
+             counting here would report a refused selector that never existed"
+        );
+    }
+
+    /// The same selector on a slice that merges, with a predicate that is not
+    /// primary-key-safe. Pruning would drop base rows before the merge could
+    /// update them into a match, so the gate refuses it -- and counts the
+    /// refusal, because a suppressed selector otherwise reads as "no caller ever
     /// installed one": both are zero calls.
     #[tokio::test]
     async fn a_selector_the_gate_refuses_is_counted_not_silently_dropped() {
