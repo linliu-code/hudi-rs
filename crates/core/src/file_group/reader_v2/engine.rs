@@ -3253,6 +3253,55 @@ mod tests {
         );
     }
 
+    /// The UNPROJECTED path never reaches the provider, so it counts no
+    /// provider withdrawal either.
+    ///
+    /// That path returns after its own read, above the provider block entirely,
+    /// which is why it passes a literal `false` for `provider_will_be_offered`.
+    /// The literal was correct and held by nothing: flipping it to `true` moved
+    /// no test, because no other test on this path injects a provider.
+    ///
+    /// The branch is unreachable from the FFI surface today — it needs a caller
+    /// with no `required_schema`, and the FFI always supplies one. That is a
+    /// property of today's callers, not of this function, which is the same
+    /// argument the branch's own comment makes for running the repair gate here
+    /// at all.
+    #[tokio::test]
+    async fn the_unprojected_path_counts_no_provider_withdrawal() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        let mut reader =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, straddling_table_schema())
+                .await;
+        reader.schema_handler.table_schema = Some(straddling_table_schema());
+        // No projection: take the unprojected branch.
+        reader.schema_handler.required_schema = None;
+        Arc::get_mut(&mut reader.reader_context)
+            .expect("sole owner in this test")
+            .repair_risk_columns = vec!["ts".to_string()];
+        let provider = StubDataProvider::not_serving();
+        reader.base_file_provider = Some(provider.clone());
+
+        let volume = reader.storage.read_volume();
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(out.num_rows(), 2, "every row still reaches the caller");
+        assert!(
+            provider.seen().is_none(),
+            "fixture check: this branch returns before the provider block, so an \
+             injected provider is never offered the file"
+        );
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            0,
+            "a provider this path never reaches had no pushdown to withdraw"
+        );
+    }
+
     /// A file the INSTANT RANGE excludes is not a withdrawal either.
     ///
     /// The withdrawal sits below `base_file_in_range` for the same reason the
@@ -6816,6 +6865,98 @@ mod tests {
             "served rows inside the instant range survive"
         );
         assert!(provider.seen().is_some(), "an in-range file is offered");
+    }
+
+    /// Under POSITION merge a provider is never offered the file, so the repair
+    /// gate must not count a withdrawal for it either.
+    ///
+    /// The fifth direction of `pushdown_suppressed_by_repair`, and the one the
+    /// four-direction claim in `004450b`'s commit message silently omitted.
+    /// `provider_will_be_offered` has three conjuncts; two were pinned and
+    /// `!use_position` was free — deleting it moved no test.
+    ///
+    /// Reachable, not theoretical. `use_record_position` requires log files, and
+    /// with log files `base_read_pushdown_is_safe()` reduces to `mor_pk_safe` —
+    /// so a MOR split with a PK-safe predicate arms the repair gate while
+    /// `if !use_position && …` skips the provider block outright. Every base file
+    /// of such a scan incremented a counter for a pushdown no consumer held:
+    /// this fixture is a legacy tz-millis table read by an embedder that uses
+    /// position merge, which is the configuration most likely to see it.
+    ///
+    /// Pairs with `base_file_provider_is_skipped_under_position_based_merge`,
+    /// which pins the skip itself; this pins its ACCOUNTING.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn under_position_merge_a_provider_is_not_counted_as_a_withdrawal() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        // Mislabelled, so the gate finds a REAL conflict and the withdrawal path
+        // is reached rather than returning at the top.
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+        let log_name = ".f1-0_20240101120000000.log.1_0-0-0";
+        std::fs::write(tmp.path().join(log_name), b"").unwrap();
+
+        let base_path = tmp.path().to_str().unwrap().to_string();
+        let hudi_configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath.as_ref(),
+            base_path,
+        )]));
+        let storage = Storage::new(Arc::new(HashMap::new()), hudi_configs).unwrap();
+        let input_split = InputSplit::new(
+            Some(base_name.to_string()),
+            Some("001".to_string()),
+            vec![log_name.to_string()],
+            String::new(),
+        );
+        let mut reader_context = ReaderContext::empty();
+        reader_context.latest_commit_time =
+            crate::file_group::reader_v2::MAX_INSTANT_TIME.to_string();
+        reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+        // PK-safe, so the MERGE gate does not refuse first and the repair gate is
+        // the only thing that can withdraw anything here.
+        reader_context.mor_pk_safe = true;
+        reader_context.repair_risk_columns = vec!["ts".to_string()];
+        reader_context.rebuild_record_context(String::new());
+        let params = ReaderParameters {
+            use_record_position: true,
+            ..Default::default()
+        };
+
+        let provider = StubDataProvider::not_serving();
+        let mut reader = HoodieFileGroupReader::new(
+            Arc::new(reader_context),
+            storage,
+            input_split,
+            params,
+            None,
+            None,
+        )
+        .unwrap();
+        reader.schema_handler.required_schema = Some(straddling_table_schema());
+        reader.schema_handler.table_schema = Some(straddling_table_schema());
+        reader.base_file_provider = Some(provider.clone());
+
+        assert!(
+            reader.use_record_position(),
+            "fixture check: the read must actually take the position-merge path, \
+             or this pins nothing about `!use_position`"
+        );
+        let volume = reader.storage.read_volume();
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(out.num_rows(), 2, "every row still reaches the caller");
+        assert!(
+            provider.seen().is_none(),
+            "fixture check: position merge skips the provider block, so the \
+             provider is never offered the file and has no verdict to narrow"
+        );
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            0,
+            "no filter, no selector, and a provider the position path never asks: \
+             nothing was withdrawn, so nothing may be counted"
+        );
     }
 
     /// Position-based merge skips the provider: the base read carries a
