@@ -1556,7 +1556,9 @@ impl HoodieFileGroupReader {
         // own binding. Pinned by
         // `a_selector_the_gate_refuses_is_counted_not_silently_dropped`, which
         // asserts the repair counter stays at zero for a merge-gate refusal —
-        // the only test in this file that fails under that mis-keying.
+        // one of the tests that fails under that mis-keying — see also
+        // `a_merge_gate_refusal_does_not_also_arm_the_repair_gate`, which pins the
+        // merge conjunct through a provider-backed withdrawal.
         //
         // The three verdicts agree; only one of them is structurally unable to be
         // left behind. A fourth consumer added later should read the binding,
@@ -1833,10 +1835,15 @@ impl HoodieFileGroupReader {
 
     /// Is the #18132 repair gate capable of firing on this read at all?
     ///
-    /// `repair_risk_columns` is decided ONCE per scan from the table schema and
-    /// the predicate's own referenced columns, and is empty unless the predicate
-    /// touches a tz-aware millis column — so the common scan answers `false` here
-    /// and never reaches a footer on the gate's account. `pushdown_is_safe` is the
+    /// `repair_risk_columns` is decided ONCE per scan. Usually from the table
+    /// schema scoped to the predicate's referenced columns, so a scan whose
+    /// predicate touches no tz-aware millis column answers `false` here. But when
+    /// the predicate is opaque to us — no substrait bytes, or references that do
+    /// not resolve — `repair_risk_columns_for` falls back to EVERY
+    /// repair-eligible column in the table, because an injected provider applies
+    /// the caller's predicate and "we have no predicate" is not "nothing is
+    /// filtered". So a predicate-free scan of a legacy tz-millis table does arm
+    /// this, and the per-file footer comparison is what keeps that cheap. `pushdown_is_safe` is the
     /// merge gate: when it has already refused, there is no pushdown left to
     /// withdraw.
     ///
@@ -1901,19 +1908,32 @@ impl HoodieFileGroupReader {
         if repair_conflict.is_empty() {
             return;
         }
-        // Nothing was pushed, so nothing was suppressed.
+        // Logged before anything is gated: a file that needs the repair is worth
+        // saying so about even on a read that pushed nothing, because the
+        // PROVIDER's verdict is narrowed by this same conflict and that decision
+        // is otherwise invisible.
+        log::debug!(
+            "base file '{path}' needs a value-reinterpreting logical-type repair \
+             on {repair_conflict:?} — skipping parquet RowFilter pushdown and \
+             row-group pruning (post-merge filter still runs)"
+        );
+
+        // WAS any pushdown actually withdrawn? Three consumers can have one, and
+        // the counter means "a pushdown was withdrawn", not "this table has a
+        // mislabel-eligible column".
         //
-        // Before the opaque-predicate fallback this was unreachable:
-        // `repair_risk_columns` came from the predicate, so an absent predicate
-        // gave an empty risk set and the gate never armed. Now the gate arms from
-        // the TABLE, so every read of a legacy tz-millis table reaches here —
-        // including reads that installed no filter and no selector. Counting
-        // those would make `pushdown_suppressed_by_repair` mean "this table has a
-        // mislabel-eligible column", not "a pushdown was withdrawn", and the
-        // counter exists to separate a repair withdrawal from a merge-gate
-        // refusal. The clearing below stays unconditional — it is idempotent on
-        // two `None`s — so only the ACCOUNTING is gated.
-        if row_filter.is_none() && row_group_selector.is_none() {
+        // The provider is the one an earlier cut of this missed. Since the gate
+        // began arming from the TABLE (for the opaque-predicate case), a read can
+        // reach here with no filter and no selector of its own — and on exactly
+        // that read the provider is told `can_push_predicate: false` because of
+        // this conflict. That IS a withdrawal, and it is the withdrawal the
+        // opaque-predicate fallback exists to produce. Gating on the local two
+        // alone made it invisible in both the counter and the log: an operator
+        // whose Velox scan lost pushdown on every file of a legacy table saw
+        // nothing anywhere.
+        let withdrew_local = row_filter.is_some() || row_group_selector.is_some();
+        let withdrew_provider = self.base_file_provider.is_some();
+        if !withdrew_local && !withdrew_provider {
             return;
         }
         let volume = self.storage.read_volume();
@@ -1923,11 +1943,6 @@ impl HoodieFileGroupReader {
         if row_group_selector.is_some() {
             volume.record_selector_suppressed();
         }
-        log::debug!(
-            "base file '{path}' needs a value-reinterpreting logical-type repair \
-             on {repair_conflict:?} — skipping parquet RowFilter pushdown and \
-             row-group pruning (post-merge filter still runs)"
-        );
         *row_filter = None;
         *row_group_selector = None;
     }
@@ -3074,6 +3089,60 @@ mod tests {
         );
     }
 
+    /// A PROVIDER-only withdrawal must be counted, not silently dropped.
+    ///
+    /// This is the shape the opaque-predicate fallback exists to produce: hudi-rs
+    /// has no decoded predicate, so it installs no filter and no selector, but the
+    /// gate arms from the table schema and the provider's `can_push_predicate` is
+    /// narrowed to false for a mislabelled file. A withdrawal happened — the
+    /// provider's — and gating the counter on the LOCAL two alone made it
+    /// invisible in both the counter and the log, so an operator whose Velox scan
+    /// lost pushdown across a whole legacy table saw no evidence anywhere.
+    ///
+    /// Pairs with `a_read_that_pushed_nothing_is_not_counted_as_a_repair_withdrawal`,
+    /// which is the same fixture WITHOUT a provider and must stay at zero. The two
+    /// together pin the condition rather than one direction of it.
+    #[tokio::test]
+    async fn a_provider_only_withdrawal_is_still_counted() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        let mut reader =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, straddling_table_schema())
+                .await;
+        reader.schema_handler.table_schema = Some(straddling_table_schema());
+        Arc::get_mut(&mut reader.reader_context)
+            .expect("sole owner in this test")
+            .repair_risk_columns = vec!["ts".to_string()];
+        // No row filter and no selector — but a provider, whose verdict this
+        // conflict narrows.
+        let provider = StubDataProvider::not_serving();
+        reader.base_file_provider = Some(provider.clone());
+
+        let volume = reader.storage.read_volume();
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert!(
+            provider.seen().is_some(),
+            "fixture check: the provider must have been offered the file"
+        );
+        assert!(
+            !provider.seen().unwrap().can_push_predicate,
+            "fixture check: the conflict must actually have narrowed the provider's \
+             verdict, or there is no withdrawal to count"
+        );
+        assert_eq!(out.num_rows(), 2, "every row still reaches the caller");
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            1,
+            "the provider's pushdown WAS withdrawn, so it must be counted — this is \
+             the only signal an operator has that a legacy table is losing pushdown"
+        );
+    }
+
     /// A merge-gate refusal must not ALSO arm the repair gate.
     ///
     /// `repair_gate_is_armed` is `pushdown_is_safe && !repair_risk_columns
@@ -3119,6 +3188,16 @@ mod tests {
             vec![".f1-0_20240101130000000.log.1_0-1-1".to_string()],
             String::new(),
         );
+        // A PROVIDER is what makes this test able to fail. On a merge-gate refusal
+        // the local `row_filter` and `row_group_selector` are already `None` by the
+        // time `withdraw_pushdown_for_repair` runs — the merge gate clears them —
+        // so the "was anything withdrawn?" gate there would return early and the
+        // counter would read zero whether or not the merge conjunct survived. With
+        // a provider attached the withdrawal is real and countable, so dropping
+        // `pushdown_is_safe &&` from `repair_gate_is_armed` moves the counter and
+        // this test fails. Without it, this test cannot fail — which is exactly
+        // what happened when the gate was first added.
+        reader.base_file_provider = Some(StubDataProvider::not_serving());
 
         let volume = reader.storage.read_volume();
         let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;

@@ -1723,6 +1723,19 @@ mod tests {
             provider.try_base_file(sample_request(&schema, &fields)),
         )
         .await;
+        // Release the parked C call on the way out, whatever happens below.
+        // Without this a failing assertion panics while `blocking_try` is still
+        // spinning on `CALL_MAY_RETURN`, and the test binary never exits — a
+        // failure that wedges CI instead of reporting.
+        struct ReleaseOnDrop;
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                CALL_MAY_RETURN.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let _release = ReleaseOnDrop;
+
         assert!(abandoned.is_err(), "the fixture must still be inside C");
         assert!(
             CALL_ENTERED.load(Ordering::SeqCst),

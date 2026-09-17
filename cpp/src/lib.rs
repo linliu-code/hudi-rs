@@ -712,6 +712,21 @@ pub(crate) fn repair_risk_columns_for(
             }
         };
     };
+    if !pf.referenced_columns_are_complete() {
+        // At least one field index did not resolve to a name, so the list below
+        // is SHORT of what the predicate touches. Screening against it would
+        // disarm the gate for a column the predicate really reads — the same
+        // under-approximation as having no predicate at all, so take the same
+        // fallback. `build_row_filter` refuses this plan, so hudi-rs's own read is
+        // already safe; this is for the provider, which applies the caller's copy.
+        log::warn!(
+            "[ENG-48206] a pushed predicate references a field index that does not \
+             resolve to a column name (a wire-format bug on the C++ side); \
+             screening the repair gate against the table instead of a truncated \
+             reference list"
+        );
+        return repair_risk_columns_for(None, table_schema);
+    }
     let referenced = pf.referenced_columns();
     match table_schema {
         Some(table_schema) => {
@@ -2597,6 +2612,41 @@ pub(crate) mod tests {
                 "with no decoded predicate the gate must arm from the TABLE schema; \
                  an empty set here hands an injected provider an unconditional \
                  'safe to push' over a possibly-mislabelled file"
+            );
+        }
+
+        /// A table with TWO repair-eligible columns, so "scoped to the referenced
+        /// one" is distinguishable from "every column in the table".
+        const TWO_TZ_MILLIS_AVRO_JSON: &str = r#"{"type":"record","name":"trip","fields":[{"name":"id","type":["null","int"],"default":null},{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},{"name":"other_ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}"#;
+
+        /// A DECODED predicate must scope the gate to the columns it references,
+        /// and that scoping must reach production.
+        ///
+        /// The opaque-predicate tests below drive contexts with no substrait bytes,
+        /// so none of them exercises the decoded branch — replacing
+        /// `pushed_filter.as_ref()` with `None` at the call site survived every
+        /// suite. This is the same unpinned-wiring defect as the table-schema
+        /// argument, one parameter over.
+        ///
+        /// `pushdown_gt_filter_bytes` references field 0 only, so with both `ts`
+        /// and `other_ts` repair-eligible, a gate that ignored the predicate would
+        /// arm on both — costing pushdown over a column the predicate never reads,
+        /// which `referenced_columns`' doc calls out as the reason it exists.
+        #[test]
+        fn a_decoded_predicate_scopes_the_gate_to_its_referenced_columns() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let mut ctx = base_only_context(&table_path, 0);
+            ctx.data_schema_json = TWO_TZ_MILLIS_AVRO_JSON.to_string();
+            ctx.substrait_filter_bytes = super::pushdown_gt_filter_bytes(&["ts", "other_ts"]);
+
+            let reader = new_file_group_reader_with_context(ctx).expect("build FFI reader");
+
+            assert_eq!(
+                reader.reader_context.repair_risk_columns,
+                vec!["ts".to_string()],
+                "the gate must be scoped to the REFERENCED column; arming on \
+                 `other_ts` too would cost pushdown over a column the predicate \
+                 never reads"
             );
         }
 

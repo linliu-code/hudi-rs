@@ -190,8 +190,8 @@ pub struct ReaderContext {
     /// millis-semantics literal reads those rows as 1970 and the scan drops rows
     /// that match. A post-scan filter cannot restore them.
     ///
-    /// Computed once per scan by whoever supplies [`Self::row_filter_builder`], from
-    /// that predicate's referenced columns and the table schema, via
+    /// Computed once per scan by whoever supplies [`Self::row_filter_builder`],
+    /// normally from that predicate's referenced columns and the table schema, via
     /// [`crate::schema::batch_evolution::repair_risk_columns`]; routed here by
     /// [`HoodieFileGroupReaderBuilder::with_repair_risk_columns`](crate::file_group::reader_v2::HoodieFileGroupReaderBuilder::with_repair_risk_columns).
     /// **Empty on every table whose predicate touches no tz-aware millis column,

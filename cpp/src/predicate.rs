@@ -243,13 +243,32 @@ impl PushedFilter {
     ///   it is the kind of thing a later optimisation quietly removes.
     /// * the injected provider — applies the CALLER's predicate, not ours, so
     ///   neither control above touches it. Covered instead in
-    ///   `repair_risk_columns_for`: when the predicate is opaque to us the risk set
-    ///   is taken from the table schema rather than left empty.
+    ///   `repair_risk_columns_for`, which falls back to the table schema in BOTH
+    ///   shapes where this list cannot be trusted: no decoded predicate at all,
+    ///   and a decoded one whose references did not all resolve
+    ///   ([`Self::referenced_columns_are_complete`]). The second is the one this
+    ///   paragraph is about, and an earlier version of this bullet claimed it was
+    ///   covered when only the first was.
     pub fn referenced_columns(&self) -> Vec<String> {
         self.referenced_field_indices()
             .into_iter()
             .filter_map(|idx| self.column_names.get(idx).cloned())
             .collect()
+    }
+
+    /// Did [`Self::referenced_columns`] lose any reference it could not resolve?
+    ///
+    /// `true` means the name list it returned is SHORT of what the predicate
+    /// actually touches, so keying a safety decision on it under-approximates.
+    /// `repair_risk_columns_for` uses this to fall back to the table rather than
+    /// screen against a truncated list — the same reason it falls back when there
+    /// is no decoded predicate at all, and the same failure if it did not: an
+    /// injected provider applies the caller's predicate over a column the gate was
+    /// never shown.
+    pub fn referenced_columns_are_complete(&self) -> bool {
+        self.referenced_field_indices()
+            .into_iter()
+            .all(|idx| self.column_names.get(idx).is_some())
     }
 
     /// Returns true iff every column this filter references is either in
