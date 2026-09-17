@@ -303,14 +303,29 @@ mod ffi {
         /// `SpillableRecordMap::current_in_memory_bytes` — the pinned source
         /// batches + owned/key/overhead bytes; NOT the RocksDB spill tier or the
         /// produced Arrow output batch). It is published ONCE, at
-        /// `get_closable_iterator` time, as the post-`open()` value — which is the
-        /// true maximum for the read: `open()` loads every log record into the
-        /// merge map during the log scan, and from then on the base file is
-        /// *streamed* through the merge (base rows are never accumulated into the
-        /// map), so the footprint only decreases as chunks drain. It is therefore
-        /// the high-water mark a host memory manager should reserve for the whole
-        /// read. Returns 0 before `get_closable_iterator` and for a base-only
-        /// (no-merge) slice.
+        /// `get_closable_iterator` time, as the post-`open()` value: `open()`
+        /// loads every log record into the merge map during the log scan, and
+        /// from then on the base file is *streamed* through the merge (base rows
+        /// are never accumulated into the map), so the MERGE MAP's footprint only
+        /// decreases as chunks drain. Returns 0 before `get_closable_iterator`
+        /// and for a base-only (no-merge) slice.
+        ///
+        /// EXCLUSION, stated because a host memory manager reserves against this
+        /// value: `open()` also prefetches `BASE_READ_INITIAL_PREFETCH_BATCHES`
+        /// base batches, held in the reader's own buffer and NOT in the merge
+        /// map, so they are not counted here. This value is therefore the maximum
+        /// of the MERGE MAP, no longer the maximum of the read. The un-counted
+        /// amount is that constant times `MERGE_CHUNK_ROWS` — the rows per base
+        /// batch, which `base_read_options` sets, NOT
+        /// `hoodie.read.stream.batch_size`, which does not reach this path —
+        /// times the row width, PER READER; and Velox may hold several preloaded
+        /// splits at once, so what a host under-reserves is that product times
+        /// the preload depth, not one buffer. It shrinks to zero as the buffer
+        /// drains. `MERGE_CHUNK_ROWS` is 4096 rather than the 1024 it once was, so
+        /// the un-counted amount is 4x what it was. The earlier eager path
+        /// held the WHOLE base file and was likewise uncounted. Folding it in
+        /// would need the buffered byte size plumbed onto the gauge; it is
+        /// excluded deliberately, not by oversight.
         ///
         /// Intended for a host memory manager (velox's `MemoryPool`) to RESERVE
         /// against hudi-rs's native usage so velox's arbitration reflects it. Cheap
@@ -426,11 +441,23 @@ mod ffi {
         /// How many parquet `RowFilter`s this reader actually
         /// installed — the number of base files read with EARLY filtering.
         ///
-        /// NOT final until the split has drained. `open()` holds the base file
-        /// as a lazy `ParquetSyncReader` (see `FileGroupReader::open`), so the
-        /// builder that produces the RowFilter runs on the first batch pull, not
-        /// during `get_closable_iterator`. Reading this at prepareSplit time
-        /// always yields 0 and would look like "pushdown broken" on every split.
+        /// Final for a base file as soon as its stream is CONSTRUCTED, which
+        /// happens inside `open()`: `ParquetReader::apply_options` invokes the
+        /// RowFilter builder while assembling the
+        /// `ParquetRecordBatchStreamBuilder`, before `build()`, so a filter is
+        /// installed (or declined) before any batch is pulled. A slice whose base
+        /// read installs one therefore reports >= 1 as soon as
+        /// `get_closable_iterator` returns, and a 0 there means no filter was
+        /// installed rather than "not pulled yet". Still NOT final for the reader
+        /// overall until the split has drained, since a slice with several base
+        /// files constructs a stream per file.
+        ///
+        /// An earlier version of this comment said the builder runs on the first
+        /// batch pull, so this always reads 0 at prepare-split time. That was
+        /// wrong when written, and is doubly wrong now: `open()` also awaits the
+        /// first `BASE_READ_INITIAL_PREFETCH_BATCHES` batches, so even a
+        /// pull-time install would have happened before `get_closable_iterator`
+        /// returned.
         ///
         /// 0 with `hudi_pushdown_decoded() == 1` means the predicate decoded but
         /// no RowFilter was installed: the base-read pushdown gate (merging slice
@@ -490,10 +517,11 @@ pub struct HoodieFileGroupReader {
     // `get_closable_iterator` time and read by `hudi_reader_memory_bytes`.
     // `AtomicU64` for interior mutability + a non-torn cross-thread read (the
     // publish/read happen-before comes from Velox's prepareSplit→next() handoff,
-    // see the FFI doc). Starts at 0. The post-`open()` value is the true max
-    // because the base file is streamed through the merge, not accumulated, so
-    // the footprint never grows after `open()` — hence a single publish, not a
-    // per-chunk refresh.
+    // see the FFI doc). Starts at 0. The post-`open()` value is the max of the
+    // MERGE MAP — the base file is streamed through the merge, not accumulated,
+    // so the map never grows after `open()` — hence a single publish, not a
+    // per-chunk refresh. It is NOT the max of the read: see the exclusion on
+    // `hudi_reader_memory_bytes` for the prefetched base batches it misses.
     reader_memory_bytes: AtomicU64,
 
     // ── base-file data provider (composition-root-injected via C ABI) ─────
