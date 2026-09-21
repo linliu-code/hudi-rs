@@ -142,46 +142,171 @@ test-python: ## Run tests on Python
 	uv run pytest -s $(PYTHON_DIR)
 
 # ---- JNI library carrier (hudi-internal's hudi-native-reader resolves it from Maven) ----
-JNI_VERSION ?= 0.5.0-dev.$(shell git rev-parse --short HEAD)
+# The default version is derived from [workspace.package] version in the root Cargo.toml, the
+# same way jni-native.yml's package job derives it: always a dev coordinate,
+# <x.y.z>-dev.<short sha>, whatever pre-release suffix the workspace version carries. Both are
+# recursive (`=`), so only the targets that use the version evaluate it, and a version that
+# cannot be read stops those targets instead of minting a coordinate from an empty string.
+JNI_WORKSPACE_VERSION = $(or $(shell .github/scripts/workspace-version.sh),$(error cannot read [workspace.package] version with .github/scripts/workspace-version.sh; fix it or pass JNI_VERSION explicitly))
+JNI_SHORT_SHA = $(or $(shell git rev-parse --short HEAD),$(error cannot read the commit with git rev-parse; build from a git checkout or pass JNI_VERSION explicitly))
+JNI_VERSION ?= $(firstword $(subst -, ,$(JNI_WORKSPACE_VERSION)))-dev.$(JNI_SHORT_SHA)
 JNI_ARCH ?= $(shell uname -m | sed 's/arm64/aarch64/;s/amd64/x86_64/')
 JNI_OS ?= linux
 JNI_OUT ?= target/jni-native
-JNI_STAGE := $(JNI_OUT)/stage
-JNI_JAR := $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION)-$(JNI_OS)-$(JNI_ARCH).jar
+# F-2: the stage directory jni-jar-multi packages. Derived from JNI_OUT (so JNI_OUT=... moves
+# both the stage and the jar), but overridable on its own to package a stage some other target
+# produced -- see jni-jar-multi-portable and JNI_JAR_MULTI_PREREQ below.
+JNI_STAGE ?= $(JNI_OUT)/stage
+# Where cargo actually writes the release build; overridden by jni-lib-portable so a container
+# build never touches this host's normal target/release/libhudi_jni.so (D-27, OI-72).
+JNI_CARGO_TARGET_DIR ?= target
+# internal-only default; override for other hosts
 CODEARTIFACT_URL ?= https://onehouse-194159489498.d.codeartifact.us-west-2.amazonaws.com/maven/onehouse-internal/
 
+# D-27: manylinux_2_28 images for the portable (glibc<=2.28-floor) container build; jni-lib-portable
+DOCKER_MANYLINUX_x86_64  := quay.io/pypa/manylinux_2_28_x86_64
+DOCKER_MANYLINUX_aarch64 := quay.io/pypa/manylinux_2_28_aarch64
+JNI_PORTABLE_OUT ?= target/jni-portable
+
+# JNI_MULTI=1 switches jni-jar/jni-install/jni-deploy onto the classifier-less multi-arch jar
+# name (the same one jni-jar-multi produces) instead of the single-arch classifier jar; it does
+# NOT by itself merge in another arch's library — that's jni-jar-multi's JNI_EXTRA_NATIVE_DIR job,
+# which jni-install/jni-deploy pull in as their prerequisite under JNI_MULTI=1.
+ifeq ($(JNI_MULTI),1)
+JNI_JAR = $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar
+JNI_DEPLOY_PREREQ := jni-jar-multi
+JNI_CLASSIFIER_ARG :=
+JNI_DEPLOY_COORD = io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION)
+else
+JNI_JAR = $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION)-$(JNI_OS)-$(JNI_ARCH).jar
+JNI_DEPLOY_PREREQ := jni-jar
+JNI_CLASSIFIER_ARG := -Dclassifier=$(JNI_OS)-$(JNI_ARCH)
+JNI_DEPLOY_COORD = io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH)
+endif
+
+# The staged copy is stripped. Measured on an aarch64 build: 74,330,712 B -> 55,604,776 B, and
+# byte-identical to a plain `strip` -- the flag makes the intent explicit, it does not change the
+# bytes. `.dynsym` is what JNI binds against and a strip must never touch it, so the recipe
+# asserts the two entry points survived instead of trusting the flag. The previous stage is
+# removed only once the build has succeeded, so a compile failure leaves it intact.
 .PHONY: jni-lib
-jni-lib: ## Build libhudi_jni.so (release) and stage a stripped copy under target/jni-native
+jni-lib: ## Build libhudi_jni.so (release) and stage a stripped copy under target/jni-native (refuses a dirty tree; JNI_ALLOW_DIRTY=1 overrides)
 	$(info --- Build hudi-jni (release) ---)
-	./build-wrapper.sh cargo build -p hudi-jni --release
+	test -z "$$(git status --porcelain)" || { echo "dirty tree; set JNI_ALLOW_DIRTY=1 to override"; test "$(JNI_ALLOW_DIRTY)" = 1; }
+	CARGO_TARGET_DIR=$(JNI_CARGO_TARGET_DIR) ./build-wrapper.sh cargo build -p hudi-jni --release
+	rm -rf $(JNI_STAGE)
 	mkdir -p $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH) $(JNI_STAGE)/META-INF
-	strip -o $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so target/release/libhudi_jni.so
-	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\nmd5=%s\narch=%s-%s\n' \
+	strip --strip-unneeded -o $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so $(JNI_CARGO_TARGET_DIR)/release/libhudi_jni.so
+	nm -D --defined-only $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so | grep -c ' T Java_' | grep -qx 2
+	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\nglibc.floor=%s\nmd5=%s\narch=%s-%s\nstripped=true\n' \
 	  "$$(git rev-parse HEAD)" \
 	  "$$(grep -o 'JNI_ABI_VERSION: u32 = [0-9]*' crates/jni/src/lib.rs | grep -o '[0-9]*$$')" \
 	  "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+	  "$$(objdump -T $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)" \
 	  "$$(md5sum $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so | cut -d' ' -f1)" \
 	  "$(JNI_OS)" "$(JNI_ARCH)" > $(JNI_STAGE)/META-INF/hudi-jni-native.properties
 	cat $(JNI_STAGE)/META-INF/hudi-jni-native.properties
 
 .PHONY: jni-jar
-jni-jar: jni-lib ## Package the staged library as hudi-jni-native-<version>-<os>-<arch>.jar
+jni-jar: jni-lib ## Package the staged library as hudi-jni-native-<version>-<os>-<arch>.jar (JNI_MULTI=1 drops the classifier, matching jni-jar-multi's name)
 	$(info --- Package $(JNI_JAR) ---)
 	rm -f $(JNI_JAR) && jar cf $(JNI_JAR) -C $(JNI_STAGE) .
 	unzip -l $(JNI_JAR)
 
+# F-2: jni-jar-multi packages whatever stage it is pointed at, and its build prerequisite is a
+# variable, so a stage some OTHER target produced can be packaged without re-running (and
+# wiping) the host build. Three supported shapes:
+#   make jni-jar-multi JNI_EXTRA_NATIVE_DIR=<dir>            host build, target/jni-native/stage
+#   make jni-jar-multi-portable JNI_EXTRA_NATIVE_DIR=<dir>   container build, target/jni-portable/stage
+#   make jni-jar-multi JNI_JAR_MULTI_PREREQ= JNI_OUT=target/jni-portable JNI_EXTRA_NATIVE_DIR=<dir>
+#                                                            package an EXISTING stage, build nothing
+JNI_JAR_MULTI_PREREQ ?= jni-lib
+
+# The packaging body, shared by jni-jar-multi and jni-jar-multi-portable so the two can never
+# drift. $(JNI_STAGE)/$(JNI_OUT) are resolved per target (jni-jar-multi-portable sets JNI_OUT).
+#
+# It refuses, before copying or writing anything, unless BOTH arches -- each taken from
+# JNI_EXTRA_NATIVE_DIR if it has one, else from the stage -- are present, stripped and export the
+# two Java_ entry points: the jar is published under the classifier-less
+# multi-arch coordinate, and `stripped=true` is a claim about bytes this target may only have
+# copied (JNI_EXTRA_NATIVE_DIR, or a stage packaged with JNI_JAR_MULTI_PREREQ=). The properties
+# are written in the same order as the workflow's package job, and the LICENSE/NOTICE/
+# THIRD-PARTY.txt come from the same script that job runs.
+define jni_package_multi
+	test -n "$(JNI_EXTRA_NATIVE_DIR)" || { echo "JNI_EXTRA_NATIVE_DIR is required"; exit 2; }
+	test -d "$(JNI_EXTRA_NATIVE_DIR)/native" || { echo "JNI_EXTRA_NATIVE_DIR=$(JNI_EXTRA_NATIVE_DIR) has no native/ directory (expected native/linux-<arch>/libhudi_jni.so)"; exit 2; }
+	test -d "$(JNI_STAGE)/native" || { echo "no staged library under $(JNI_STAGE)/native -- run jni-lib or jni-lib-portable first, or point JNI_OUT/JNI_STAGE at an existing stage"; exit 2; }
+	for a in x86_64 aarch64; do \
+	  so=$(JNI_EXTRA_NATIVE_DIR)/native/linux-$$a/libhudi_jni.so; \
+	  test -f "$$so" || so=$(JNI_STAGE)/native/linux-$$a/libhudi_jni.so; \
+	  test -f "$$so" || { echo "linux-$$a/libhudi_jni.so is missing: the multi-arch jar needs both linux-x86_64 and linux-aarch64 (one staged, the other in JNI_EXTRA_NATIVE_DIR)"; exit 2; }; \
+	  if readelf -S "$$so" | grep ' \.symtab' >/dev/null; then echo "$$so is not stripped (it has a .symtab); stage it with jni-lib or jni-lib-portable"; exit 2; fi; \
+	  n=$$(nm -D --defined-only "$$so" | grep -c ' T Java_'); \
+	  [ "$$n" = 2 ] || { echo "$$so exports $$n Java_ symbols, expected 2"; exit 2; }; \
+	done
+	cp -r $(JNI_EXTRA_NATIVE_DIR)/native/. $(JNI_STAGE)/native/
+	mkdir -p $(JNI_STAGE)/META-INF
+	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\narch=linux-x86_64,linux-aarch64\n' "$$(git rev-parse HEAD)" \
+	  "$$(grep -o 'JNI_ABI_VERSION: u32 = [0-9]*' crates/jni/src/lib.rs | grep -o '[0-9]*$$')" \
+	  "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" > $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+	for a in x86_64 aarch64; do \
+	  printf 'md5.linux-%s=%s\n' "$$a" "$$(md5sum $(JNI_STAGE)/native/linux-$$a/libhudi_jni.so | cut -d' ' -f1)"; \
+	done >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+	for a in x86_64 aarch64; do \
+	  printf 'glibc.floor.linux-%s=%s\n' "$$a" "$$(objdump -T $(JNI_STAGE)/native/linux-$$a/libhudi_jni.so | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)"; \
+	done >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+	printf 'stripped=true\n' >> $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+	cat $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+	.github/jni-legal/stage-legal.sh $(JNI_STAGE)
+	rm -f $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar && jar cf $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar -C $(JNI_STAGE) . && unzip -l $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar
+endef
+
+.PHONY: jni-jar-multi
+jni-jar-multi: $(JNI_JAR_MULTI_PREREQ) ## Package the staged library (JNI_STAGE, default target/jni-native/stage) plus JNI_EXTRA_NATIVE_DIR (another leg's native/<os>-<arch>/libhudi_jni.so) as ONE classifier-less jar with LICENSE/NOTICE/THIRD-PARTY.txt; JNI_JAR_MULTI_PREREQ= packages an existing stage and builds nothing
+	$(jni_package_multi)
+
+.PHONY: jni-jar-multi-portable
+jni-jar-multi-portable: JNI_OUT := $(JNI_PORTABLE_OUT)
+jni-jar-multi-portable: jni-lib-portable ## F-2/D-27: build this arch in the manylinux_2_28 container and package target/jni-portable/stage (+ JNI_EXTRA_NATIVE_DIR) as the multi-arch jar
+	$(jni_package_multi)
+
+# D-27 (OI-72): jni-lib builds on THIS host, whose glibc floor is whatever this box happens to
+# run (documented, not asserted) — jni-lib-portable instead builds inside a manylinux_2_28
+# container (glibc 2.28) with librocksdb-sys's -lstdc++/-lgcc_s force-static via
+# .github/jni-portable/static-cxx-linker.sh (see that file for why RUSTFLAGS alone doesn't do
+# it), so the resulting .so's floor is <=2.28 regardless of this box's own glibc. Stages under
+# $(JNI_PORTABLE_OUT), and builds cargo into $(JNI_PORTABLE_OUT)/cargo-target — NEVER
+# target/release or target/jni-native/stage, which other gates on this box depend on.
+# The container body is .github/jni-portable/container-build.sh, the script the workflow's build
+# job runs, so the two cannot drift. CARGO_BUILD_JOBS is passed through when set (e.g. to bound
+# the build on a small machine). The floor asserted afterwards is the one the workflow asserts,
+# from the same script: glibc ceiling, no versioned GLIBCXX_/CXXABI_ imports, the NEEDED
+# allow-list, no undefined unwinder/C++ symbols, the two Java_ exports, and a stripped library.
+.PHONY: jni-lib-portable
+jni-lib-portable: ## D-27: build libhudi_jni.so inside a manylinux_2_28 container (static libstdc++/libgcc/libgcc_eh, -Wl,-z,defs) and assert .github/jni-portable/portability-floor.sh (glibc<=2.28, NEEDED allow-list, no undefined unwinder symbols, 2 Java_ exports, stripped); stages under target/jni-portable, never touches target/release
+	mkdir -p $(JNI_PORTABLE_OUT)
+	docker run --rm -e CARGO_BUILD_JOBS -v "$$(pwd):/work" -w /work $(DOCKER_MANYLINUX_$(JNI_ARCH)) \
+	  .github/jni-portable/container-build.sh $(JNI_ARCH) $(JNI_PORTABLE_OUT) $(JNI_PORTABLE_OUT)/cargo-target
+	.github/jni-portable/portability-floor.sh $(JNI_PORTABLE_OUT)/stage/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so
+
 .PHONY: jni-deploy
-jni-deploy: jni-jar ## Deploy the carrier jar to CodeArtifact (server id `codeartifact` in ~/.m2/settings.xml)
-	$(info --- Deploy $(JNI_JAR) as io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH) ---)
+jni-deploy: $(JNI_DEPLOY_PREREQ) ## Deploy the carrier jar to CodeArtifact (server id `codeartifact` in ~/.m2/settings.xml); JNI_MULTI=1 deploys the classifier-less multi-arch jar (needs JNI_EXTRA_NATIVE_DIR)
+	$(info --- Deploy $(JNI_JAR) as $(JNI_DEPLOY_COORD) ---)
 	mvn -B -ntp deploy:deploy-file -Dfile=$(JNI_JAR) -DgroupId=io.onehouse.hudi-rs -DartifactId=hudi-jni-native \
-	  -Dversion=$(JNI_VERSION) -Dclassifier=$(JNI_OS)-$(JNI_ARCH) -Dpackaging=jar -DgeneratePom=true \
+	  -Dversion=$(JNI_VERSION) $(JNI_CLASSIFIER_ARG) -Dpackaging=jar -DgeneratePom=true \
 	  -DrepositoryId=codeartifact -Durl=$(CODEARTIFACT_URL)
 
 .PHONY: jni-install
-jni-install: jni-jar ## Install the carrier jar into the local Maven repository (~/.m2) for builds on this machine
-	$(info --- Install $(JNI_JAR) into the local Maven repository as io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH) ---)
+jni-install: $(JNI_DEPLOY_PREREQ) ## Install the carrier jar into the local Maven repository (~/.m2) for builds on this machine; JNI_MULTI=1 installs the classifier-less multi-arch jar (needs JNI_EXTRA_NATIVE_DIR)
+	$(info --- Install $(JNI_JAR) into the local Maven repository as $(JNI_DEPLOY_COORD) ---)
 	mvn -B -ntp install:install-file -Dfile=$(JNI_JAR) -DgroupId=io.onehouse.hudi-rs -DartifactId=hudi-jni-native \
-	  -Dversion=$(JNI_VERSION) -Dclassifier=$(JNI_OS)-$(JNI_ARCH) -Dpackaging=jar -DgeneratePom=true
+	  -Dversion=$(JNI_VERSION) $(JNI_CLASSIFIER_ARG) -Dpackaging=jar -DgeneratePom=true
+
+.PHONY: test-jni-carrier
+test-jni-carrier: ## Test the carrier's Makefile rules: the default JNI_VERSION and jni-jar-multi's packaging checks (needs gcc, binutils, cargo and a JDK's jar)
+	$(info --- Test the JNI carrier Makefile rules ---)
+	.github/jni-tests/jni-version.sh
+	.github/jni-tests/jni-package-multi.sh
 
 .PHONY: coverage
 coverage: coverage-rust ## Generate coverage report (alias for coverage-rust)

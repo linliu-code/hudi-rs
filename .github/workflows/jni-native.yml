@@ -1,0 +1,183 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: JNI native carrier
+# Trigger: push a tag `jni-native/<version>` (e.g. jni-native/<x.y.z>-dev.abc1234) at the
+# commit to build. The default version is DERIVED from the one authority --
+# `[workspace.package] version` in the root Cargo.toml, read by
+# .github/scripts/workspace-version.sh -- so a version bump is a single edit there and never
+# leaves the carrier disagreeing with the crates it was built from.
+# workflow_dispatch is kept for when this file reaches the default branch.
+# This workflow builds, checks and packages the carrier and uploads it as a workflow artifact
+# (`hudi-jni-native-carrier`). It publishes nothing.
+on:
+  push:
+    tags:
+      - 'jni-native/*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "carrier version (default: the tag's suffix, else <x.y.z>-dev.<short sha> from the workspace version)"
+        required: false
+        default: ""
+# Two runs for the same ref would otherwise race to produce the same artifacts. Serialise per ref,
+# and never cancel a run in progress.
+concurrency:
+  group: jni-native-${{ github.ref }}
+  cancel-in-progress: false
+# Read-only: no job needs to write to the repository or to assume a cloud role.
+permissions:
+  contents: read
+jobs:
+  build:
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm   # aarch64, Ubuntu 24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies (host side; the build itself runs inside manylinux_2_28, D-27)
+        run: sudo apt-get update && sudo apt-get install -y binutils
+      # D-27 (OI-72): swatinem/rust-cache targets this RUNNER's ~/.cargo and target/, but the
+      # build now happens inside a manylinux_2_28 container with its OWN rustup/registry —
+      # nothing on the runner's cache path is ever read or written by that build. Dropped
+      # rather than pointed at the container's cargo home: caching a fresh-rustup-install +
+      # full dependency compile inside a throwaway container would need a second cache action
+      # keyed to a bind-mounted cargo home, which is more machinery than this fix round
+      # justifies. Cost: every run of this workflow is a full ~cold compile inside the
+      # container (~2-3 min measured locally per arch), same as before this fix (the runner-side
+      # cache was already continue-on-error and unverified on the ARC leg).
+      - name: Build libhudi_jni.so (inside manylinux_2_28, D-27 — glibc<=2.28 floor)
+        # .github/jni-portable/container-build.sh is the container body `make jni-lib-portable`
+        # runs too, so a local portable build and this leg install the same toolchain (protoc
+        # pinned and checksummed) and run the same build. Here it stages under target/jni-native
+        # and builds into target/, the paths the steps below read.
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "${{ matrix.arch }}"
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work quay.io/pypa/manylinux_2_28_${{ matrix.arch }} \
+            .github/jni-portable/container-build.sh "${{ matrix.arch }}" target/jni-native target
+          nm -D target/release/libhudi_jni.so | grep -c ' T Java_' | grep -qx 2
+          file target/jni-native/stage/native/linux-${{ matrix.arch }}/libhudi_jni.so
+      - name: Portability floor (D-27)
+        # F-5/F-13/F-7: one script, shared with `make jni-lib-portable`, so a local portable
+        # build and this leg assert exactly the same thing. It checks the glibc symbol-version
+        # ceiling, that no versioned GLIBCXX_/CXXABI_ import survived the static link, that every
+        # NEEDED soname is on an ALLOW-list (the previous two-entry deny-list accepted any new
+        # dynamic dependency a future crate might drag in), that no unwinder/C++ ABI symbol is
+        # left undefined, that the two Java_ exports survived the strip, and that the library
+        # is stripped.
+        run: .github/jni-portable/portability-floor.sh target/jni-native/stage/native/linux-${{ matrix.arch }}/libhudi_jni.so
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - name: JNI load smoke (on the runner)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/smoke && javac -d /tmp/smoke .github/jni-smoke/org/apache/hudi/io/nativereader/NativeFileGroupReader.java
+          java -cp /tmp/smoke org.apache.hudi.io.nativereader.NativeFileGroupReader "$PWD/target/jni-native/stage/native/linux-${{ matrix.arch }}/libhudi_jni.so" | tee smoke.txt
+          grep -q '^SMOKE hudi-jni .* abi=3' smoke.txt
+      - name: JNI load smoke (glibc 2.35 container, D-27 — proves a host older than this runner's own glibc loads it)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work eclipse-temurin:17-jdk-jammy bash -c '
+            set -euo pipefail
+            mkdir -p /tmp/smoke && javac -d /tmp/smoke .github/jni-smoke/org/apache/hudi/io/nativereader/NativeFileGroupReader.java
+            java -cp /tmp/smoke org.apache.hudi.io.nativereader.NativeFileGroupReader "$PWD/target/jni-native/stage/native/linux-${{ matrix.arch }}/libhudi_jni.so" | tee /tmp/smoke-2_35.txt
+            grep -q "^SMOKE hudi-jni .* abi=3" /tmp/smoke-2_35.txt
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libhudi_jni-linux-${{ matrix.arch }}
+          path: |
+            target/jni-native/stage/native/linux-${{ matrix.arch }}/libhudi_jni.so
+            target/jni-native/stage/META-INF/hudi-jni-native.properties
+          if-no-files-found: error
+  package:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: legs }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - name: Assemble the multi-arch carrier
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="$INPUT_VERSION"
+          [ -n "$VERSION" ] || case "$GITHUB_REF" in refs/tags/jni-native/*) VERSION="${GITHUB_REF#refs/tags/jni-native/}";; esac
+          # The default is always a DEV coordinate, <x.y.z>-dev.<short sha>, whatever pre-release
+          # suffix the workspace version carries. Appending to the workspace version verbatim
+          # would mint a release-looking <x.y.z>.<short sha> the moment it stops carrying `-dev`.
+          # The Makefile's JNI_VERSION derives the same string (.github/jni-tests/jni-version.sh).
+          [ -n "$VERSION" ] || VERSION="$(.github/scripts/workspace-version.sh | sed 's/-.*//')-dev.$(git rev-parse --short HEAD)"
+          mkdir -p stage/META-INF
+          for arch in x86_64 aarch64; do
+            mkdir -p stage/native/linux-$arch
+            cp legs/libhudi_jni-linux-$arch/native/linux-$arch/libhudi_jni.so stage/native/linux-$arch/ 2>/dev/null || cp legs/libhudi_jni-linux-$arch/libhudi_jni.so stage/native/linux-$arch/
+          done
+          # Each leg's library is re-checked here, on the bytes this job is about to package,
+          # rather than trusting the leg: the same portability floor the legs assert (glibc
+          # ceiling, NEEDED allow-list, Java_ exports, stripped), so the properties below make no
+          # claim this job has not checked.
+          for arch in x86_64 aarch64; do
+            .github/jni-portable/portability-floor.sh stage/native/linux-$arch/libhudi_jni.so
+          done
+          ABI=$(grep -o 'JNI_ABI_VERSION: u32 = [0-9]*' crates/jni/src/lib.rs | grep -o '[0-9]*$')
+          printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\narch=linux-x86_64,linux-aarch64\nmd5.linux-x86_64=%s\nmd5.linux-aarch64=%s\n' \
+            "$(git rev-parse HEAD)" "$ABI" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "$(md5sum stage/native/linux-x86_64/libhudi_jni.so | cut -d' ' -f1)" \
+            "$(md5sum stage/native/linux-aarch64/libhudi_jni.so | cut -d' ' -f1)" > stage/META-INF/hudi-jni-native.properties
+          # D-27: each leg's glibc.floor, re-measured here with the same objdump one-liner
+          # jni-lib/jni-jar-multi use (rather than trusting a leg's uploaded properties file).
+          for arch in x86_64 aarch64; do
+            printf 'glibc.floor.linux-%s=%s\n' "$arch" \
+              "$(objdump -T stage/native/linux-$arch/libhudi_jni.so | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)" \
+              >> stage/META-INF/hudi-jni-native.properties
+          done
+          # D-29: asserted by the portability floor above; record it so a consumer can tell a
+          # stripped carrier from an unstripped one.
+          printf 'stripped=true\n' >> stage/META-INF/hudi-jni-native.properties
+          cat stage/META-INF/hudi-jni-native.properties
+          # LICENSE / NOTICE / THIRD-PARTY.txt, from the same script `make jni-jar-multi`
+          # runs, so a CI carrier and a locally assembled one carry identical legal files. It
+          # needs cargo (`cargo tree` + `cargo metadata` for the hudi-jni dependency closure);
+          # the ubuntu-24.04 image ships one, but install a toolchain if that ever changes rather
+          # than shipping a carrier with no attribution.
+          command -v cargo >/dev/null || {
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain stable
+            export PATH="$HOME/.cargo/bin:$PATH"
+          }
+          .github/jni-legal/stage-legal.sh stage
+          jar cf "hudi-jni-native-$VERSION.jar" -C stage .
+          unzip -l "hudi-jni-native-$VERSION.jar"; md5sum "hudi-jni-native-$VERSION.jar" | tee "hudi-jni-native-$VERSION.jar.md5"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hudi-jni-native-carrier
+          path: |
+            hudi-jni-native-*.jar
+            hudi-jni-native-*.jar.md5
+          if-no-files-found: error
