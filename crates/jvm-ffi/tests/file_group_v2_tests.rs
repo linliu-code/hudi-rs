@@ -1487,3 +1487,624 @@ fn si_tombstone_in_a_delete_block_hides_the_base_row_under_a_prefix_lookup() {
         "with the tombstone's instant excluded the base row {victim:?} must come back; got {keys_none:?}"
     );
 }
+
+// ---- v6 (Hudi 0.14) record_index, read under the CURRENT schema -----------
+//
+// A table-version-6 MDT was written with a `HoodieMetadataRecord` that predates
+// four additions: `SecondaryIndexMetadata`, `ColumnStatsMetadata.isTightBound`
+// (non-nullable, `"default": false`), `ColumnStatsMetadata.valueType`,
+// `recordIndexMetadata.position` — and two union branches appended to
+// `ColumnStatsMetadata.minValue`/`.maxValue` (`LocalDateWrapper`,
+// `ArrayWrapper`: 12 branches in the file against 14 in the reader schema).
+//
+// Java reads it with `GenericDatumReader(writerSchema, readerSchema)`
+// (`HoodieNativeAvroHFileReader:453`), so Avro's resolver matches union branches
+// by full name and fills reader-only fields from their declared defaults. The
+// native path must do the same. Before it did, it decoded with the writer schema
+// alone and then asked `arrow_cast` for a 12-branch → 14-branch union cast,
+// which arrow-cast refuses — the CI failure of
+// `TestUpgradeFromV6IndexTypes.testUpgradePreservesIndexFunctionality[6]`.
+//
+// Fixture: `crates/test/data/metadata_v6_record_index/`; its README carries the
+// provenance and how to refresh the reader schema.
+
+/// The file `TestUpgradeFromV6IndexTypes[6]` fails on, verbatim.
+const V6_FAILING_HFILE: &str = "record-index-0005-0_4-1636-3849_20260505162917195001.hfile";
+/// A v6 slice of the same partition whose log file carries an Avro DATA block,
+/// so the log-block half of the resolution is exercised: the block is written in
+/// the v6 schema and has to reach the current one.
+const V6_BASE_WITH_LOG_HFILE: &str = "record-index-0002-0_3-1636-3848_20260505162917195001.hfile";
+const V6_LOG_FILE: &str = ".record-index-0002-0_20260505162917195001.log.1_0-1654-3883";
+/// A v6 slice whose log file is a DELETE block against the base row — the same
+/// read with nothing to resolve, which must still come out empty rather than
+/// erroring.
+const V6_BASE_WITH_DELETE_LOG_HFILE: &str =
+    "record-index-0004-0_5-1636-3850_20260505162917195001.hfile";
+const V6_DELETE_LOG_FILE: &str = ".record-index-0004-0_20260505162917195001.log.1_0-1713-3978";
+
+fn v6_fixture_file(relative: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR").replace("/jvm-ffi", "/test"))
+        .join("data/metadata_v6_record_index")
+        .join(relative)
+}
+
+/// The v6 metadata table's path, extracted from the committed fixture zip.
+fn v6_mdt_path() -> String {
+    hudi_test::extract_test_table(&v6_fixture_file("v6_record_index_014.zip"))
+        .join("v6_record_index_014")
+        .to_str()
+        .expect("fixture path is utf8")
+        .to_string()
+}
+
+/// (hfile base names, log file names) under the v6 `record_index`, both sorted.
+fn v6_record_index_files() -> (Vec<String>, Vec<String>) {
+    let dir = format!("{}/record_index", v6_mdt_path());
+    let mut hfiles = Vec::new();
+    let mut logs = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("v6 record_index dir") {
+        let name = entry
+            .expect("dir entry")
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+        if name.starts_with("._") {
+            continue;
+        }
+        if name.ends_with(".hfile") {
+            hfiles.push(name);
+        } else if name.starts_with(".record-index-") && name.contains(".log.") {
+            logs.push(name);
+        }
+    }
+    hfiles.sort();
+    logs.sort();
+    assert!(
+        hfiles.iter().any(|h| h == V6_FAILING_HFILE),
+        "the fixture must carry the file the Java test fails on"
+    );
+    (hfiles, logs)
+}
+
+/// The CURRENT `HoodieMetadataRecord` reader schema — Java's
+/// `HoodieBackedTableMetadata.SCHEMA`, i.e.
+/// `HoodieAvroUtils.addMetadataFields(HoodieMetadataRecord.getClassSchema())`,
+/// derived from hudi-internal `hudi-common/src/main/avro/HoodieMetadata.avsc`.
+/// See the fixture README for exactly how.
+fn current_metadata_reader_schema_json() -> String {
+    std::fs::read_to_string(v6_fixture_file(
+        "HoodieMetadataRecord-with-meta-fields.avsc",
+    ))
+    .expect("read the current HoodieMetadataRecord schema")
+    .trim()
+    .to_string()
+}
+
+/// The writer schema of a v6 HFile, straight out of its own file info.
+fn v6_writer_schema_json(base: &str) -> String {
+    let path = format!("{}/record_index/{base}", v6_mdt_path());
+    let bytes = std::fs::read(&path).expect("read v6 hfile");
+    HFileReader::new(bytes)
+        .expect("parse v6 hfile")
+        .avro_schema_json()
+        .expect("read the v6 hfile's avro schema")
+        .expect("a v6 MDT hfile carries a writer schema")
+        .to_string()
+}
+
+fn v6_request<'a>(
+    mdt: &'a str,
+    base: &'a str,
+    logs: &'a [&'a str],
+    schema: &'a str,
+) -> FileGroupRequest<'a> {
+    FileGroupRequest {
+        table_path: mdt,
+        partition_path: "record_index",
+        base_file_name: base,
+        log_file_names: logs,
+        latest_instant: MAX_INSTANT_TIME,
+        data_schema_json: schema,
+        lookup_keys: None,
+        lookup_keys_are_prefixes: false,
+        valid_instants: &[],
+    }
+}
+
+/// `(key, recordIndexMetadata.fileId, recordIndexMetadata.instantTime)` per row —
+/// the RLI payload the Java caller reads off the record.
+fn record_index_payload(batch: &arrow::array::RecordBatch) -> Vec<(String, String, i64)> {
+    let keys = keys_of(batch);
+    let rim = batch
+        .column_by_name("recordIndexMetadata")
+        .expect("`recordIndexMetadata` column")
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("recordIndexMetadata is a struct");
+    let file_id = rim
+        .column_by_name("fileId")
+        .expect("fileId field")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("fileId is utf8");
+    let instant = rim
+        .column_by_name("instantTime")
+        .expect("instantTime field")
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("instantTime is int64");
+    let mut out: Vec<(String, String, i64)> = (0..keys.len())
+        .map(|i| {
+            (
+                keys[i].clone(),
+                if file_id.is_null(i) {
+                    String::new()
+                } else {
+                    file_id.value(i).to_string()
+                },
+                if instant.is_null(i) {
+                    -1
+                } else {
+                    instant.value(i)
+                },
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The union branch names of `ColumnStatsMetadata.<field>` in a batch's schema.
+fn union_branch_names(batch: &arrow::array::RecordBatch, field: &str) -> Vec<String> {
+    let cs = batch
+        .schema()
+        .field_with_name("ColumnStatsMetadata")
+        .expect("`ColumnStatsMetadata` column")
+        .clone();
+    let arrow::datatypes::DataType::Struct(children) = cs.data_type() else {
+        panic!("ColumnStatsMetadata is not a struct: {:?}", cs.data_type());
+    };
+    let child = children
+        .iter()
+        .find(|f| f.name() == field)
+        .unwrap_or_else(|| panic!("ColumnStatsMetadata has no `{field}` field"));
+    match child.data_type() {
+        arrow::datatypes::DataType::Union(fields, _) => {
+            fields.iter().map(|(_, f)| f.name().clone()).collect()
+        }
+        other => panic!("ColumnStatsMetadata.{field} is not a union: {other:?}"),
+    }
+}
+
+/// The child field names of a struct column of a batch.
+fn struct_child_names(batch: &arrow::array::RecordBatch, column: &str) -> Vec<String> {
+    let field = batch
+        .schema()
+        .field_with_name(column)
+        .unwrap_or_else(|_| panic!("`{column}` column"))
+        .clone();
+    match field.data_type() {
+        arrow::datatypes::DataType::Struct(children) => {
+            children.iter().map(|f| f.name().clone()).collect()
+        }
+        other => panic!("{column} is not a struct: {other:?}"),
+    }
+}
+
+/// The read the failing Java test performs: the v6 HFiles against the current
+/// `HoodieMetadataRecord`. Everything the reader schema added must arrive from
+/// its Avro default; everything the file carries must come out unchanged.
+///
+/// Every shard, not just the failing one: a shard here holds one record, so a
+/// single comparison would also pass for a reader that always returned one row.
+#[test]
+fn v6_record_index_hfiles_read_under_the_current_metadata_schema() {
+    let (hfiles, _) = v6_record_index_files();
+    let mdt = v6_mdt_path();
+    let reader_schema = current_metadata_reader_schema_json();
+
+    let mut total_rows = 0usize;
+    let mut failing_batch = None;
+    for base in &hfiles {
+        let writer_schema = v6_writer_schema_json(base);
+        assert_ne!(
+            writer_schema, reader_schema,
+            "{base}: the fixture must actually be schema-evolved, or this test proves nothing"
+        );
+
+        // Independent oracle: the same file decoded with its OWN writer schema.
+        // That read never needed resolution, so it is the truth about which rows
+        // and which payload the file holds.
+        let by_writer = read_file_group_v2(&v6_request(&mdt, base, &[], &writer_schema))
+            .unwrap_or_else(|e| panic!("{base} reads under its own writer schema: {e}"));
+        let batch = read_file_group_v2(&v6_request(&mdt, base, &[], &reader_schema))
+            .unwrap_or_else(|e| panic!("{base} under the current schema must read: {e}"));
+
+        println!(
+            "v6_under_current base={base} rows={} writer_schema_rows={} payload={:?}",
+            batch.num_rows(),
+            by_writer.num_rows(),
+            record_index_payload(&batch)
+        );
+        assert_eq!(
+            batch.num_rows(),
+            by_writer.num_rows(),
+            "{base}: resolution must not add or drop records"
+        );
+        assert_eq!(
+            record_index_payload(&batch),
+            record_index_payload(&by_writer),
+            "{base}: the RLI payload must be exactly what the writer-schema decode gives"
+        );
+        total_rows += batch.num_rows();
+        if base == V6_FAILING_HFILE {
+            failing_batch = Some(batch);
+        }
+    }
+    assert!(
+        total_rows >= hfiles.len(),
+        "every v6 shard must hold at least one record; got {total_rows} over {} shards",
+        hfiles.len()
+    );
+
+    // Schema assertions on the file the Java test actually fails on.
+    let batch = failing_batch.expect("the failing shard was read");
+    let names: Vec<String> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    println!("v6_under_current failing_file={V6_FAILING_HFILE} columns={names:?}");
+
+    // The reader schema's twelve top-level fields, `SecondaryIndexMetadata`
+    // included — the one the writer schema has no counterpart for.
+    for expected in [
+        "_hoodie_commit_time",
+        "_hoodie_commit_seqno",
+        "_hoodie_record_key",
+        "_hoodie_partition_path",
+        "_hoodie_file_name",
+        "key",
+        "type",
+        "filesystemMetadata",
+        "BloomFilterMetadata",
+        "ColumnStatsMetadata",
+        "recordIndexMetadata",
+        "SecondaryIndexMetadata",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "output schema must carry `{expected}`; got {names:?}"
+        );
+    }
+
+    // The union resolved by branch NAME and widened to the reader's fourteen.
+    for field in ["minValue", "maxValue"] {
+        let branches = union_branch_names(&batch, field);
+        assert_eq!(
+            branches.len(),
+            14,
+            "ColumnStatsMetadata.{field} must carry the reader schema's 14 branches; got {branches:?}"
+        );
+        for tail in ["LocalDateWrapper", "ArrayWrapper"] {
+            assert!(
+                branches.iter().any(|b| b.ends_with(tail)),
+                "the appended branch {tail} must be present in {field}; got {branches:?}"
+            );
+        }
+    }
+
+    // The fields Avro fills from their declared defaults.
+    let cs_children = struct_child_names(&batch, "ColumnStatsMetadata");
+    for expected in ["isTightBound", "valueType"] {
+        assert!(
+            cs_children.iter().any(|n| n == expected),
+            "ColumnStatsMetadata.{expected} must be filled from its default; got {cs_children:?}"
+        );
+    }
+    let rim_children = struct_child_names(&batch, "recordIndexMetadata");
+    assert!(
+        rim_children.iter().any(|n| n == "position"),
+        "recordIndexMetadata.position must be filled from its default; got {rim_children:?}"
+    );
+
+    // The VALUES of the default fills, on the real artefact rather than only in a
+    // synthetic unit test. `ColumnStatsMetadata` is null on every record_index
+    // row, so `isTightBound` is asserted on the file whose column stats are
+    // present — none here — and on the struct's own validity instead: what must
+    // hold is that `isTightBound` is a non-nullable boolean carrying `false`
+    // wherever the struct itself is valid, which is what Java's resolver writes.
+    let cs = batch
+        .column_by_name("ColumnStatsMetadata")
+        .expect("ColumnStatsMetadata column")
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("ColumnStatsMetadata is a struct");
+    let tight = cs
+        .column_by_name("isTightBound")
+        .expect("isTightBound field")
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("isTightBound is boolean");
+    for i in 0..tight.len() {
+        assert!(
+            cs.is_null(i) || (!tight.is_null(i) && !tight.value(i)),
+            "row {i}: isTightBound must be the Avro default `false`, not null"
+        );
+    }
+    // `position` is nullable with `default: null`, so Java fills it with null.
+    let rim = batch
+        .column_by_name("recordIndexMetadata")
+        .expect("recordIndexMetadata column")
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("recordIndexMetadata is a struct");
+    let position = rim.column_by_name("position").expect("position field");
+    for i in 0..position.len() {
+        assert!(
+            rim.is_null(i) || position.is_null(i),
+            "row {i}: position must be the Avro default `null`"
+        );
+    }
+    // `SecondaryIndexMetadata` is nullable with `default: null`.
+    let si = batch
+        .column_by_name("SecondaryIndexMetadata")
+        .expect("SecondaryIndexMetadata column");
+    for i in 0..si.len() {
+        assert!(
+            si.is_null(i),
+            "row {i}: SecondaryIndexMetadata must be the Avro default `null`"
+        );
+    }
+}
+
+/// The path the failing Java test actually takes: `readSliceWithFilter` with a
+/// key set. Two keys the partition holds plus one it does not must return
+/// exactly the two.
+#[test]
+fn v6_record_index_key_lookup_returns_only_the_keys_that_exist() {
+    let (hfiles, _) = v6_record_index_files();
+    let mdt = v6_mdt_path();
+    let reader_schema = current_metadata_reader_schema_json();
+
+    // A v6 shard here holds a single record, so the two present keys come from
+    // two shards; each lookup is asserted against its own shard.
+    let mut present: Vec<(String, String)> = Vec::new();
+    for base in &hfiles {
+        let all = read_file_group_v2(&v6_request(&mdt, base, &[], &v6_writer_schema_json(base)))
+            .unwrap_or_else(|e| panic!("{base} writer-schema read: {e}"));
+        for key in keys_of(&all) {
+            present.push((base.clone(), key));
+        }
+    }
+    present.sort();
+    assert!(
+        present.len() >= 2,
+        "need two record keys across the v6 shards; got {present:?}"
+    );
+    println!("v6_lookup present={present:?}");
+
+    let absent = "zzz-no-such-record-key";
+    let mut matched = 0usize;
+    for base in &hfiles {
+        let mut lookup: Vec<&str> = present
+            .iter()
+            .filter(|(b, _)| b == base)
+            .map(|(_, k)| k.as_str())
+            .chain(std::iter::once(absent))
+            .collect();
+        // Sorted and deduplicated, as Java's caller hands them over.
+        lookup.sort();
+        lookup.dedup();
+        let expected: Vec<String> = present
+            .iter()
+            .filter(|(b, _)| b == base)
+            .map(|(_, k)| k.clone())
+            .collect();
+
+        let mut req = v6_request(&mdt, base, &[], &reader_schema);
+        req.lookup_keys = Some(lookup.as_slice());
+        let batch = read_file_group_v2(&req)
+            .unwrap_or_else(|e| panic!("{base}: v6 key lookup under the current schema: {e}"));
+        let mut got = keys_of(&batch);
+        got.sort();
+        println!("v6_lookup base={base} asked={lookup:?} got={got:?}");
+        assert_eq!(
+            got, expected,
+            "{base}: exactly the keys that exist, and never the absent one"
+        );
+        matched += got.len();
+    }
+    assert_eq!(
+        matched,
+        present.len(),
+        "every present key must be reachable by an exact-key lookup"
+    );
+}
+
+/// The log-block half: a v6 slice with a base file AND a log file, read under
+/// the current schema.
+///
+/// A log block carries its own writer schema, and Java reads it exactly as it
+/// reads the base file — `HoodieAvroDataBlock:196` sees a reader record with
+/// more fields than the writer's, takes the rewrite branch, and
+/// `HoodieAvroUtils.rewriteRecordWithNewSchema` matches the union by branch name
+/// and fills `isTightBound` from its `false` default. Nothing less than that
+/// reads this block.
+#[test]
+fn v6_record_index_slice_with_a_log_file_reads_under_the_current_metadata_schema() {
+    let (_, logs) = v6_record_index_files();
+    for expected in [V6_LOG_FILE, V6_DELETE_LOG_FILE] {
+        assert!(
+            logs.iter().any(|l| l == expected),
+            "the fixture must carry {expected}; got {logs:?}"
+        );
+    }
+    let mdt = v6_mdt_path();
+    let reader_schema = current_metadata_reader_schema_json();
+
+    // A log file whose block holds records: the base row plus one the log adds.
+    let log_names = [V6_LOG_FILE];
+    let base_only = read_file_group_v2(&v6_request(
+        &mdt,
+        V6_BASE_WITH_LOG_HFILE,
+        &[],
+        &v6_writer_schema_json(V6_BASE_WITH_LOG_HFILE),
+    ))
+    .expect("writer-schema base-only read");
+    let mut base_keys = keys_of(&base_only);
+    base_keys.sort();
+
+    let batch = read_file_group_v2(&v6_request(
+        &mdt,
+        V6_BASE_WITH_LOG_HFILE,
+        &log_names,
+        &reader_schema,
+    ))
+    .unwrap_or_else(|e| panic!("v6 base+log under the current schema must read: {e}"));
+
+    let mut keys = keys_of(&batch);
+    keys.sort();
+    println!(
+        "v6_base_plus_log base_keys={base_keys:?} merged_keys={keys:?} payload={:?}",
+        record_index_payload(&batch)
+    );
+    assert!(
+        keys.len() > base_keys.len(),
+        "the log block must contribute records the base file does not have; \
+         base={base_keys:?} merged={keys:?}"
+    );
+    for key in &base_keys {
+        assert!(
+            keys.contains(key),
+            "the base row {key:?} must survive the merge; got {keys:?}"
+        );
+    }
+    assert_eq!(
+        keys.iter().collect::<HashSet<_>>().len(),
+        keys.len(),
+        "merge keeps one row per key"
+    );
+
+    // The log-contributed rows arrive in the reader schema, not the writer's.
+    assert!(
+        batch.column_by_name("SecondaryIndexMetadata").is_some(),
+        "the merged output must carry the reader schema's added column"
+    );
+    for field in ["minValue", "maxValue"] {
+        assert_eq!(
+            union_branch_names(&batch, field).len(),
+            14,
+            "the merged output carries the reader schema's {field} union"
+        );
+    }
+    assert!(
+        struct_child_names(&batch, "ColumnStatsMetadata")
+            .iter()
+            .any(|n| n == "isTightBound"),
+        "the merged output carries the default-filled `isTightBound`"
+    );
+    assert!(
+        struct_child_names(&batch, "recordIndexMetadata")
+            .iter()
+            .any(|n| n == "position"),
+        "the merged output carries the default-filled `position`"
+    );
+
+    // Every merged row is a real RLI record, not a shell the projection made.
+    // `fileId` is empty here because this fixture stores the location UUID-encoded
+    // (`fileIdEncoding = 0`, so the id lives in fileIdHighBits/LowBits/fileIndex),
+    // which is exactly why `instantTime` is the field asserted on.
+    for (key, file_id, instant) in record_index_payload(&batch) {
+        assert!(
+            instant > 0,
+            "row {key:?} lost its RLI payload: fileId={file_id:?} instantTime={instant}"
+        );
+    }
+
+    // The lookup shape the Java caller uses, on the merged slice: the two keys
+    // the slice holds plus one it does not.
+    assert!(keys.len() >= 2, "need two keys on the merged slice");
+    let absent = "zzz-no-such-record-key";
+    let mut lookup: Vec<&str> = keys
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(absent))
+        .collect();
+    lookup.sort();
+    let mut req = v6_request(&mdt, V6_BASE_WITH_LOG_HFILE, &log_names, &reader_schema);
+    req.lookup_keys = Some(lookup.as_slice());
+    let looked_up = read_file_group_v2(&req)
+        .unwrap_or_else(|e| panic!("v6 base+log key lookup under the current schema: {e}"));
+    let mut got = keys_of(&looked_up);
+    got.sort();
+    println!("v6_base_plus_log lookup asked={lookup:?} got={got:?}");
+    assert_eq!(got, keys, "exactly the keys the slice holds");
+
+    // A log file that is a DELETE block against the base row: nothing to
+    // resolve, and the row is gone rather than the read failing.
+    let delete_logs = [V6_DELETE_LOG_FILE];
+    let deleted = read_file_group_v2(&v6_request(
+        &mdt,
+        V6_BASE_WITH_DELETE_LOG_HFILE,
+        &delete_logs,
+        &reader_schema,
+    ))
+    .unwrap_or_else(|e| panic!("v6 base+delete-log under the current schema must read: {e}"));
+    println!(
+        "v6_delete_log base_rows={} merged_rows={}",
+        read_file_group_v2(&v6_request(
+            &mdt,
+            V6_BASE_WITH_DELETE_LOG_HFILE,
+            &[],
+            &reader_schema
+        ))
+        .expect("base-only read")
+        .num_rows(),
+        deleted.num_rows()
+    );
+    assert_eq!(
+        deleted.num_rows(),
+        0,
+        "the delete block removes the base row"
+    );
+    assert!(
+        deleted
+            .schema()
+            .field_with_name("SecondaryIndexMetadata")
+            .is_ok(),
+        "even an empty result carries the reader schema"
+    );
+}
+
+/// The other side of the contract: a slice whose writer schema already IS the
+/// reader schema must come out exactly as it did before resolution was armed.
+/// Read on the committed v8 fixture, every `record_index` shard, in this same
+/// test run — with the file's own schema as the requested schema (the FFI path,
+/// where resolution is now armed) and with none at all (the path that never had
+/// it). The two batches must be equal, values and schema alike.
+#[test]
+fn v8_record_index_read_is_unchanged_when_the_writer_schema_is_the_reader_schema() {
+    let (hfiles, _) = record_index_files();
+    let mdt = mdt_path();
+    let schema = mdt_record_schema_json();
+    for base in &hfiles {
+        let with_schema = read_file_group_v2(&FileGroupRequest {
+            data_schema_json: &schema,
+            ..v6_request(&mdt, base, &[], "")
+        })
+        .unwrap_or_else(|e| panic!("{base}: v8 read with its own schema requested: {e}"));
+        let without_schema = read_file_group_v2(&v6_request(&mdt, base, &[], ""))
+            .unwrap_or_else(|e| panic!("{base}: v8 read with no requested schema: {e}"));
+        assert_eq!(
+            with_schema, without_schema,
+            "v8 shard {base}: arming reader-schema resolution must not change a byte \
+             when the writer schema already equals the reader schema"
+        );
+    }
+    println!(
+        "v8_unchanged shards={} (identical with and without a requested schema)",
+        hfiles.len()
+    );
+}

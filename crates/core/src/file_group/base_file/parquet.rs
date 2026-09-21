@@ -358,6 +358,7 @@ impl BaseFileReader for ParquetBaseFileReader {
     fn read_schema<'a>(
         &'a self,
         relative_path: &'a str,
+        _options: BaseFileReadOptions,
     ) -> BoxFuture<'a, Result<arrow_schema::SchemaRef>> {
         Box::pin(async move { Ok(Arc::new(self.get_schema(relative_path).await?)) })
     }

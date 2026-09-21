@@ -142,6 +142,35 @@ pub struct BaseFileReadOptions {
     /// one: pruning removes base rows before a log merge could have updated them
     /// into a match. The caller installs it only when that cannot happen.
     pub row_group_selector: Option<RowGroupSelector>,
+    /// Avro JSON of the schema the file's records must be RESOLVED to as they
+    /// are decoded — Avro's reader schema, against the file's own writer schema.
+    ///
+    /// This is what Java does for every metadata-table read
+    /// (`GenericDatumReader(writerSchema, readerSchema)` in
+    /// `HoodieNativeAvroHFileReader`): a union branch is matched by its full
+    /// name rather than by position, and a reader field the writer never wrote
+    /// arrives from its declared Avro default. Neither is expressible after the
+    /// fact in Arrow, which is why it has to be handed to the decoder rather
+    /// than applied to the decoded batch.
+    ///
+    /// One divergence from Java, from `arrow-avro` and not from this crate: a
+    /// reader field the writer never wrote that declares NO default is refused by
+    /// Java (Avro requires the default, `Resolver.RecordAdjust`) whatever its
+    /// nullability, but `arrow-avro` accepts it when it is a null-first union,
+    /// reads it as NULL, and stamps a `"null"` default the schema never declared.
+    /// A null-second union or a non-union field is refused, as in Java. Hudi's
+    /// own Avro conversion declares `"default": null` on every nullable column,
+    /// so schemas it writes never reach the divergent case. Pinned by
+    /// `pins_that_a_null_first_reader_only_field_without_a_default_resolves_to_null`
+    /// (`log_file::avro`), so an `arrow-avro` upgrade that changes it is visible.
+    ///
+    /// Only the HFile reader honors this; Parquet and Lance ignore it (their
+    /// files carry no Avro writer schema to resolve from). When it is `None`,
+    /// or when it is the file's own writer schema verbatim, the file is decoded
+    /// exactly as before — building a decoder WITH a reader schema costs about
+    /// 380us against 154us without, per batch rebuild, so the identical case is
+    /// not made to pay for it.
+    pub reader_schema_json: Option<String>,
 }
 
 // `row_filter` holds a closure, which has no `Debug`. Report whether one is set
@@ -156,6 +185,7 @@ impl std::fmt::Debug for BaseFileReadOptions {
             .field("row_filter", &self.row_filter.is_some())
             .field("row_index_column", &self.row_index_column)
             .field("row_group_selector", &self.row_group_selector.is_some())
+            .field("reader_schema_json", &self.reader_schema_json.is_some())
             .finish()
     }
 }
@@ -200,6 +230,13 @@ impl BaseFileReadOptions {
     /// Sets the known base-file size in bytes.
     pub fn with_known_file_size(mut self, size: u64) -> Self {
         self.known_file_size = Some(size);
+        self
+    }
+
+    /// Resolves the file's records to `reader_schema_json` as they are decoded.
+    /// See [`Self::reader_schema_json`].
+    pub fn with_reader_schema_json(mut self, reader_schema_json: impl Into<String>) -> Self {
+        self.reader_schema_json = Some(reader_schema_json.into());
         self
     }
 
@@ -280,14 +317,30 @@ pub trait BaseFileReader: Send + Sync {
     /// metadata alone should override it: the caller wants the schema in order to
     /// decide what to read next, so the read that follows is a second open, and
     /// only the override keeps this one from setting up a decode nobody polls.
+    ///
+    /// `options` is the same options the read that follows will use, because the
+    /// answer depends on them: with a
+    /// [`reader_schema_json`](BaseFileReadOptions::reader_schema_json) the HFile
+    /// reader reports the RESOLVED schema, which is the one its batches will
+    /// carry. The answer is the file's schema, not the read's: a projection or a
+    /// row-index column changes what the read returns, not what the file holds,
+    /// so the default clears both before opening the stream, and an override must
+    /// not consult them either. The caller intersects this schema with the one it
+    /// requires, so a narrowed answer would silently drop columns from the merge.
+    /// Everything else passes through, since some of it (a key predicate, a known
+    /// file size) decides how cheaply the file is opened.
     fn read_schema<'a>(
         &'a self,
         relative_path: &'a str,
+        options: BaseFileReadOptions,
     ) -> BoxFuture<'a, Result<arrow_schema::SchemaRef>> {
         Box::pin(async move {
-            let stream = self
-                .read_stream(relative_path, BaseFileReadOptions::new())
-                .await?;
+            let options = BaseFileReadOptions {
+                projection: None,
+                row_index_column: None,
+                ..options
+            };
+            let stream = self.read_stream(relative_path, options).await?;
             Ok(stream.schema().clone())
         })
     }
@@ -360,5 +413,72 @@ mod tests {
         let storage = test_storage();
         let result = create_base_file_reader(&storage, &BaseFileFormatValue::Lance);
         assert!(result.is_ok());
+    }
+
+    /// The default `read_schema` reports the file's schema whatever the options
+    /// ask the READ to do: a `read_stream` that honours a projection or appends a
+    /// row-index column must not shrink or widen the answer, while the reader
+    /// schema, which does decide the schema, still reaches it.
+    #[tokio::test]
+    async fn the_default_read_schema_ignores_the_projection_and_row_index_column() {
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Mutex;
+
+        /// A two-column file whose stream honours every schema-changing option,
+        /// and remembers the options it was opened with.
+        struct Honouring(Mutex<Option<BaseFileReadOptions>>);
+        impl BaseFileReader for Honouring {
+            fn read_stream<'a>(
+                &'a self,
+                _relative_path: &'a str,
+                options: BaseFileReadOptions,
+            ) -> BoxFuture<'a, Result<BaseFileStream>> {
+                Box::pin(async move {
+                    let mut fields: Vec<Field> = ["a", "b"]
+                        .into_iter()
+                        .filter(|name| {
+                            options
+                                .projection
+                                .as_ref()
+                                .is_none_or(|p| p.iter().any(|c| c == name))
+                        })
+                        .map(|name| Field::new(name, DataType::Int64, true))
+                        .collect();
+                    if let Some(row_index) = &options.row_index_column {
+                        fields.push(Field::new(row_index, DataType::Int64, false));
+                    }
+                    *self.0.lock().unwrap() = Some(options);
+                    Ok(BaseFileStream::new(
+                        Arc::new(Schema::new(fields)),
+                        futures::stream::empty().boxed(),
+                    ))
+                })
+            }
+
+            fn get_metadata_and_stats<'a>(
+                &'a self,
+                _relative_path: &'a str,
+                _table_schema: &'a arrow_schema::Schema,
+            ) -> BoxFuture<'a, Result<(FileMetadata, StatisticsContainer)>> {
+                unimplemented!("not consulted by read_schema")
+            }
+        }
+
+        let reader = Honouring(Mutex::new(None));
+        let mut options = BaseFileReadOptions::new()
+            .with_projection(["a"])
+            .with_reader_schema_json("{}");
+        options.row_index_column = Some("_row_index".to_string());
+        options.key_predicate = Some(KeyPredicate::Keys(vec!["k".to_string()]));
+        let schema = reader.read_schema("f", options).await.unwrap();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["a", "b"], "the file's own columns, all of them");
+
+        let seen = reader.0.lock().unwrap().take().unwrap();
+        assert_eq!(seen.reader_schema_json.as_deref(), Some("{}"));
+        assert!(
+            seen.key_predicate.is_some(),
+            "options that do not shape the schema are passed through untouched"
+        );
     }
 }

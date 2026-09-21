@@ -258,7 +258,18 @@ pub fn read_file_group_v2(req: &FileGroupRequest<'_>) -> Result<RecordBatch, Str
         );
         schema_handler = schema_handler
             .with_data_schema(schema.clone())
-            .with_requested_schema(schema);
+            .with_requested_schema(schema)
+            // The same schema in Avro-land. That is what makes the read do what
+            // Java's `GenericDatumReader(writerSchema, readerSchema)` does
+            // (`HoodieNativeAvroHFileReader:453`): resolve the base HFile and
+            // every log block against THIS schema at decode time, matching union
+            // branches by name and filling reader-only fields from their Avro
+            // defaults. Without it a file written by an older Hudi (a
+            // table-version-6 metadata table, say) decodes in its own writer
+            // schema and then has to be bent to this one in Arrow, which cannot
+            // widen a union and has no notion of an Avro field default.
+            .with_data_schema_json(req.data_schema_json.to_string())
+            .with_requested_schema_json(req.data_schema_json.to_string());
     }
 
     let table_path = req.table_path.to_string();

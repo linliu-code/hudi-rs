@@ -30,7 +30,6 @@ use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::delete_record_list_schema_json;
 use crate::schema::extended_promotion::record_needs_rewrite_for_extended_promotion;
 use crate::schema::parquet_list_norm::normalize_parquet_metadata;
-use crate::schema::resolver::avro_json_to_arrow_schema;
 use crate::storage::RowFilterBuilder;
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -296,6 +295,23 @@ impl Decoder {
         Ok(())
     }
 
+    /// The registration for `writer_schema_json`, built once per writer schema
+    /// rather than once per block. Compared, not hashed: a block with a
+    /// different schema must not reuse another's fingerprint. One entry, since
+    /// a log file normally carries one schema and a file that alternates simply
+    /// re-registers rather than growing a map.
+    fn registered_for(&self, writer_schema_json: &str) -> Result<RegisteredWriterSchema> {
+        let mut slot = self.registered.borrow_mut();
+        match slot.as_ref() {
+            Some((json, reg)) if json == writer_schema_json => Ok(reg.clone()),
+            _ => {
+                let reg = RegisteredWriterSchema::new(writer_schema_json)?;
+                *slot = Some((writer_schema_json.to_string(), reg.clone()));
+                Ok(reg)
+            }
+        }
+    }
+
     /// A decoder for records written with `writer_schema_json`, resolved up to
     /// the reader schema when the block's header permits it.
     ///
@@ -342,8 +358,52 @@ impl Decoder {
                         "log block rewritten rather than resolved: its schema differs from the \
                          table's in a way Avro does not define a promotion for"
                     );
-                    let target = avro_json_to_arrow_schema(required_json)?;
-                    (None, Some(Arc::new(target)))
+                    // Java's rewrite (`HoodieAvroUtils.rewriteRecordWithNewSchema`,
+                    // reached from `HoodieAvroDataBlock:196`) fills a reader field the
+                    // writer never wrote from that field's Avro DEFAULT. Nothing in
+                    // an Arrow schema converted from a reader schema alone says what
+                    // that default is, so the rewrite goes first through the required
+                    // schema with the reader schema's defaults stamped on it, and then
+                    // through the plain required schema, which is what the merge
+                    // downstream expects (the two differ only by that metadata, so
+                    // the second step converts nothing).
+                    //
+                    // The defaults are read from the reader schema JSON rather than
+                    // from a schema `arrow-avro` resolved against the writer: it
+                    // refuses to resolve exactly the evolutions this branch exists
+                    // for (`int -> string` is one), and where it does resolve, a
+                    // named type referenced after the record that defines it comes
+                    // back in the writer's shape, without the fields the evolution
+                    // added. Either way a reader-only field would read as NULL, or
+                    // fail the read, where the schema declares its value.
+                    //
+                    // Through the arrow-avro decoder rather than
+                    // `resolver::avro_json_to_arrow_schema` -> `avro_to_arrow`, which
+                    // still `todo!()`s on `AvroSchema::Ref` (OI-10). The metadata
+                    // table's own record schema is full of refs, and since the JNI
+                    // path now supplies a reader schema this line is on it — a
+                    // `todo!()` here would be a panic at the JNI boundary, not an
+                    // error.
+                    //
+                    // Both targets go through `normalize_utc_timezone_spelling`
+                    // for the same reason `prepare_required_schema` does: they
+                    // come off the arrow-avro decoder, which spells a UTC zone
+                    // `+00:00`, and they have to agree with `required_schema` and
+                    // with the base batches, which spell it `UTC`. Arrow compares
+                    // timezones as strings, so without this a log batch and a
+                    // base batch of the same table are judged to have different
+                    // types.
+                    let required_converted =
+                        crate::ffi_support::arrow_schema_from_avro_json(required_json)?;
+                    let required_arrow: Arc<Schema> = Arc::new(
+                        crate::schema::normalize_utc_timezone_spelling(&required_converted),
+                    );
+                    let defaults_carrier: Arc<Schema> =
+                        Arc::new(crate::schema::avro_schema_utils::with_avro_defaults(
+                            &required_arrow,
+                            required_json,
+                        )?);
+                    (None, Some((defaults_carrier, required_arrow)))
                 } else {
                     (Some(required_json), None)
                 }
@@ -351,28 +411,16 @@ impl Decoder {
             None => (None, None),
         };
 
-        // Registered once per writer schema rather than once per block. Compared,
-        // not hashed: a block with a different schema must not reuse another's
-        // fingerprint. One entry, since a log file normally carries one schema and
-        // a file that alternates simply re-registers rather than growing a map.
-        let registered = {
-            let mut slot = self.registered.borrow_mut();
-            match slot.as_ref() {
-                Some((json, reg)) if json == writer_schema_json => reg.clone(),
-                _ => {
-                    let reg = RegisteredWriterSchema::new(writer_schema_json)?;
-                    *slot = Some((writer_schema_json.to_string(), reg.clone()));
-                    reg
-                }
-            }
-        };
+        let registered = self.registered_for(writer_schema_json)?;
         let mut decoder = AvroBlockDecoder::try_new_with_registered(
             &registered,
             reader_schema_json,
             self.batch_size,
         )?;
-        if let Some(rewrite_to) = rewrite_to {
-            decoder = decoder.with_rewrite_to(rewrite_to);
+        if let Some((defaults_carrier, required_arrow)) = rewrite_to {
+            decoder = decoder
+                .with_rewrite_to(defaults_carrier)
+                .with_rewrite_to(required_arrow);
         }
         Ok(decoder)
     }
@@ -656,7 +704,7 @@ mod tests {
     use apache_avro::types::Record as AvroRecord;
     use apache_avro::types::Value as AvroValue;
     use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use parquet::arrow::ArrowWriter;
     use std::io::{BufReader, Cursor};
     use std::sync::Arc;
@@ -1361,5 +1409,393 @@ mod tests {
                 &header,
             )
             .expect("the same block without a predicate decodes");
+    }
+
+    /// The log rewrite path's targets must spell a UTC timestamp zone `UTC`, not
+    /// `+00:00`.
+    ///
+    /// The required target comes off the arrow-avro conversion, which spells that
+    /// zone as the offset, while `required_schema` and every parquet-derived base
+    /// batch spell it `UTC`; the defaults carrier is stamped onto that same
+    /// normalised schema. Arrow compares timezones as strings, so a target left
+    /// unnormalised makes a log batch and a base batch of the same table
+    /// disagree by type. The rewrite branch is selected by giving the reader
+    /// schema one more field than the writer's, which is what Java's
+    /// `recordNeedsRewriteForExtendedAvroTypePromotion` keys on
+    /// (`HoodieAvroUtils.java:1461`).
+    #[test]
+    fn the_log_rewrite_targets_spell_a_utc_timestamp_zone_utc() -> Result<()> {
+        let writer_schema_json = r#"{
+            "type": "record",
+            "name": "TzRecord",
+            "fields": [
+                {"name": "id", "type": "long"},
+                {"name": "ts", "type": {"type": "long", "logicalType": "timestamp-micros"}}
+            ]
+        }"#;
+        // One extra field, so `record_needs_rewrite_for_extended_promotion` is
+        // true and the decoder takes the rewrite branch rather than resolving.
+        let reader_schema_json = r#"{
+            "type": "record",
+            "name": "TzRecord",
+            "fields": [
+                {"name": "id", "type": "long"},
+                {"name": "ts", "type": {"type": "long", "logicalType": "timestamp-micros"}},
+                {"name": "added", "type": ["null", "string"], "default": null}
+            ]
+        }"#;
+
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(reader_schema_json.to_string()));
+        let avro = decoder.avro_decoder_for(writer_schema_json, &HashMap::new())?;
+
+        let targets = avro.rewrite_targets();
+        assert_eq!(
+            targets.len(),
+            2,
+            "the rewrite runs through the defaults carrier and then the required schema"
+        );
+        for (i, target) in targets.iter().enumerate() {
+            let ts = target.field_with_name("ts").expect("ts field");
+            assert_eq!(
+                ts.data_type(),
+                &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                "rewrite target {i} must spell the zone `UTC`, got {:?}",
+                ts.data_type()
+            );
+        }
+        // The first target is the defaults carrier; the last is the plain
+        // required conversion. Both carry the reader-only field.
+        assert!(
+            targets[0].field_with_name("added").is_ok(),
+            "the defaults carrier carries the reader-only field"
+        );
+        Ok(())
+    }
+
+    /// One `{id: 1, num: 7}` record written as `{id: long, num: int}`, decoded
+    /// against `reader_json` through the log rewrite path, with the rewrite chain
+    /// the decoder was built with.
+    fn decode_one_int_num_record_against(
+        reader_json: &str,
+    ) -> Result<(RecordBatch, Vec<arrow_schema::SchemaRef>)> {
+        let writer_json = r#"{"type":"record","name":"R","fields":[
+            {"name":"id","type":"long"},
+            {"name":"num","type":"int"}
+        ]}"#;
+        // The premise of every caller: `num` went `int -> string`, which Avro
+        // defines no promotion for, so resolving this writer is refused.
+        assert!(
+            AvroBlockDecoder::try_new_with_reader(writer_json, Some(reader_json), 1).is_err(),
+            "the test needs an evolution arrow-avro cannot resolve"
+        );
+        let writer_schema = apache_avro::Schema::parse_str(writer_json)?;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put("id", 1i64);
+        record.put("num", 7i32);
+        let body = to_avro_datum(&writer_schema, record)?;
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(reader_json.to_string()));
+
+        let mut batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+        assert_eq!(batches.num_data_batches(), 1);
+        let batch = batches.data_batches.remove(0);
+        let num = batch
+            .column_by_name("num")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("num promoted to string")
+            .value(0)
+            .to_string();
+        assert_eq!(num, "7");
+
+        let avro = decoder.avro_decoder_for(writer_json, &header)?;
+        Ok((batch, avro.rewrite_targets().to_vec()))
+    }
+
+    /// Two targets, the last of them the plain required schema: the rewrite runs
+    /// through a schema carrying the defaults first.
+    fn assert_rewrite_chain_carries_defaults(targets: &[arrow_schema::SchemaRef]) {
+        assert_eq!(
+            targets.len(),
+            2,
+            "an unresolvable writer must still rewrite through a schema carrying the defaults"
+        );
+        assert!(
+            targets[1]
+                .fields()
+                .iter()
+                .all(|f| f.metadata().get("avro.field.default").is_none()),
+            "the last target is the plain required schema"
+        );
+    }
+
+    /// A nullable reader-only field takes its declared Avro DEFAULT on the log
+    /// rewrite path even when the writer cannot be resolved against the reader.
+    ///
+    /// The rewrite used to take its defaults only from a schema resolved against
+    /// the writer, and arrow-avro refuses to resolve exactly the evolutions the
+    /// rewrite branch exists for. With no resolved schema it fell back to the
+    /// plain required schema, which carries no default metadata, so `tag` came
+    /// back NULL instead of `"dflt"` with nothing above `debug` to show for it.
+    /// The defaults now come from the reader schema itself.
+    #[test]
+    fn a_log_rewrite_that_cannot_resolve_fills_a_nullable_default_rather_than_null() -> Result<()> {
+        let (batch, targets) = decode_one_int_num_record_against(
+            r#"{"type":"record","name":"R","fields":[
+                {"name":"id","type":"long"},
+                {"name":"num","type":"string"},
+                {"name":"tag","type":["string","null"],"default":"dflt"},
+                {"name":"note","type":["null","string"],"default":null}
+            ]}"#,
+        )?;
+        let tag = batch
+            .column_by_name("tag")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("tag is string");
+        assert!(!tag.is_null(0), "tag must take its default, not NULL");
+        assert_eq!(tag.value(0), "dflt");
+        assert!(
+            batch.column_by_name("note").unwrap().is_null(0),
+            "a declared null default stays null"
+        );
+        // Checked after the values, so a regression reports the wrong value first.
+        assert_rewrite_chain_carries_defaults(&targets);
+        assert_eq!(
+            targets[0]
+                .field_with_name("tag")
+                .expect("tag")
+                .metadata()
+                .get("avro.field.default")
+                .map(String::as_str),
+            Some("\"dflt\""),
+            "the first target is the one carrying the defaults"
+        );
+        Ok(())
+    }
+
+    /// The non-nullable sibling of the test above: with no carrier for the
+    /// default, the same fallback failed the whole read with "non-nullable column
+    /// 'is_active' absent from the source" although the schema declares what the
+    /// value is.
+    #[test]
+    fn a_log_rewrite_that_cannot_resolve_fills_a_non_nullable_default() -> Result<()> {
+        let (batch, targets) = decode_one_int_num_record_against(
+            r#"{"type":"record","name":"R","fields":[
+                {"name":"id","type":"long"},
+                {"name":"num","type":"string"},
+                {"name":"is_active","type":"boolean","default":true}
+            ]}"#,
+        )?;
+        let is_active = batch
+            .column_by_name("is_active")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .expect("is_active is boolean");
+        assert!(is_active.value(0), "is_active takes its default, true");
+        // Checked after the values, so a regression reports the wrong value first.
+        assert_rewrite_chain_carries_defaults(&targets);
+        Ok(())
+    }
+
+    /// A reader-only field NESTED in a record the writer did write takes its
+    /// default on the same unresolvable rewrite. The enclosing column is declared
+    /// `"default": null`, which is how every nullable record column is declared,
+    /// so the defaults have to be found inside it rather than only at the top.
+    #[test]
+    fn a_log_rewrite_that_cannot_resolve_fills_a_nested_default() -> Result<()> {
+        let writer_json = r#"{"type":"record","name":"R","fields":[
+            {"name":"num","type":"int"},
+            {"name":"s","type":["null",{"type":"record","name":"S","fields":[
+                {"name":"y","type":"string"}
+            ]}],"default":null}
+        ]}"#;
+        let reader_json = r#"{"type":"record","name":"R","fields":[
+            {"name":"num","type":"string"},
+            {"name":"s","type":["null",{"type":"record","name":"S","fields":[
+                {"name":"x","type":"int","default":5},
+                {"name":"y","type":"string"}
+            ]}],"default":null}
+        ]}"#;
+        assert!(
+            AvroBlockDecoder::try_new_with_reader(writer_json, Some(reader_json), 1).is_err(),
+            "the test needs an evolution arrow-avro cannot resolve"
+        );
+        let writer_schema = apache_avro::Schema::parse_str(writer_json)?;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put("num", 7i32);
+        record.put(
+            "s",
+            AvroValue::Union(
+                1,
+                Box::new(AvroValue::Record(vec![(
+                    "y".to_string(),
+                    AvroValue::String("why".to_string()),
+                )])),
+            ),
+        );
+        let body = to_avro_datum(&writer_schema, record)?;
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+        let batches = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(reader_json.to_string()))
+            .decode_avro_record_content(buf.as_slice(), &header)?;
+
+        let s = batches.data_batches[0]
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("s is a struct");
+        let x = s
+            .column_by_name("x")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .expect("s.x is int");
+        assert_eq!(x.value(0), 5, "s.x takes its default");
+        let y = s
+            .column_by_name("y")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("s.y is string");
+        assert_eq!(y.value(0), "why");
+        Ok(())
+    }
+
+    /// A reader-only field inside a named record that is REFERENCED after the
+    /// record defining it closes takes its default, on a rewrite whose writer
+    /// arrow-avro can resolve.
+    ///
+    /// arrow-avro's resolution re-registers such a named type in the writer's
+    /// shape, so a defaults carrier taken from it had `b` as `Struct{y}` with no
+    /// `x` and no default: the rewrite then failed the read on `b.x`. The
+    /// defaults now come from the reader schema, where `S` is whole.
+    #[test]
+    fn a_log_rewrite_fills_a_default_inside_a_named_type_referenced_later() -> Result<()> {
+        let writer_json = r#"{"type":"record","name":"R","fields":[
+            {"name":"a","type":{"type":"record","name":"A","fields":[
+                {"name":"s","type":{"type":"record","name":"S","fields":[
+                    {"name":"y","type":"string"}]}}]}},
+            {"name":"b","type":["null","S"],"default":null}
+        ]}"#;
+        let reader_json = r#"{"type":"record","name":"R","fields":[
+            {"name":"a","type":{"type":"record","name":"A","fields":[
+                {"name":"s","type":{"type":"record","name":"S","fields":[
+                    {"name":"x","type":"int","default":5},
+                    {"name":"y","type":"string"}]}}]}},
+            {"name":"b","type":["null","S"],"default":null}
+        ]}"#;
+        assert!(
+            AvroBlockDecoder::try_new_with_reader(writer_json, Some(reader_json), 1).is_ok(),
+            "the test needs a writer arrow-avro CAN resolve"
+        );
+        let writer_schema = apache_avro::Schema::parse_str(writer_json)?;
+        let s_value =
+            |y: &str| AvroValue::Record(vec![("y".to_string(), AvroValue::String(y.to_string()))]);
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put(
+            "a",
+            AvroValue::Record(vec![("s".to_string(), s_value("in a"))]),
+        );
+        record.put("b", AvroValue::Union(1, Box::new(s_value("in b"))));
+        let body = to_avro_datum(&writer_schema, record)?;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+        let batches = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(reader_json.to_string()))
+            .decode_avro_record_content(buf.as_slice(), &header)?;
+
+        let batch = &batches.data_batches[0];
+        let x_of = |s: &StructArray| {
+            s.column_by_name("x")
+                .expect("x")
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .expect("x is int")
+                .value(0)
+        };
+        let a = batch
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let a_s = a
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(x_of(a_s), 5, "a.s.x takes its default");
+        let b = batch
+            .column_by_name("b")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            x_of(b),
+            5,
+            "b.x takes its default through the later reference"
+        );
+        Ok(())
+    }
+
+    /// A default arrow-avro refuses to materialise, declared on a field the block
+    /// DID write, does not fail the rewrite: a default is read only for a field
+    /// the block never wrote. A `fixed(4)` default two bytes long is one
+    /// apache-avro accepts and arrow-avro refuses.
+    #[test]
+    fn a_log_rewrite_does_not_read_the_default_of_a_field_the_block_wrote() -> Result<()> {
+        let writer_json = r#"{"type":"record","name":"R","fields":[
+            {"name":"num","type":"int"},
+            {"name":"f","type":{"type":"fixed","name":"F","size":4}}
+        ]}"#;
+        let reader_json = r#"{"type":"record","name":"R","fields":[
+            {"name":"num","type":"string"},
+            {"name":"f","type":{"type":"fixed","name":"F","size":4},"default":"ab"}
+        ]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(writer_json)?;
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put("num", 7i32);
+        record.put("f", AvroValue::Fixed(4, vec![1, 2, 3, 4]));
+        let body = to_avro_datum(&writer_schema, record)?;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+        let batches = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(reader_json.to_string()))
+            .decode_avro_record_content(buf.as_slice(), &header)?;
+        let f = batches.data_batches[0]
+            .column_by_name("f")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+            .expect("f is fixed");
+        assert_eq!(f.value(0), [1, 2, 3, 4]);
+        Ok(())
     }
 }

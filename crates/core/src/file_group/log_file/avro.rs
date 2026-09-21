@@ -60,9 +60,9 @@ pub struct AvroBlockDecoder {
     prefix: [u8; 10],
     /// Reused across records so framing costs one copy, not one allocation.
     framed: Vec<u8>,
-    /// When set, each batch is projected to this schema after decoding. See
-    /// [`AvroBlockDecoder::with_rewrite_to`].
-    rewrite_to: Option<SchemaRef>,
+    /// Schemas each decoded batch is projected through, in order, after
+    /// decoding. See [`AvroBlockDecoder::with_rewrite_to`].
+    rewrite_to: Vec<SchemaRef>,
 }
 
 /// A writer schema that has been parsed and fingerprinted once.
@@ -168,7 +168,7 @@ impl AvroBlockDecoder {
             batch_size,
             prefix,
             framed: Vec::new(),
-            rewrite_to: None,
+            rewrite_to: Vec::new(),
         })
     }
 
@@ -190,9 +190,23 @@ impl AvroBlockDecoder {
     /// converted afterwards. Mirrors what the Java reader does when
     /// `recordNeedsRewriteForExtendedAvroTypePromotion` says so: read
     /// writer-to-writer, then promote.
+    ///
+    /// Called more than once, the schemas apply in the order they were added.
+    /// That is how a rewrite reaches a schema whose Avro DEFAULTS it needs: a
+    /// schema carrying each default as `avro.field.default` metadata goes first
+    /// (see `schema::avro_schema_utils::with_avro_defaults`), and the caller's
+    /// own target follows to strip the metadata back off.
     pub fn with_rewrite_to(mut self, schema: SchemaRef) -> Self {
-        self.rewrite_to = Some(schema);
+        self.rewrite_to.push(schema);
         self
+    }
+
+    /// The rewrite chain, in the order [`Self::flush`] applies it. Test-only:
+    /// the chain is an implementation detail of the rewrite branch, and the only
+    /// thing outside it that can observe the chain is the batch's schema.
+    #[cfg(test)]
+    pub(crate) fn rewrite_targets(&self) -> &[SchemaRef] {
+        &self.rewrite_to
     }
 
     /// Decode one record body, returning a batch once enough rows have accrued.
@@ -235,12 +249,13 @@ impl AvroBlockDecoder {
             CoreError::LogBlockError(format!("Failed to flush decoded records: {e}"))
         })?;
         let batch = batch.map(normalize_utc_timestamps).transpose()?;
-        match (batch, self.rewrite_to.as_ref()) {
-            (Some(batch), Some(target)) => {
-                crate::schema::batch_evolution::project_batch_to_schema(&batch, target).map(Some)
-            }
-            (batch, _) => Ok(batch),
+        let Some(mut batch) = batch else {
+            return Ok(None);
+        };
+        for target in &self.rewrite_to {
+            batch = crate::schema::batch_evolution::project_batch_to_schema(&batch, target)?;
         }
+        Ok(Some(batch))
     }
 }
 
@@ -508,5 +523,59 @@ mod tests {
             batch.schema().field(0).data_type(),
             &arrow_schema::DataType::Int32
         );
+    }
+
+    /// PINS arrow-avro behaviour that diverges from Java: a reader field the
+    /// writer never wrote, declared as a null-first union with NO `default`, is
+    /// resolved to NULL, and the resolved field is stamped with a
+    /// `"avro.field.default": "null"` the reader schema never declared.
+    ///
+    /// Avro's specification and Java's `Resolver.RecordAdjust` require such a
+    /// field to declare a default, and Java refuses to read without one whatever
+    /// the field's nullability. arrow-avro takes a null-first union's first branch
+    /// as an implicit default. The other shapes agree with Java and are pinned
+    /// alongside: a null-SECOND union and a non-union field without a default
+    /// are refused. See `BaseFileReadOptions::reader_schema_json`.
+    ///
+    /// If an arrow-avro upgrade starts refusing the first shape, this test fails
+    /// and the divergence note has to change with it.
+    #[test]
+    fn pins_that_a_null_first_reader_only_field_without_a_default_resolves_to_null() {
+        let writer = r#"{"type":"record","name":"r","fields":[{"name":"a","type":"long"}]}"#;
+        let reader_with = |field: &str| {
+            format!(
+                r#"{{"type":"record","name":"r","fields":[{{"name":"a","type":"long"}},{field}]}}"#
+            )
+        };
+
+        let reader = reader_with(r#"{"name":"b","type":["null","string"]}"#);
+        let mut decoder = AvroBlockDecoder::try_new_with_reader(writer, Some(&reader), 1024)
+            .expect("arrow-avro resolves a null-first reader-only field with no default");
+        decoder.decode(&[0x0E]).unwrap(); // long 7, zigzag encoded
+        let batch = decoder.flush().unwrap().expect("a batch");
+        assert!(batch.column(1).is_null(0), "and reads it as NULL");
+        assert_eq!(
+            batch
+                .schema()
+                .field(1)
+                .metadata()
+                .get("avro.field.default")
+                .map(String::as_str),
+            Some("null"),
+            "stamping a default the reader schema never declared"
+        );
+
+        for refused in [
+            r#"{"name":"c","type":["string","null"]}"#,
+            r#"{"name":"d","type":"string"}"#,
+        ] {
+            let err = AvroBlockDecoder::try_new_with_reader(writer, Some(&reader_with(refused)), 1)
+                .err()
+                .unwrap_or_else(|| panic!("{refused} must be refused"));
+            assert!(
+                err.to_string().contains("must have a default value"),
+                "{refused}: {err}"
+            );
+        }
     }
 }

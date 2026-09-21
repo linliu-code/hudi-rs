@@ -32,13 +32,23 @@
 
 use crate::Result;
 use crate::error::CoreError;
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, new_null_array};
-use arrow_schema::{DataType, FieldRef, SchemaRef, TimeUnit};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, new_empty_array, new_null_array};
+use arrow_schema::{DataType, FieldRef, SchemaRef, TimeUnit, UnionMode};
 use std::sync::Arc;
 
 /// Microseconds per millisecond — the ÷1000 factor for the NTZ (local-timestamp)
 /// micros→millis arithmetic conversion. Mirrors Java `DateTimeUtils.MICROS_PER_MILLIS`.
 const MICROS_PER_MILLIS: i64 = 1000;
+
+/// Where a field's Avro `default` is carried, as the default's raw JSON text
+/// (`"false"`, `"42"`, `"\"lorem ipsum\""`, `"null"`).
+///
+/// `arrow-avro` stamps it on a schema it produced by RESOLVING a writer schema
+/// against a reader schema, and `schema::avro_schema_utils::with_avro_defaults`
+/// stamps it from a reader schema directly; converting a reader schema on its
+/// own does not carry defaults. A reader field the writer never wrote has to
+/// come from somewhere, and Avro says it comes from this.
+pub(crate) const AVRO_FIELD_DEFAULT_KEY: &str = "avro.field.default";
 
 /// Project `batch` to `target` schema: reorder by name, null-fill missing
 /// nullable columns, evolve types. Identity-cheap when schemas already match.
@@ -52,16 +62,7 @@ pub fn project_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> Resul
     for tf in target.fields() {
         match index_of_ci(&batch_schema, tf.name())? {
             Some(idx) => columns.push(evolve_array(batch.column(idx), tf)?),
-            None => {
-                if tf.is_nullable() {
-                    columns.push(new_null_array(tf.data_type(), num_rows));
-                } else {
-                    return Err(CoreError::Schema(format!(
-                        "evolution: non-nullable column '{}' absent from source batch",
-                        tf.name()
-                    )));
-                }
-            }
+            None => columns.push(fill_absent_field(tf, num_rows, "column")?),
         }
     }
     RecordBatch::try_new(target.clone(), columns)
@@ -238,7 +239,286 @@ fn is_container(dt: &DataType) -> bool {
             | DataType::FixedSizeList(_, _)
             | DataType::Struct(_)
             | DataType::Map(_, _)
+            | DataType::Union(_, _)
     )
+}
+
+/// The value a target field takes when the source has no field of that name —
+/// Java's `HoodieAvroUtils.rewriteRecordWithNewSchemaInternal` for a reader
+/// field the writer never wrote (`HoodieAvroUtils.java:1115-1120`):
+///
+/// * an Avro `default` that is not JSON `null` → a constant column of it;
+/// * an Avro `default` of `null`, or no default on a nullable field → NULLs;
+/// * no default on a non-nullable field → a loud error, as Java throws
+///   `SchemaCompatibilityException`.
+///
+/// One deliberate divergence: Java tests `defaultVal() instanceof JsonProperties.Null`
+/// FIRST and puts `null` unconditionally, so an explicit `"default": null` on a
+/// non-nullable field writes a null into a non-nullable Avro slot. That schema is
+/// invalid Avro in the first place; here it is an error, which is the safer of the
+/// two and cannot mask a genuine schema mistake.
+///
+/// `what` names the level for the message ("column" / "struct child").
+fn fill_absent_field(target_field: &FieldRef, len: usize, what: &str) -> Result<ArrayRef> {
+    let default_json = target_field.metadata().get(AVRO_FIELD_DEFAULT_KEY);
+    match default_json {
+        Some(json) => {
+            let value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+                CoreError::Schema(format!(
+                    "evolution: {what} '{}' carries an unparseable Avro default {json:?}: {e}",
+                    target_field.name()
+                ))
+            })?;
+            if value.is_null() {
+                if target_field.is_nullable() {
+                    return Ok(new_null_array(target_field.data_type(), len));
+                }
+                return Err(CoreError::Schema(format!(
+                    "evolution: non-nullable {what} '{}' is absent and its Avro default is null",
+                    target_field.name()
+                )));
+            }
+            constant_array_from_avro_default(target_field, &value, len)
+        }
+        None if target_field.is_nullable() => Ok(new_null_array(target_field.data_type(), len)),
+        None => Err(CoreError::Schema(format!(
+            "evolution: non-nullable {what} '{}' absent from the source",
+            target_field.name()
+        ))),
+    }
+}
+
+/// A length-`len` constant array holding an Avro default value.
+///
+/// Only the scalar types an Avro default can name are built here. A default on a
+/// nested type is refused rather than guessed at: Avro spells those as JSON
+/// objects/arrays whose mapping onto an Arrow child layout is not one line, and
+/// nothing in the corpus has one — an untested builder would be worse than a
+/// clear error. A few scalar Arrow types have no arm at all and so still fall to
+/// the catch-all below: `Decimal256`, `Time32(Second)`, `Time64(Nanosecond)` and
+/// `Timestamp(Second | Nanosecond, _)`.
+fn constant_array_from_avro_default(
+    target_field: &FieldRef,
+    value: &serde_json::Value,
+    len: usize,
+) -> Result<ArrayRef> {
+    use arrow_array::types::Int32Type;
+    use arrow_array::*;
+    let name = target_field.name();
+    let bad = |expected: &str| {
+        CoreError::Schema(format!(
+            "evolution: Avro default {value} for '{name}' is not {expected}"
+        ))
+    };
+    let array: ArrayRef = match target_field.data_type() {
+        DataType::Boolean => Arc::new(BooleanArray::from(vec![
+            value.as_bool().ok_or_else(
+                || bad("a boolean")
+            )?;
+            len
+        ])),
+        DataType::Int32 => Arc::new(Int32Array::from(vec![
+            i32::try_from(
+                value.as_i64().ok_or_else(|| bad("an integer"))?
+            )
+            .map_err(|_| bad("in int32 range"))?;
+            len
+        ])),
+        DataType::Int64 => Arc::new(Int64Array::from(vec![
+            value.as_i64().ok_or_else(|| bad(
+                "an integer"
+            ))?;
+            len
+        ])),
+        DataType::Float32 => {
+            let wide = value.as_f64().ok_or_else(|| bad("a number"))?;
+            // The bounds arrow-avro's resolution applies to the same default, so
+            // the two paths refuse the same values (`as` would round a value just
+            // past `f32::MAX` down to it, or saturate a larger one to infinity).
+            if !wide.is_finite() || wide < f32::MIN as f64 || wide > f32::MAX as f64 {
+                return Err(bad("in float32 range"));
+            }
+            Arc::new(Float32Array::from(vec![wide as f32; len]))
+        }
+        DataType::Float64 => Arc::new(Float64Array::from(vec![
+            value.as_f64().ok_or_else(
+                || bad("a number")
+            )?;
+            len
+        ])),
+        DataType::Utf8 => Arc::new(StringArray::from(vec![
+            value
+                .as_str()
+                .ok_or_else(|| bad("a string"))?;
+            len
+        ])),
+        // Avro spells a `bytes`/`fixed` default as a string of code points 0-255.
+        DataType::Binary => {
+            let bytes = avro_byte_string(value, &bad)?;
+            Arc::new(BinaryArray::from(vec![bytes.as_slice(); len]))
+        }
+        DataType::Date32 => Arc::new(Date32Array::from(vec![
+            i32::try_from(
+                value.as_i64().ok_or_else(|| bad("an integer (days)"))?
+            )
+            .map_err(|_| bad("in int32 range"))?;
+            len
+        ])),
+        DataType::Time32(TimeUnit::Millisecond) => Arc::new(Time32MillisecondArray::from(vec![
+            i32::try_from(value.as_i64().ok_or_else(|| bad("an integer (millis)"))?)
+                .map_err(|_| bad("in int32 range"))?;
+            len
+        ])),
+        DataType::Time64(TimeUnit::Microsecond) => Arc::new(Time64MicrosecondArray::from(vec![
+            value.as_i64().ok_or_else(|| bad("an integer (micros)"))?;
+            len
+        ])),
+        DataType::Timestamp(TimeUnit::Millisecond, tz) => Arc::new(
+            TimestampMillisecondArray::from(vec![
+                value
+                    .as_i64()
+                    .ok_or_else(|| bad("an integer (millis)"))?;
+                len
+            ])
+            .with_timezone_opt(tz.clone()),
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => Arc::new(
+            TimestampMicrosecondArray::from(vec![
+                value
+                    .as_i64()
+                    .ok_or_else(|| bad("an integer (micros)"))?;
+                len
+            ])
+            .with_timezone_opt(tz.clone()),
+        ),
+        // Avro spells a decimal default as the two's-complement big-endian bytes,
+        // as a code-point string.
+        DataType::Decimal128(precision, scale) => {
+            let bytes = avro_byte_string(value, &bad)?;
+            if bytes.is_empty() || bytes.len() > 16 {
+                return Err(bad("a 1..16 byte two's-complement decimal"));
+            }
+            let mut buf = if (bytes[0] & 0x80) != 0 {
+                [0xffu8; 16]
+            } else {
+                [0u8; 16]
+            };
+            buf[16 - bytes.len()..].copy_from_slice(&bytes);
+            let unscaled = i128::from_be_bytes(buf);
+            Arc::new(
+                Decimal128Array::from(vec![unscaled; len])
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(|e| {
+                        CoreError::Schema(format!("evolution: decimal default for '{name}': {e}"))
+                    })?,
+            )
+        }
+        // An Avro `uuid` also maps to `FixedSizeBinary(16)`, but its default is a
+        // UUID string, not a code-point byte string: arrow-avro parses it as one
+        // when it resolves, and marks the field `logicalType: uuid`. Read as a
+        // byte string, a hyphenated UUID would fail on its length and a
+        // 16-character string would be taken as its ASCII bytes.
+        DataType::FixedSizeBinary(16)
+            if target_field
+                .metadata()
+                .get("logicalType")
+                .is_some_and(|t| t == "uuid") =>
+        {
+            let bytes = value
+                .as_str()
+                .and_then(uuid_string_bytes)
+                .ok_or_else(|| bad("a UUID string"))?;
+            Arc::new(fixed_size_binary_repeated(&bytes, len).map_err(|e| {
+                CoreError::Schema(format!("evolution: uuid default for '{name}': {e}"))
+            })?)
+        }
+        DataType::FixedSizeBinary(width) => {
+            let bytes = avro_byte_string(value, &bad)?;
+            if bytes.len() != usize::try_from(*width).unwrap_or(usize::MAX) {
+                return Err(bad(&format!("a {width}-byte string")));
+            }
+            Arc::new(fixed_size_binary_repeated(&bytes, len).map_err(|e| {
+                CoreError::Schema(format!("evolution: fixed default for '{name}': {e}"))
+            })?)
+        }
+        // An Avro enum default is one of its symbols; Arrow reads enums as a
+        // Utf8 dictionary.
+        DataType::Dictionary(key, val) if **key == DataType::Int32 && **val == DataType::Utf8 => {
+            let symbol = value.as_str().ok_or_else(|| bad("an enum symbol"))?;
+            let keys = Int32Array::from(vec![0i32; len]);
+            let values = Arc::new(StringArray::from(vec![symbol])) as ArrayRef;
+            Arc::new(
+                DictionaryArray::<Int32Type>::try_new(keys, values).map_err(|e| {
+                    CoreError::Schema(format!("evolution: enum default for '{name}': {e}"))
+                })?,
+            )
+        }
+        other => {
+            return Err(CoreError::Schema(format!(
+                "evolution: '{name}' is absent and its Avro default {value} cannot be \
+                 materialised for type {other}"
+            )));
+        }
+    };
+    Ok(array)
+}
+
+/// `len` copies of `bytes` as a `FixedSizeBinary(bytes.len())` array. Built with
+/// the builder rather than `FixedSizeBinaryArray::try_from_iter`, which refuses an
+/// empty iterator and so cannot express the zero-row fill a nested field gets when
+/// its container holds no values in the batch; the builder also keeps the row
+/// count for a zero-width value, whose value buffer is empty whatever `len` is.
+fn fixed_size_binary_repeated(
+    bytes: &[u8],
+    len: usize,
+) -> std::result::Result<arrow_array::FixedSizeBinaryArray, arrow_schema::ArrowError> {
+    let width = i32::try_from(bytes.len()).map_err(|_| {
+        arrow_schema::ArrowError::InvalidArgumentError(format!(
+            "a {}-byte fixed value does not fit an i32 width",
+            bytes.len()
+        ))
+    })?;
+    let mut builder = arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(len, width);
+    for _ in 0..len {
+        builder.append_value(bytes)?;
+    }
+    Ok(builder.finish())
+}
+
+/// The 16 bytes of a UUID string, in exactly the spellings arrow-avro's
+/// resolution accepts for a `uuid` default (`uuid::Uuid::try_parse`): 32 bare
+/// hex digits, hyphenated `8-4-4-4-12`, or the hyphenated form braced
+/// (`{...}`) or behind `urn:uuid:`.
+fn uuid_string_bytes(text: &str) -> Option<[u8; 16]> {
+    let hyphenated = |t: &str| {
+        (t.len() == 36 && [8, 13, 18, 23].iter().all(|&i| t.as_bytes()[i] == b'-'))
+            .then(|| t.bytes().filter(|&b| b != b'-').collect::<Vec<u8>>())
+    };
+    let hex: Vec<u8> = match text.len() {
+        32 => text.bytes().collect(),
+        36 => hyphenated(text)?,
+        38 => hyphenated(text.strip_prefix('{')?.strip_suffix('}')?)?,
+        45 => hyphenated(text.strip_prefix("urn:uuid:")?)?,
+        _ => return None,
+    };
+    if hex.len() != 32 || !hex.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (byte, pair) in out.iter_mut().zip(hex.chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Avro spells a `bytes`/`fixed`/decimal default as a string whose code points
+/// are the bytes 0-255 (`arrow-avro`'s "code-point string" convention for a
+/// default it cannot otherwise represent as JSON).
+fn avro_byte_string(value: &serde_json::Value, bad: &dyn Fn(&str) -> CoreError) -> Result<Vec<u8>> {
+    let text = value.as_str().ok_or_else(|| bad("a string"))?;
+    text.chars()
+        .map(|c| u8::try_from(c as u32).map_err(|_| bad("a byte string")))
+        .collect()
 }
 
 /// Whether `from` -> `to` is a type change Hudi permits as schema evolution, and
@@ -319,15 +599,7 @@ pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<Ar
             for tf in tfields {
                 match sa.column_by_name(tf.name()) {
                     Some(child) => children.push(evolve_array(child, tf)?),
-                    None if tf.is_nullable() => {
-                        children.push(new_null_array(tf.data_type(), sa.len()))
-                    }
-                    None => {
-                        return Err(CoreError::Schema(format!(
-                            "evolution: non-nullable struct child '{}' absent",
-                            tf.name()
-                        )));
-                    }
+                    None => children.push(fill_absent_field(tf, sa.len(), "struct child")?),
                 }
             }
             Ok(Arc::new(
@@ -492,6 +764,116 @@ pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<Ar
                 micros.unary(|v| v.div_euclid(MICROS_PER_MILLIS));
             Ok(Arc::new(millis))
         }
+        // Union → union: Avro's own rule, which is BY BRANCH NAME, not by
+        // position. A writer that predates two appended branches
+        // (`ColumnStatsMetadata.minValue` gaining `LocalDateWrapper` and
+        // `ArrayWrapper`) encodes branch indices that no longer mean what the
+        // reader's indices mean, so the type ids have to be remapped — which is
+        // why `arrow_cast` refuses every union→union cast and why this cannot be
+        // left to the fall-through. Java does the same thing in
+        // `HoodieAvroUtils.rewriteRecordWithNewSchemaInternal`'s UNION case
+        // (`getActualSchemaFromUnion`, matched by name).
+        (DataType::Union(sfields, smode), DataType::Union(tfields, tmode)) => {
+            if *smode != UnionMode::Dense || *tmode != UnionMode::Dense {
+                return Err(CoreError::Schema(format!(
+                    "evolution: union '{}' is {smode:?} -> {tmode:?}; only dense unions \
+                     are evolved (arrow-avro emits dense, and a sparse layout would need \
+                     a different rebuild)",
+                    target_field.name()
+                )));
+            }
+            let ua = src
+                .as_any()
+                .downcast_ref::<arrow_array::UnionArray>()
+                .ok_or_else(|| {
+                    CoreError::Schema(format!(
+                        "evolution: field '{}' is typed Union but its array is not a UnionArray",
+                        target_field.name()
+                    ))
+                })?;
+            let offsets = ua.offsets().cloned().ok_or_else(|| {
+                CoreError::Schema(format!(
+                    "evolution: dense union '{}' carries no offsets",
+                    target_field.name()
+                ))
+            })?;
+
+            // source type id -> (target type id, target branch field). A source
+            // branch the target does not name is a narrowing or a rename, which
+            // is not legal Hudi evolution — fail rather than drop the values.
+            //
+            // Deliberate divergence from Java, recorded as OI-61(b): Java's
+            // `HoodieAvroUtils.rewriteRecordWithNewSchema` refuses a narrowed union
+            // per ROW (rows before the offending one were already emitted); this
+            // refuses per BATCH (no row of the batch is emitted). Both are loud and
+            // neither returns wrong data — the only observable difference is where
+            // the error surfaces, which no index lookup depends on.
+            let mut remap: std::collections::HashMap<i8, (i8, FieldRef)> =
+                std::collections::HashMap::with_capacity(sfields.len());
+            for (sid, sf) in sfields.iter() {
+                let (tid, tf) = tfields
+                    .iter()
+                    .find(|(_, tf)| tf.name() == sf.name())
+                    .ok_or_else(|| {
+                        CoreError::Schema(format!(
+                            "evolution: union '{}' branch '{}' has no branch of that \
+                             name in the target union",
+                            target_field.name(),
+                            sf.name()
+                        ))
+                    })?;
+                remap.insert(sid, (tid, tf.clone()));
+            }
+
+            // One child per TARGET branch, in the target's own order. A branch
+            // the source never had contributes an empty child: dense offsets
+            // only ever point into a child a type id selected, and no type id
+            // selects this one.
+            let mut children: Vec<ArrayRef> = Vec::with_capacity(tfields.len());
+            for (tid, tf) in tfields.iter() {
+                match sfields
+                    .iter()
+                    .find(|(sid, _)| remap.get(sid).is_some_and(|(mapped, _)| *mapped == tid))
+                {
+                    Some((sid, _)) => children.push(evolve_array(ua.child(sid), tf)?),
+                    None => children.push(new_empty_array(tf.data_type())),
+                }
+            }
+
+            // Offsets carry over: each source branch maps to exactly one target
+            // branch, and its child keeps the order and length it had, so a
+            // value's index within its child is unchanged. Only the type id,
+            // which names the branch, has to move.
+            let type_ids: arrow_buffer::ScalarBuffer<i8> = ua
+                .type_ids()
+                .iter()
+                .map(|sid| {
+                    remap.get(sid).map(|(tid, _)| *tid).ok_or_else(|| {
+                        CoreError::Schema(format!(
+                            "evolution: union '{}' holds type id {sid} that its own schema \
+                         does not declare",
+                            target_field.name()
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<i8>>>()?
+                .into();
+
+            Ok(Arc::new(
+                arrow_array::UnionArray::try_new(
+                    tfields.clone(),
+                    type_ids,
+                    Some(offsets),
+                    children,
+                )
+                .map_err(|e| {
+                    CoreError::Schema(format!(
+                        "evolution: rebuild union '{}': {e}",
+                        target_field.name()
+                    ))
+                })?,
+            ))
+        }
         // Container-variant drift (e.g. LargeList source vs List target, or a
         // container on only one side) would silently bypass the recursion arms
         // and their gold-parity casts (string-mediated float→double) via
@@ -616,15 +998,36 @@ fn float_to_java_string_array(src: &ArrayRef) -> Result<ArrayRef> {
 #[cfg(test)]
 mod tests {
     use super::project_batch_to_schema;
+    use arrow_array::types::Int32Type;
     use arrow_array::{
-        Array, ArrayRef, Float32Array, Int32Array, RecordBatch, StringArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray,
+        Array, ArrayRef, Date32Array, Decimal128Array, DictionaryArray, FixedSizeBinaryArray,
+        Float32Array, Int32Array, RecordBatch, StringArray, Time32MillisecondArray,
+        Time64MicrosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     };
-    use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit, UnionFields, UnionMode};
     use std::sync::Arc;
 
     fn batch(fields: Vec<Field>, cols: Vec<ArrayRef>) -> RecordBatch {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+    }
+
+    /// Attach an Avro default (given as raw JSON text, matching how `arrow-avro`
+    /// stamps `avro.field.default`) to a field, driving the same path the
+    /// existing default tests use.
+    fn with_default(field: Field, default_json: impl Into<String>) -> Field {
+        field.with_metadata(
+            [("avro.field.default".to_string(), default_json.into())]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// Encode bytes as the Avro "code-point string" a `bytes`/`fixed`/decimal
+    /// default is spelled as: each byte becomes the `char` of that code point,
+    /// then it's JSON-string-encoded like `arrow-avro` would stamp it.
+    fn avro_byte_string_default(bytes: &[u8]) -> String {
+        let s: String = bytes.iter().map(|&b| b as char).collect();
+        serde_json::to_string(&s).unwrap()
     }
 
     #[test]
@@ -1389,6 +1792,550 @@ mod tests {
         );
     }
 
+    // ---- Avro union / Avro default (the v6 metadata-table shape) -----------
+    //
+    // A `HoodieMetadataRecord` written by Hudi 0.14 carries a 12-branch
+    // `ColumnStatsMetadata.minValue` union and no `isTightBound`; the current
+    // one carries 14 branches and a non-nullable `isTightBound` defaulting to
+    // `false`. Java resolves the first by branch NAME and fills the second from
+    // its declared default. These are that pair in miniature.
+
+    fn dense_union_fields(names: &[(&str, DataType)]) -> UnionFields {
+        UnionFields::try_new(
+            (0..names.len() as i8).collect::<Vec<_>>(),
+            names
+                .iter()
+                .map(|(n, dt)| Field::new(*n, dt.clone(), false))
+                .collect::<Vec<_>>(),
+        )
+        .expect("dense union fields")
+    }
+
+    #[test]
+    fn test_project_widens_a_dense_union_by_branch_name() {
+        let src_fields = dense_union_fields(&[
+            ("null", DataType::Null),
+            ("IntWrapper", DataType::Int32),
+            ("LongWrapper", DataType::Int64),
+        ]);
+        // The target appends a branch, as `LocalDateWrapper`/`ArrayWrapper` were
+        // appended to the metadata record's union.
+        let target_fields = dense_union_fields(&[
+            ("null", DataType::Null),
+            ("IntWrapper", DataType::Int32),
+            ("LongWrapper", DataType::Int64),
+            ("LocalDateWrapper", DataType::Int32),
+        ]);
+        let src = arrow_array::UnionArray::try_new(
+            src_fields.clone(),
+            vec![1i8, 2, 1].into(),
+            Some(vec![0i32, 0, 1].into()),
+            vec![
+                arrow_array::new_null_array(&DataType::Null, 0),
+                Arc::new(Int32Array::from(vec![7, 9])),
+                Arc::new(arrow_array::Int64Array::from(vec![11i64])),
+            ],
+        )
+        .unwrap();
+
+        let b = batch(
+            vec![Field::new(
+                "minValue",
+                DataType::Union(src_fields, UnionMode::Dense),
+                false,
+            )],
+            vec![Arc::new(src)],
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "minValue",
+            DataType::Union(target_fields, UnionMode::Dense),
+            false,
+        )]));
+
+        let out = project_batch_to_schema(&b, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let ua = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::UnionArray>()
+            .expect("rebuilt as a union");
+        assert_eq!(ua.len(), 3);
+        // Values survive, read back through the branch they were written on.
+        let read = |row: usize| -> String {
+            let type_id = ua.type_id(row);
+            let value = ua.value(row);
+            match type_id {
+                1 => format!(
+                    "int:{}",
+                    value
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(0)
+                ),
+                2 => format!(
+                    "long:{}",
+                    value
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int64Array>()
+                        .unwrap()
+                        .value(0)
+                ),
+                other => format!("branch{other}"),
+            }
+        };
+        assert_eq!(read(0), "int:7");
+        assert_eq!(read(1), "long:11");
+        assert_eq!(read(2), "int:9");
+        // The appended branch exists and holds nothing.
+        assert_eq!(ua.child(3).len(), 0);
+    }
+
+    #[test]
+    fn test_project_refuses_a_union_branch_the_target_does_not_name() {
+        // The reverse direction: a source branch with no target of that name is
+        // a narrowing or a rename, never legal Hudi evolution. It must be loud,
+        // not a dropped column.
+        let src_fields = dense_union_fields(&[
+            ("null", DataType::Null),
+            ("IntWrapper", DataType::Int32),
+            ("LongWrapper", DataType::Int64),
+        ]);
+        let target_fields =
+            dense_union_fields(&[("null", DataType::Null), ("IntWrapper", DataType::Int32)]);
+        let src = arrow_array::UnionArray::try_new(
+            src_fields.clone(),
+            vec![1i8].into(),
+            Some(vec![0i32].into()),
+            vec![
+                arrow_array::new_null_array(&DataType::Null, 0),
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(arrow_array::Int64Array::from(Vec::<i64>::new())),
+            ],
+        )
+        .unwrap();
+        let b = batch(
+            vec![Field::new(
+                "minValue",
+                DataType::Union(src_fields, UnionMode::Dense),
+                false,
+            )],
+            vec![Arc::new(src)],
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "minValue",
+            DataType::Union(target_fields, UnionMode::Dense),
+            false,
+        )]));
+        let err = project_batch_to_schema(&b, &target)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("LongWrapper") && err.contains("no branch of that name"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_project_fills_a_non_nullable_struct_child_from_its_avro_default() {
+        // `ColumnStatsMetadata.isTightBound`: `"boolean"` with `"default": false`,
+        // so Arrow-non-nullable and absent from every pre-1.0 writer. Without the
+        // default it is a hard error; with it Java puts `false` in every row.
+        let src_children = vec![Field::new("isDeleted", DataType::Boolean, false)];
+        let src = arrow_array::StructArray::try_new(
+            src_children.clone().into(),
+            vec![Arc::new(arrow_array::BooleanArray::from(vec![false, true])) as ArrayRef],
+            None,
+        )
+        .unwrap();
+        let b = batch(
+            vec![Field::new(
+                "ColumnStatsMetadata",
+                DataType::Struct(src_children.into()),
+                true,
+            )],
+            vec![Arc::new(src)],
+        );
+
+        let target_children = vec![
+            Field::new("isDeleted", DataType::Boolean, false),
+            Field::new("isTightBound", DataType::Boolean, false).with_metadata(
+                [("avro.field.default".to_string(), "false".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+        ];
+        let target: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "ColumnStatsMetadata",
+            DataType::Struct(target_children.into()),
+            true,
+        )]));
+
+        let out = project_batch_to_schema(&b, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let sa = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .unwrap();
+        let filled = sa
+            .column_by_name("isTightBound")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap();
+        assert_eq!(filled.len(), 2);
+        assert!(!filled.is_null(0) && !filled.value(0));
+        assert!(!filled.is_null(1) && !filled.value(1));
+    }
+
+    #[test]
+    fn test_project_still_refuses_a_non_nullable_child_with_no_default() {
+        // Same shape, no `avro.field.default`: nothing says what the value is, so
+        // the read must fail rather than invent one.
+        let src_children = vec![Field::new("isDeleted", DataType::Boolean, false)];
+        let src = arrow_array::StructArray::try_new(
+            src_children.clone().into(),
+            vec![Arc::new(arrow_array::BooleanArray::from(vec![false])) as ArrayRef],
+            None,
+        )
+        .unwrap();
+        let b = batch(
+            vec![Field::new(
+                "ColumnStatsMetadata",
+                DataType::Struct(src_children.into()),
+                true,
+            )],
+            vec![Arc::new(src)],
+        );
+        let target_children = vec![
+            Field::new("isDeleted", DataType::Boolean, false),
+            Field::new("isTightBound", DataType::Boolean, false),
+        ];
+        let target: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "ColumnStatsMetadata",
+            DataType::Struct(target_children.into()),
+            true,
+        )]));
+        let err = project_batch_to_schema(&b, &target)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-nullable struct child 'isTightBound' absent from the source"),
+            "got: {err}"
+        );
+    }
+
+    /// A `float` default out of `f32` range is refused, as every sibling arm
+    /// refuses an out-of-range default, rather than narrowed to infinity.
+    #[test]
+    fn a_float32_default_out_of_range_errs_rather_than_becoming_infinite() {
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        );
+        let target_with = |default: &str| -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                with_default(Field::new("f", DataType::Float32, false), default),
+            ]))
+        };
+        // `3.4028234714e38` is past `f32::MAX` by less than half its last place, so
+        // `as f32` would round it down to `f32::MAX` rather than to infinity.
+        for out_of_range in ["1e40", "-1e40", "3.4028236e38", "3.4028234714e38"] {
+            let err = project_batch_to_schema(&b, &target_with(out_of_range))
+                .expect_err("out of float range")
+                .to_string();
+            assert!(err.contains("in float32 range"), "{out_of_range}: {err}");
+        }
+        let out = project_batch_to_schema(&b, &target_with("3.4e38")).unwrap();
+        let f = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(f.value(0), 3.4e38f32, "just under f32::MAX is in range");
+
+        let out = project_batch_to_schema(&b, &target_with("1.5")).unwrap();
+        let f = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(f.value(0), 1.5);
+        // Precision loss inside the range is what a float default means, not an
+        // error.
+        let out = project_batch_to_schema(&b, &target_with("0.1")).unwrap();
+        let f = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(f.value(0), 0.1f32);
+    }
+
+    #[test]
+    fn test_project_fills_a_non_nullable_date32_field_from_its_avro_default() {
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(Field::new("asOfDate", DataType::Date32, false), "19000"),
+        ]));
+        let out = project_batch_to_schema(&b, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let col = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        assert_eq!(col.len(), 2);
+        assert_eq!(col.value(0), 19000);
+        assert_eq!(col.value(1), 19000);
+    }
+
+    #[test]
+    fn test_project_fills_non_nullable_time_fields_from_their_avro_defaults() {
+        // Avro `time-millis` -> Arrow Time32(Millisecond); `time-micros` ->
+        // Time64(Microsecond). Both are exercised here as one logical "Time" arm.
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new(
+                    "startMillis",
+                    DataType::Time32(TimeUnit::Millisecond),
+                    false,
+                ),
+                "1234",
+            ),
+            with_default(
+                Field::new(
+                    "startMicros",
+                    DataType::Time64(TimeUnit::Microsecond),
+                    false,
+                ),
+                "5678",
+            ),
+        ]));
+        let out = project_batch_to_schema(&b, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let millis = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Time32MillisecondArray>()
+            .unwrap();
+        assert_eq!(millis.len(), 2);
+        assert_eq!(millis.value(0), 1234);
+        assert_eq!(millis.value(1), 1234);
+        let micros = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Time64MicrosecondArray>()
+            .unwrap();
+        assert_eq!(micros.len(), 2);
+        assert_eq!(micros.value(0), 5678);
+        assert_eq!(micros.value(1), 5678);
+    }
+
+    #[test]
+    fn test_project_fills_a_non_nullable_timestamp_field_from_its_avro_default() {
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new(
+                    "eventTime",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+                "1700000000000000",
+            ),
+        ]));
+        let out = project_batch_to_schema(&b, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let col = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(col.len(), 2);
+        assert_eq!(col.value(0), 1_700_000_000_000_000);
+        assert_eq!(col.value(1), 1_700_000_000_000_000);
+        assert_eq!(col.timezone(), Some("UTC"));
+    }
+
+    #[test]
+    fn test_project_fills_a_non_nullable_decimal128_field_from_its_avro_default() {
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new("amount", DataType::Decimal128(10, 2), false),
+                avro_byte_string_default(&[0x04, 0xd2]),
+            ),
+            with_default(
+                Field::new("amountNeg", DataType::Decimal128(10, 2), false),
+                avro_byte_string_default(&[0xff, 0xff, 0xfb, 0x2e]),
+            ),
+        ]));
+        let out = project_batch_to_schema(&b, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let pos = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(pos.len(), 2);
+        assert_eq!(pos.value(0), 1234);
+        assert_eq!(pos.value(1), 1234);
+        let neg = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(neg.value(0), -1234);
+        assert_eq!(neg.value(1), -1234);
+    }
+
+    #[test]
+    fn test_project_fills_a_non_nullable_fixed_size_binary_field_from_its_avro_default() {
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new("checksum", DataType::FixedSizeBinary(4), false),
+                avro_byte_string_default(&[0x01, 0x02, 0x03, 0x04]),
+            ),
+        ]));
+        let out = project_batch_to_schema(&b, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let col = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(col.len(), 2);
+        assert_eq!(col.value(0), [0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(col.value(1), [0x01, 0x02, 0x03, 0x04]);
+
+        // A default of the wrong byte width must be a loud error, not silently
+        // truncated/padded.
+        let bad_target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new("checksum", DataType::FixedSizeBinary(4), false),
+                avro_byte_string_default(&[0x01, 0x02, 0x03]),
+            ),
+        ]));
+        let err = project_batch_to_schema(&b, &bad_target)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("4-byte string"), "got: {err}");
+    }
+
+    #[test]
+    fn test_project_a_36_char_uuid_default_on_fixed_size_binary_16_errs_with_the_width_message() {
+        // A plain `fixed(16)` (no `logicalType: uuid`, see
+        // `a_uuid_default_fills_the_bytes_arrow_avro_resolution_gives_it`) reads
+        // its default as a code-point byte string, so a 36-char hyphenated
+        // string must fail loudly on the width check, not be silently mis-decoded.
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new("uid", DataType::FixedSizeBinary(16), false),
+                serde_json::to_string(&"550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            ),
+        ]));
+        let err = project_batch_to_schema(&b, &target)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("16-byte string"), "got: {err}");
+    }
+
+    #[test]
+    fn test_project_fills_a_non_nullable_enum_field_from_its_avro_default() {
+        // Arrow reads an Avro enum as a Utf8 dictionary; the default names one
+        // of its symbols.
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new(
+                    "color",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    false,
+                ),
+                "\"RED\"",
+            ),
+        ]));
+        let out = project_batch_to_schema(&b, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let dict = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        assert_eq!(dict.len(), 2);
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for key in dict.keys().iter() {
+            let idx = usize::try_from(key.unwrap()).unwrap();
+            assert_eq!(values.value(idx), "RED");
+        }
+    }
+
+    #[test]
+    fn test_project_still_refuses_a_struct_typed_avro_default() {
+        // Nested (struct/list/map) defaults stay refused with the existing
+        // "cannot be materialised" error — Avro spells those as JSON
+        // objects/arrays whose mapping onto an Arrow child layout is not
+        // covered here.
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        );
+        let nested = vec![Field::new("x", DataType::Int32, true)];
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new("meta", DataType::Struct(nested.into()), false),
+                "{}",
+            ),
+        ]));
+        let err = project_batch_to_schema(&b, &target)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot be materialised for type"),
+            "got: {err}"
+        );
+    }
+
     // The two pushdown classifiers. Flagging too little drops rows silently;
     // flagging too much only costs pushdown. These pin both directions.
 
@@ -1735,5 +2682,161 @@ mod tests {
             vec!["l".to_string()],
             "and so must one inside a list"
         );
+    }
+
+    /// A zero-row fill of a `fixed` or `uuid` default yields an empty array, as
+    /// every other type's does. It is reached through a zero-row batch, as here,
+    /// and when the field is a child of a container with no values in the batch:
+    /// a list of records whose every list is empty, or a union branch no row
+    /// selects.
+    #[test]
+    fn a_zero_row_fixed_or_uuid_default_fill_is_empty() {
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(Vec::<i32>::new()))],
+        );
+        let uuid_metadata: std::collections::HashMap<String, String> =
+            [("logicalType".to_string(), "uuid".to_string())].into();
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new("checksum", DataType::FixedSizeBinary(4), false),
+                avro_byte_string_default(&[1, 2, 3, 4]),
+            ),
+            Field::new("u", DataType::FixedSizeBinary(16), false).with_metadata(
+                uuid_metadata
+                    .into_iter()
+                    .chain([(
+                        "avro.field.default".to_string(),
+                        "\"550e8400-e29b-41d4-a716-446655440000\"".to_string(),
+                    )])
+                    .collect(),
+            ),
+        ]));
+        let out = project_batch_to_schema(&b, &target)
+            .expect("an empty batch fills its defaulted fixed columns with nothing");
+        assert_eq!(out.num_rows(), 0);
+        assert_eq!(out.schema(), target);
+    }
+
+    /// A zero-width `fixed` default fills one (empty) value per row: the array
+    /// length follows the row count, not the value buffer, which is empty either
+    /// way.
+    #[test]
+    fn a_zero_width_fixed_default_fills_every_row() {
+        let b = batch(
+            vec![Field::new("id", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            with_default(
+                Field::new("empty", DataType::FixedSizeBinary(0), false),
+                "\"\"",
+            ),
+        ]));
+        let out = project_batch_to_schema(&b, &target)
+            .expect("a zero-width fixed default fills three rows");
+        assert_eq!(out.column(1).len(), 3);
+    }
+
+    /// Every spelling `uuid_string_bytes` accepts gives the same bytes; anything
+    /// else is refused.
+    #[test]
+    fn uuid_string_bytes_accepts_the_uuid_spellings_and_nothing_else() {
+        use super::uuid_string_bytes;
+        let want = Some([
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ]);
+        for ok in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "550E8400-E29B-41D4-A716-446655440000",
+            "550e8400e29b41d4a716446655440000",
+            "{550e8400-e29b-41d4-a716-446655440000}",
+            "urn:uuid:550e8400-e29b-41d4-a716-446655440000",
+        ] {
+            assert_eq!(uuid_string_bytes(ok), want, "{ok}");
+        }
+        for bad in [
+            "0123456789abcdef",
+            "550e8400-e29b-41d4-a716-44665544000g",
+            "550e8400+e29b+41d4+a716+446655440000",
+            "+50e8400e29b41d4a716446655440000",
+            "{550e8400e29b41d4a716446655440000}",
+            "urn:uuid:550e8400e29b41d4a716446655440000",
+            "urn:uuid:{550e8400-e29b-41d4-a716-446655440000}",
+            "URN:UUID:550e8400-e29b-41d4-a716-446655440000",
+            "",
+        ] {
+            assert_eq!(uuid_string_bytes(bad), None, "{bad}");
+        }
+    }
+
+    /// An Avro `uuid` default fills a rewritten field with the same 16 bytes
+    /// arrow-avro's own resolving decoder gives it.
+    ///
+    /// arrow-avro reads a `uuid` default as a UUID string, and marks the field
+    /// `logicalType: uuid`. The rewrite fill used to read every
+    /// `FixedSizeBinary(16)` default as an Avro code-point byte string instead, so
+    /// a valid hyphenated UUID default failed the read on its length and a
+    /// 16-character string default was taken as its 16 ASCII bytes, where the
+    /// resolving decoder refuses it.
+    #[test]
+    fn a_uuid_default_fills_the_bytes_arrow_avro_resolution_gives_it() {
+        use crate::file_group::log_file::avro::AvroBlockDecoder;
+        let writer = r#"{"type":"record","name":"R","fields":[{"name":"id","type":"long"}]}"#;
+        let reader_with = |default: &str| {
+            format!(
+                r#"{{"type":"record","name":"R","fields":[{{"name":"id","type":"long"}},{{"name":"u","type":{{"type":"string","logicalType":"uuid"}},"default":"{default}"}}]}}"#
+            )
+        };
+        let writer_schema = apache_avro::Schema::parse_str(writer).unwrap();
+        let mut record = apache_avro::types::Record::new(&writer_schema).unwrap();
+        record.put("id", 1i64);
+        let body = apache_avro::to_avro_datum(&writer_schema, record).unwrap();
+        let writer_batch = batch(
+            vec![Field::new("id", DataType::Int64, false)],
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1]))],
+        );
+
+        // Valid: the rewrite fill equals the resolving decode.
+        let reader = reader_with("550e8400-e29b-41d4-a716-446655440000");
+        let mut resolving =
+            AvroBlockDecoder::try_new_with_reader(writer, Some(&reader), 1).unwrap();
+        let resolved = resolving.decode(&body).unwrap().expect("one-row batch");
+        let rewritten = project_batch_to_schema(&writer_batch, &resolved.schema())
+            .expect("a valid UUID default must fill, as resolution does");
+        assert_eq!(
+            rewritten.column(1).as_ref(),
+            resolved.column(1).as_ref(),
+            "the rewrite and the resolution must agree on the bytes"
+        );
+        let uuid = rewritten
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap()
+            .value(0)
+            .to_vec();
+        assert_eq!(
+            uuid,
+            [
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00
+            ]
+        );
+
+        // Not a UUID: resolution refuses it, and so must the rewrite, rather than
+        // storing the string's ASCII bytes.
+        let reader = reader_with("0123456789abcdef");
+        let mut resolving =
+            AvroBlockDecoder::try_new_with_reader(writer, Some(&reader), 1).unwrap();
+        assert!(resolving.decode(&body).is_err(), "resolution refuses it");
+        let target = resolving.schema();
+        let err = project_batch_to_schema(&writer_batch, &target)
+            .expect_err("a 16-character non-UUID default must not fill")
+            .to_string();
+        assert!(err.contains("a UUID string"), "got: {err}");
     }
 }

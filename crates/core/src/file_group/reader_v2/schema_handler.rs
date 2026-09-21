@@ -404,7 +404,15 @@ impl FileGroupReaderSchemaHandler {
                      (data/requested JSONs were provided): {e}"
                     ))
                 })?;
-            let arrow = crate::schema::resolver::avro_json_to_arrow_schema(&required_json)
+            // Through the arrow-avro decoder, not `resolver::avro_json_to_arrow_schema`
+            // -> `avro_to_arrow`: the latter still `todo!()`s on `AvroSchema::Ref`
+            // (OI-10) and the metadata table's own record schema is full of them —
+            // `ColumnStatsMetadata.maxValue` references the wrapper records that
+            // `minValue` defines. It is also the conversion the FFI boundary and
+            // the HFile base-file reader already use, so the required schema here
+            // and the schema a resolved decode emits cannot drift.
+            let arrow = crate::ffi_support::arrow_schema_from_avro_json(&required_json)
+                .map(|schema| crate::schema::normalize_utc_timezone_spelling(&schema))
                 .map_err(|e| {
                     crate::error::CoreError::Schema(format!(
                         "required avro json -> arrow failed on the FFI path: {e}"

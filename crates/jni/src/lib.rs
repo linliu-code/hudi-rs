@@ -46,12 +46,21 @@ use jni::sys::{jboolean, jlong, jstring};
 /// jar that is upgraded first, never one that lags behind: never deploy the
 /// library ahead of the jar; ship jar and library together.
 ///
+/// The sentence above is the first clause of the rule, not all of it: a change that
+/// leaves the parameter list alone can still make a jar/library pairing unsafe, and a
+/// change that turns an error into a correct result with byte-identical output for every
+/// previously-succeeding input does not bump. The rule is stated once, with the `638ce3b`
+/// worked example, in `crates/jni/README.md` ("When to bump it").
+///
 /// History: 1 = the 7-argument `readFileGroupInto` (pre lookup-keys);
 /// 2 = `readFileGroupInto` gained `lookupKeys`, `lookupKeysArePrefixes`, `validInstants`;
 /// 3 = same parameter list, changed meaning of two inputs: an EMPTY `lookupKeys` array
 ///     means match-nothing (was: whole slice, D-12) and an empty `latestInstant` is refused
 ///     (was: read everything, D-13). Bumped so a jar that still expects the old meanings
 ///     refuses this library rather than mis-reading a lookup.
+///     (`638ce3b`: evaluated under rule 2 and declined — no bump, D-21. It changed what the
+///     native side does with `dataSchemaJson` but only turns an error into a correct result,
+///     byte-identical for every previously-succeeding input. See the README's worked example.)
 pub const JNI_ABI_VERSION: u32 = 3;
 
 const EXCEPTION_CLASS: &str = "org/apache/hudi/io/nativereader/NativeReaderException";
@@ -157,7 +166,8 @@ fn throw(env: &mut JNIEnv, message: String) {
 /// `lookupKeysArePrefixes` is set. `validInstants` is the set of valid instant
 /// timestamps; a null array means no instant filter.
 ///
-/// Changing this parameter list requires bumping [`JNI_ABI_VERSION`].
+/// Changing this parameter list requires bumping [`JNI_ABI_VERSION`] — that is clause 1
+/// of the rule, not all of it; see `crates/jni/README.md`, "When to bump it", for the full one.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_apache_hudi_io_nativereader_NativeFileGroupReader_readFileGroupInto<
     'local,

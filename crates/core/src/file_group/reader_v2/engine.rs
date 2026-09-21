@@ -154,22 +154,28 @@ pub struct HoodieFileGroupReader {
 /// `--release --ignored --nocapture`).
 const MERGE_CHUNK_ROWS: usize = 1024;
 
-/// Base-file read options carrying an optional pushdown predicate, and the
-/// row-position column when the merge is by position.
+/// Base-file read options carrying an optional pushdown predicate, the Avro
+/// reader schema, and the row-position column when the merge is by position.
 ///
-/// The three base reads below differ only in projection, so both are attached in
-/// one place — a read that silently lost the filter would return extra rows
-/// rather than fail, which is the hard kind of bug to notice, and one that lost
-/// the row-position column would fail in the buffer with the column named but
-/// not the read that dropped it.
+/// The three base reads below differ only in projection, so all of them are
+/// attached in one place — a read that silently lost the filter would return
+/// extra rows rather than fail, which is the hard kind of bug to notice; one
+/// that lost the row-position column would fail in the buffer with the column
+/// named but not the read that dropped it; and one that lost the reader schema
+/// would decode an older file in its own writer schema and only fail later, in
+/// the Arrow projector, with the two schemas printed and neither named.
 fn base_read_options(
     row_filter: Option<RowFilterBuilder>,
     row_group_selector: Option<RowGroupSelector>,
     key_predicate: Option<crate::file_group::base_file::reader::KeyPredicate>,
+    reader_schema_json: Option<String>,
     use_record_position: bool,
 ) -> BaseFileReadOptions {
     let mut options = BaseFileReadOptions::new();
     options = options.with_batch_size(MERGE_CHUNK_ROWS);
+    if let Some(reader_schema_json) = reader_schema_json {
+        options = options.with_reader_schema_json(reader_schema_json);
+    }
     if let Some(row_filter) = row_filter {
         options = options.with_row_filter(row_filter);
     }
@@ -885,6 +891,7 @@ impl HoodieFileGroupReader {
                         row_filter.clone(),
                         row_group_selector.clone(),
                         key_predicate.clone(),
+                        self.schema_handler.reader_schema_json.clone(),
                         use_position,
                     ),
                 )
@@ -912,9 +919,35 @@ impl HoodieFileGroupReader {
         //      promotions (float→double string-mediated so it is value-exact).
         // Step 3 is applied PER ROW-GROUP, so every base batch the merge
         // interleaves is already in `required_schema`.
+
+        // The options the read below will use: with an Avro reader schema the
+        // HFile reader answers with the RESOLVED schema, which is what its
+        // batches will carry, so the intersection is taken against that and not
+        // against a writer schema the read never produces.
+        // ENG-48206 / OSS #748 — `row_filter` and `row_group_selector` are WITHDRAWN
+        // below, once this file's footer schema shows a value-reinterpreting repair.
+        // They are therefore passed per call instead of captured: a closure that
+        // captured them would borrow across that assignment (E0506) and, worse,
+        // would have pinned the pre-withdrawal values for the stream read — i.e.
+        // it would have pushed the very filter the gate just decided to withdraw.
+        // Upstream has no closure here and calls `base_read_options` directly at
+        // both sites; this keeps 145's de-duplication with upstream's semantics.
+        let read_options =
+            |row_filter: Option<RowFilterBuilder>, row_group_selector: Option<RowGroupSelector>| {
+                base_read_options(
+                    row_filter,
+                    row_group_selector,
+                    key_predicate.clone(),
+                    self.schema_handler.reader_schema_json.clone(),
+                    use_position,
+                )
+            };
         let file_schema = self
             .base_file_reader()?
-            .read_schema(&path)
+            .read_schema(
+                &path,
+                read_options(row_filter.clone(), row_group_selector.clone()),
+            )
             .await
             .map_err(|e| {
                 CoreError::ReadFileSliceError(format!(
@@ -1032,13 +1065,8 @@ impl HoodieFileGroupReader {
             .base_file_reader()?
             .read_stream(
                 &path,
-                base_read_options(
-                    row_filter.clone(),
-                    row_group_selector.clone(),
-                    key_predicate.clone(),
-                    use_position,
-                )
-                .with_projection(intersection.fields().iter().map(|f| f.name())),
+                read_options(row_filter.clone(), row_group_selector.clone())
+                    .with_projection(intersection.fields().iter().map(|f| f.name())),
             )
             .await
             .map_err(|e| {
@@ -2357,7 +2385,7 @@ mod tests {
         for use_position in [false, true] {
             for filter in [None, Some(make_row_filter_builder())] {
                 assert_eq!(
-                    base_read_options(filter, None, None, use_position).batch_size,
+                    base_read_options(filter, None, None, None, use_position).batch_size,
                     Some(MERGE_CHUNK_ROWS),
                     "the base read must ask for the merge's chunk bound rather than \
                      inherit one (use_position={use_position})"
