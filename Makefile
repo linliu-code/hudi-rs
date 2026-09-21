@@ -141,6 +141,48 @@ test-python: ## Run tests on Python
 	$(info --- Run Python tests ---)
 	uv run pytest -s $(PYTHON_DIR)
 
+# ---- JNI library carrier (hudi-internal's hudi-native-reader resolves it from Maven) ----
+JNI_VERSION ?= 0.5.0-dev.$(shell git rev-parse --short HEAD)
+JNI_ARCH ?= $(shell uname -m | sed 's/arm64/aarch64/;s/amd64/x86_64/')
+JNI_OS ?= linux
+JNI_OUT ?= target/jni-native
+JNI_STAGE := $(JNI_OUT)/stage
+JNI_JAR := $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION)-$(JNI_OS)-$(JNI_ARCH).jar
+CODEARTIFACT_URL ?= https://onehouse-194159489498.d.codeartifact.us-west-2.amazonaws.com/maven/onehouse-internal/
+
+.PHONY: jni-lib
+jni-lib: ## Build libhudi_jni.so (release) and stage a stripped copy under target/jni-native
+	$(info --- Build hudi-jni (release) ---)
+	./build-wrapper.sh cargo build -p hudi-jni --release
+	mkdir -p $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH) $(JNI_STAGE)/META-INF
+	strip -o $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so target/release/libhudi_jni.so
+	printf 'hudi-rs.sha=%s\nabi=%s\nbuilt=%s\nmd5=%s\narch=%s-%s\n' \
+	  "$$(git rev-parse HEAD)" \
+	  "$$(grep -o 'JNI_ABI_VERSION: u32 = [0-9]*' crates/jni/src/lib.rs | grep -o '[0-9]*$$')" \
+	  "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+	  "$$(md5sum $(JNI_STAGE)/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so | cut -d' ' -f1)" \
+	  "$(JNI_OS)" "$(JNI_ARCH)" > $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+	cat $(JNI_STAGE)/META-INF/hudi-jni-native.properties
+
+.PHONY: jni-jar
+jni-jar: jni-lib ## Package the staged library as hudi-jni-native-<version>-<os>-<arch>.jar
+	$(info --- Package $(JNI_JAR) ---)
+	rm -f $(JNI_JAR) && jar cf $(JNI_JAR) -C $(JNI_STAGE) .
+	unzip -l $(JNI_JAR)
+
+.PHONY: jni-deploy
+jni-deploy: jni-jar ## Deploy the carrier jar to CodeArtifact (server id `codeartifact` in ~/.m2/settings.xml)
+	$(info --- Deploy $(JNI_JAR) as io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH) ---)
+	mvn -B -ntp deploy:deploy-file -Dfile=$(JNI_JAR) -DgroupId=io.onehouse.hudi-rs -DartifactId=hudi-jni-native \
+	  -Dversion=$(JNI_VERSION) -Dclassifier=$(JNI_OS)-$(JNI_ARCH) -Dpackaging=jar -DgeneratePom=true \
+	  -DrepositoryId=codeartifact -Durl=$(CODEARTIFACT_URL)
+
+.PHONY: jni-install
+jni-install: jni-jar ## Install the carrier jar into the local Maven repository (~/.m2) for builds on this machine
+	$(info --- Install $(JNI_JAR) into the local Maven repository as io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH) ---)
+	mvn -B -ntp install:install-file -Dfile=$(JNI_JAR) -DgroupId=io.onehouse.hudi-rs -DartifactId=hudi-jni-native \
+	  -Dversion=$(JNI_VERSION) -Dclassifier=$(JNI_OS)-$(JNI_ARCH) -Dpackaging=jar -DgeneratePom=true
+
 .PHONY: coverage
 coverage: coverage-rust ## Generate coverage report (alias for coverage-rust)
 

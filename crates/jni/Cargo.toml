@@ -15,34 +15,23 @@
 # specific language governing permissions and limitations
 # under the License.
 
-
 [package]
-name = "hudi-jvm-ffi"
-# Not published to crates.io yet; the release workflow's publish matrix
-# deliberately excludes it.
-publish = false
+name = "hudi-jni"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Plain C ABI over hudi-rs, so a JVM can call it through the Arrow C Data Interface."
+description = "JNI exports over hudi-rs for JVM callers; data crosses as Arrow C Data streams."
 homepage.workspace = true
 repository.workspace = true
 
 [lib]
-name = "hudi_jvm_ffi"
-crate-type = ["cdylib", "rlib"]
-
-[features]
-# Exports a deliberately panicking function, so a caller can prove a panic does
-# not cross the C ABI. Off by default: it must not exist in a shipped library.
-ffi-test-hooks = []
+name = "hudi_jni"
+crate-type = ["cdylib"]
 
 [dependencies]
-hudi = { path = "../hudi", version = "0.6.0-dev" }
+hudi-jvm-ffi = { path = "../jvm-ffi" }
 arrow = { workspace = true, features = ["ffi"] }
-tokio = { workspace = true }
+jni = "0.21"
 log = { workspace = true }
-
-[dev-dependencies]
-hudi-test = { path = "../test" }
+env_logger = "0.11"
