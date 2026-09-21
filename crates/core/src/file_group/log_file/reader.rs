@@ -367,6 +367,7 @@ impl LogFileReader {
         &mut self,
         metadata_type: BlockMetadataType,
         format_version: &LogFormatVersion,
+        block_length: u64,
     ) -> Result<HashMap<BlockMetadataKey, String>> {
         match metadata_type {
             BlockMetadataType::Header if !format_version.has_header() => {
@@ -389,6 +390,26 @@ impl LogFileReader {
             let mut value_len_buf = [0u8; 4];
             self.reader.read_exact(&mut value_len_buf).await?;
             let value_len = u32::from_be_bytes(value_len_buf);
+            // A single metadata value lives entirely inside THIS block, so its
+            // declared length can never exceed the block length. Check that
+            // before reading.
+            //
+            // The reader's own `file_len` bound (`storage/reader.rs`) already
+            // refuses a read that runs past end-of-file, so an absurd
+            // `value_len` such as 0xFFFFFFFF is caught there and nothing is
+            // allocated. What that bound does NOT catch is a `value_len` that
+            // is larger than this block yet still inside the file: the read
+            // succeeds, silently consumes bytes belonging to the NEXT block,
+            // and surfaces as a confusing UTF-8 error (or, worse, a plausible
+            // string) far from the actual corruption. Bounding against
+            // `block_length` turns that into a precise diagnostic at the point
+            // of damage.
+            if value_len as u64 > block_length {
+                return Err(CoreError::LogFormatError(format!(
+                    "block metadata value length {value_len} exceeds block length \
+                     {block_length} (corrupt header/footer)"
+                )));
+            }
             let value_buf = self.reader.read_bytes(value_len as u64).await?;
             let value = String::from_utf8(value_buf.to_vec())
                 .map_err(|e| CoreError::Utf8Error(e.utf8_error()))?;
@@ -459,7 +480,7 @@ impl LogFileReader {
         let format_version = self.read_log_format_version().await?;
         let block_type = self.read_block_type(&format_version).await?;
         let header = self
-            .read_block_metadata(BlockMetadataType::Header, &format_version)
+            .read_block_metadata(BlockMetadataType::Header, &format_version, block_length)
             .await?;
 
         // The range starts at the content-length field, not after it, because
@@ -523,7 +544,7 @@ impl LogFileReader {
             };
         self.reader.seek_to(after_content);
         let footer = self
-            .read_block_metadata(BlockMetadataType::Footer, &format_version)
+            .read_block_metadata(BlockMetadataType::Footer, &format_version, block_length)
             .await?;
         let _ = self.read_total_block_length(&format_version).await?;
 
@@ -565,7 +586,7 @@ impl LogFileReader {
         let format_version = self.read_log_format_version().await?;
         let block_type = self.read_block_type(&format_version).await?;
         let header = self
-            .read_block_metadata(BlockMetadataType::Header, &format_version)
+            .read_block_metadata(BlockMetadataType::Header, &format_version, block_length)
             .await?;
         // If block is out of the requested range, fast skip its payload without decoding
         if self.should_skip_block(&header, instant_range)? {
@@ -605,7 +626,7 @@ impl LogFileReader {
         self.reader
             .seek_to(content_start + content_bytes.position());
         let footer = self
-            .read_block_metadata(BlockMetadataType::Footer, &format_version)
+            .read_block_metadata(BlockMetadataType::Footer, &format_version, block_length)
             .await?;
         let _ = self.read_total_block_length(&format_version).await?;
 
@@ -1563,6 +1584,104 @@ mod tests {
             "Should reach EOF after skipping the only block"
         );
 
+        Ok(())
+    }
+
+    /// A block-metadata value length must be bounded by the BLOCK, not merely by
+    /// the file.
+    ///
+    /// The reader's `file_len` bound already refuses a read running past
+    /// end-of-file, so an absurd `value_len` such as `0xFFFFFFFF` is caught
+    /// there and nothing is allocated. This pins the case that bound cannot
+    /// see: a `value_len` larger than its own block but still comfortably
+    /// inside the file. Without the block-length check the read SUCCEEDS,
+    /// silently consuming bytes that belong to whatever follows, and the damage
+    /// surfaces later as an opaque UTF-8 error — or not at all, if those bytes
+    /// happen to be valid UTF-8.
+    #[tokio::test]
+    async fn test_block_metadata_value_length_is_bounded_by_the_block() -> Result<()> {
+        const LOG_FORMAT_VERSION: u32 = 1;
+        const BLOCK_TYPE_AVRO_DATA: u32 = 3;
+        const HEADER_KEY_INSTANT_TIME: u32 = 0;
+
+        // One header entry whose declared value length is far larger than the
+        // block that contains it, while the real value is 3 bytes.
+        let bogus_value_len: u32 = 5_000;
+        let mut header = Vec::new();
+        header.extend_from_slice(&1u32.to_be_bytes()); // one entry
+        header.extend_from_slice(&HEADER_KEY_INSTANT_TIME.to_be_bytes());
+        header.extend_from_slice(&bogus_value_len.to_be_bytes());
+        header.extend_from_slice(b"abc");
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&LOG_FORMAT_VERSION.to_be_bytes());
+        body.extend_from_slice(&BLOCK_TYPE_AVRO_DATA.to_be_bytes());
+        body.extend_from_slice(&header);
+        body.extend_from_slice(&0u64.to_be_bytes()); // empty content
+        body.extend_from_slice(&0u32.to_be_bytes()); // empty footer
+
+        // The recorded length spans everything after it, the trailing pointer
+        // included; the trailing value counts the magic on top of that. Getting
+        // these right is what keeps `is_block_corrupted` from short-circuiting
+        // the walk before the header is ever parsed.
+        let block_length = (body.len() + 8) as u64;
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&block_length.to_be_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&(block_length + MAGIC.len() as u64).to_be_bytes());
+
+        assert!(
+            block_length < bogus_value_len as u64,
+            "the test is only meaningful while the declared value overruns its block"
+        );
+
+        // A block is only walked at all if what follows it is another MAGIC or
+        // EOF (`is_block_corrupted` -> `next_is_magic_or_eof`), so the padding
+        // that makes this file long has to be a REAL second block, not filler.
+        // It is also what makes the file long enough that the file-length bound
+        // cannot be the thing that rejects the overrun above — leaving the
+        // block-length check as the only candidate.
+        let filler = vec![b'x'; 8_000];
+        let mut header2 = Vec::new();
+        header2.extend_from_slice(&1u32.to_be_bytes());
+        header2.extend_from_slice(&HEADER_KEY_INSTANT_TIME.to_be_bytes());
+        header2.extend_from_slice(&(filler.len() as u32).to_be_bytes());
+        header2.extend_from_slice(&filler);
+
+        let mut body2 = Vec::new();
+        body2.extend_from_slice(&LOG_FORMAT_VERSION.to_be_bytes());
+        body2.extend_from_slice(&BLOCK_TYPE_AVRO_DATA.to_be_bytes());
+        body2.extend_from_slice(&header2);
+        body2.extend_from_slice(&0u64.to_be_bytes());
+        body2.extend_from_slice(&0u32.to_be_bytes());
+        let block_length2 = (body2.len() + 8) as u64;
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&block_length2.to_be_bytes());
+        out.extend_from_slice(&body2);
+        out.extend_from_slice(&(block_length2 + MAGIC.len() as u64).to_be_bytes());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file_name = "corrupt.log.1_0-0-0".to_string();
+        std::fs::write(tmp.path().join(&file_name), &out).unwrap();
+        assert!(
+            (out.len() as u64) > bogus_value_len as u64,
+            "the file must be long enough that file_len cannot reject the read"
+        );
+
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+        let mut reader = LogFileReader::new(hudi_configs, storage, &file_name).await?;
+
+        let err = reader
+            .read_all_blocks(&InstantRange::up_to("99991231235959999", "utc"))
+            .await
+            .expect_err("a metadata value overrunning its block must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds block length"),
+            "the error must name the block bound that rejected it, got: {msg}"
+        );
         Ok(())
     }
 }
