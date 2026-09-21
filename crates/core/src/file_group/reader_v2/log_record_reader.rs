@@ -41,7 +41,8 @@
 //! Drain deque via `pollLast` (tail-first) = oldest instant processed first.
 
 use crate::Result;
-use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType, LogBlock};
+use crate::error::CoreError;
+use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType, CommandBlock, LogBlock};
 use crate::file_group::log_file::reader::LogFileReader;
 use crate::file_group::reader_v2::buffer::HoodieFileGroupRecordBuffer;
 use crate::file_group::reader_v2::profiling::{profile_add, profile_once};
@@ -129,6 +130,14 @@ impl<'a> CompletionGate<'a> {
     }
 }
 
+/// Stand-in printed for a command block that carries no readable `INSTANT_TIME`
+/// header — a shape Java tolerates (`AbstractHoodieLogRecordScanner.java:486`
+/// reads the header with a map `get`, and its `COMMAND_BLOCK` arm at `:530-540`
+/// never touches the value). It reaches log lines only; no gate, map key or
+/// comparison ever sees it, because every one of them is guarded by
+/// `block_type != BlockType::Command`.
+const NO_INSTANT_TIME_HEADER: &str = "<no INSTANT_TIME header>";
+
 /// Run Pass 1: forward scan with 5 gates.
 ///
 /// Processes a flat list of blocks (from all log files, in file-read order)
@@ -180,18 +189,67 @@ pub fn forward_scan_pass1(
     for block in all_blocks {
         total_log_blocks += 1;
 
-        // Gate 1: Corrupt blocks → skip
+        // Gate 1: Corrupt blocks → skip.
+        //
+        // This is the ONLY block a header failure is allowed to skip, and it is
+        // skipped because Java skips it: `AbstractHoodieLogRecordScanner.java:488-493`
+        // ("Ignore the corrupt blocks. No further handling is required for them"),
+        // for a block `HoodieLogFileReader.readBlock` explicitly manufactured as
+        // corrupt after failing to parse it (`HoodieLogFileReader.java:128-146`).
+        // Every other unreadable header below returns `Err` rather than skipping.
+        //
+        // At `warn`, not `debug`: a skipped block changes the row count, and a
+        // CI run under `-Pwarn-log` must carry a trace of it. Java logs this at
+        // `debug`, so the LEVEL is a deliberate, reviewed divergence from the gold
+        // (sanctioned in R1 as concern 2) -- the behaviour is identical, and a
+        // row-count-changing skip that leaves no trace at `warn` is exactly the
+        // silent degradation D-8 exists to catch.
         if block.block_type == BlockType::Corrupted {
-            log::debug!("[Pass1] Gate1: corrupt block #{total_log_blocks} skipped");
+            log::warn!(
+                "[Pass1] Gate1: corrupt block #{total_log_blocks} skipped (the one block type \
+                 skipped by design, matching AbstractHoodieLogRecordScanner.java:488-493)"
+            );
             total_corrupt_blocks += 1;
             continue;
         }
 
+        // Java reads this header with a plain map `get`
+        // (`AbstractHoodieLogRecordScanner.java:486`), which yields null on absence
+        // and never throws, and it dereferences the value only where the block type
+        // makes it meaningful: the data/delete gate at `:494-495`
+        // (`logBlock.isDataOrDeleteBlock() && compareTimestamps(...)`) and the two
+        // gates at `:499-509`, both behind `getBlockType() != COMMAND_BLOCK`. The
+        // `COMMAND_BLOCK` arm at `:530-540` reads only `COMMAND_BLOCK_TYPE` and
+        // `TARGET_INSTANT_TIME`. So Java processes a command block with an absent
+        // or unreadable `INSTANT_TIME` normally, and requiring it here would be a
+        // divergence FROM the gold. The `?` is therefore scoped to exactly the
+        // population Java dereferences it for -- the same `!= Command` predicate
+        // the gates below already use.
+        //
+        // For that population an unreadable INSTANT_TIME is a failure, not a skip:
+        // skipping it silently drops that instant's updates (MISSING rows) or its
+        // deletes (wrong EXTRA rows), and the previous `continue` did so at `debug`
+        // level, invisible in CI. Java is loud there too: the very next thing it
+        // does with the header is
+        // `compareTimestamps(logBlock.getLogBlockHeader().get(INSTANT_TIME), GREATER_THAN, ...)`
+        // (`AbstractHoodieLogRecordScanner.java:494-495`, and `:293` in the v1
+        // scan), whose predicate is `commit1.compareTo(commit2)`
+        // (`InstantComparison.java:32,37`) -- a null header value throws there.
         let instant_time = match block.instant_time() {
-            Ok(t) => t.to_string(),
-            Err(_) => {
-                log::debug!("[Pass1] block #{total_log_blocks} has no instant time, skipping");
-                continue;
+            Ok(instant_time) => instant_time.to_string(),
+            // Command blocks only. Nothing below reads this value for them: every
+            // gate is guarded by `!= BlockType::Command`, and the command arm's
+            // own errors name TARGET_INSTANT_TIME, the header that arm reads. The
+            // placeholder exists solely so the shared trace line has something to
+            // print.
+            Err(_) if block.block_type == BlockType::Command => NO_INSTANT_TIME_HEADER.to_string(),
+            Err(e) => {
+                return Err(CoreError::LogBlockError(format!(
+                    "[Pass1] log block #{total_log_blocks} (type {:?}) has no readable instant \
+                     time: {e}. Only an explicit corrupt block may be skipped; a block whose \
+                     header cannot be read would silently change the row count.",
+                    block.block_type,
+                )));
             }
         };
 
@@ -250,17 +308,95 @@ pub fn forward_scan_pass1(
                 }
                 blocks_list.push(block);
             }
-            BlockType::Command if block.is_rollback_block() => {
+            // Every command block is classified, and one that cannot be is an
+            // error. `is_rollback_block()` reports `false` both for a genuine
+            // non-rollback command AND for a block whose COMMAND_BLOCK_TYPE header
+            // is missing or unparsable (`log_block.rs`, `matches!(…, Ok(Rollback))`),
+            // so a guard on it alone would let an unreadable header fall through to
+            // the catch-all arm and silently ignore what may have been a rollback --
+            // wrong EXTRA rows. Java throws
+            // `UnsupportedOperationException("Command type not yet supported.")` for
+            // both shapes (`AbstractHoodieLogRecordScanner.java:540`).
+            BlockType::Command => {
+                // `TARGET_INSTANT_TIME`, not `INSTANT_TIME`: those are the only two
+                // headers Java's `COMMAND_BLOCK` arm reads
+                // (`AbstractHoodieLogRecordScanner.java:530-540`), and a command
+                // block is not required to carry an `INSTANT_TIME` at all, so
+                // naming it here could only ever print the placeholder.
+                let target_for_errors = block.target_instant_time().unwrap_or("<unreadable>");
+                let command = block.command_block_type().map_err(|e| {
+                    CoreError::LogBlockError(format!(
+                        "[Pass1] command block #{total_log_blocks} \
+                         (target_instant={target_for_errors}) has no readable command block \
+                         type: {e}. Ignoring it would silently drop a rollback and leave the \
+                         rolled-back instant merged in."
+                    ))
+                })?;
+                // Exhaustive on purpose: a command type added later must be
+                // classified here rather than falling into a catch-all.
+                let CommandBlock::Rollback = command;
                 total_rollbacks += 1;
-                if let Ok(target) = block.target_instant_time() {
-                    let target = target.to_string();
-                    log::debug!("[Pass1] ROLLBACK: removing instant={target}");
-                    target_rollback_instants.insert(target.clone());
-                    ordered_instants_list.retain(|t| t != &target);
-                    instant_to_blocks_map.remove(&target);
-                }
+                // Same rule, and the more damaging direction: ignoring a rollback
+                // block whose TARGET_INSTANT_TIME cannot be read leaves the
+                // rolled-back instant merged into the result -- wrong EXTRA rows,
+                // from a write that was explicitly undone. Java dereferences this
+                // header unconditionally
+                // (`AbstractHoodieLogRecordScanner.java:349`,
+                // `targetInstantForCommandBlock.contentEquals(...)`), so a missing
+                // value throws there.
+                let target = block
+                    .target_instant_time()
+                    .map_err(|e| {
+                        CoreError::LogBlockError(format!(
+                            "[Pass1] rollback command block #{total_log_blocks} has no readable \
+                             target instant time: {e}. Ignoring it would leave the rolled-back \
+                             instant merged in."
+                        ))
+                    })?
+                    .to_string();
+                log::debug!("[Pass1] ROLLBACK: removing instant={target}");
+                target_rollback_instants.insert(target.clone());
+                ordered_instants_list.retain(|t| t != &target);
+                instant_to_blocks_map.remove(&target);
             }
-            _ => {}
+            // No `_` arm, deliberately: with every variant named, a block type
+            // added to `BlockType` later is a COMPILE error here rather than a
+            // silent drop. That is the property the `CommandBlock` destructuring
+            // above already buys for command types, applied to the outer match.
+            //
+            // CDC blocks are real, decodable data elsewhere in this crate
+            // (`LogBlock::is_data_block()` counts them, and `log_file/scanner.rs`
+            // decodes their content), so the old `_ => {}` dropped rows with `Ok`.
+            // Java does not classify them either -- CDC_DATA_BLOCK is absent from
+            // its switch, so it falls to
+            // `default: throw new UnsupportedOperationException("Block type not yet supported.")`
+            // (`AbstractHoodieLogRecordScanner.java:543`). Supporting them is a
+            // separate change needing its own Java comparison; what it must not be
+            // is a silent `Ok`.
+            BlockType::CdcData => {
+                return Err(CoreError::LogBlockError(format!(
+                    "[Pass1] log block #{total_log_blocks} (instant={instant_time}) is a CDC \
+                     data block, which this scan does not classify. Java throws \
+                     UnsupportedOperationException(\"Block type not yet supported.\") for it \
+                     (AbstractHoodieLogRecordScanner.java:543)."
+                )));
+            }
+            // Gate 1 above `continue`s on every corrupt block, so this arm cannot
+            // be reached. Named rather than left to a wildcard so the match stays
+            // exhaustive by enumeration.
+            //
+            // `return Err`, not `unreachable!`: the panic was safe today because
+            // the JNI boundary catches unwinds (`crates/jni/src/lib.rs:188,240`),
+            // but the crate's stated rule is no reachable panic, and under a
+            // `panic = "abort"` profile this would kill the JVM instead of raising
+            // a Java exception. An `Err` costs nothing and keeps the rule uniform.
+            BlockType::Corrupted => {
+                return Err(CoreError::LogBlockError(format!(
+                    "[Pass1] log block #{total_log_blocks} reached classification as a corrupt \
+                     block. Gate 1 skips every corrupt block before this point, so this is a \
+                     broken invariant inside Pass 1, not bad input."
+                )));
+            }
         }
     }
 
@@ -327,7 +463,21 @@ pub struct Pass2Result {
 ///
 /// **Invariant 4**: `current_instant_log_blocks` is ordered latest-first (reverse chronological).
 /// Drain via `pop_back` produces oldest-first processing order.
-pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
+///
+/// ## Why this returns `Result`
+///
+/// Every one of the three block lookups below is guaranteed to hit for a
+/// [`Pass1Result`] that [`forward_scan_pass1`] actually built (see the comment at
+/// each site). But `Pass1Result` is a `pub` struct with `pub` fields and this is a
+/// `pub` function, so the guarantee is a property of one caller, not of the type —
+/// and the failure it guards is not a crash but a **silent wrong row count**: the
+/// old code `continue`d or `unwrap_or_default()`ed, returned `Ok`, and handed back
+/// a scan with an instant's rows missing, or with the instant recorded in
+/// `instant_times_included`/`valid_block_instants` and **no** blocks enqueued —
+/// breaking Invariant 2 above. That is exactly the shape the R1 fail-loud wave
+/// removed from Pass 1, so it is made loud here rather than left to a
+/// `debug_assert!` that vanishes in the release build the JNI library ships.
+pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Result<Pass2Result> {
     log::debug!(
         "[Pass2] reverse_scan: {} instants to process (newest→oldest)",
         pass1.ordered_instants_list.len(),
@@ -340,9 +490,31 @@ pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
 
     for i in (0..pass1.ordered_instants_list.len()).rev() {
         let instant_time = &pass1.ordered_instants_list[i];
+        // Pass 1 pushes an instant onto `ordered_instants_list` only inside the
+        // data/delete arm, at the moment its (freshly `or_default()`ed) block list
+        // is about to receive its first block, and its rollback arm drops the
+        // target from the list and the map in the same two statements. So for a
+        // `Pass1Result` that `forward_scan_pass1` built, neither miss below can
+        // happen -- but `Pass1Result` is `pub` with `pub` fields and this is a
+        // `pub` fn, so the guarantee is not enforceable at the type level. A miss
+        // is therefore reported, not skipped: the old `_ => continue` returned
+        // `Ok` with that instant's rows silently absent.
         let instants_blocks = match pass1.instant_to_blocks_map.get(instant_time) {
             Some(blocks) if !blocks.is_empty() => blocks,
-            _ => continue,
+            Some(_) => {
+                return Err(CoreError::LogBlockError(format!(
+                    "[Pass2] instant {instant_time} is in ordered_instants_list but its entry in \
+                     instant_to_blocks_map is empty. Skipping it would drop that instant's rows \
+                     and return Ok (Invariant 2)."
+                )));
+            }
+            None => {
+                return Err(CoreError::LogBlockError(format!(
+                    "[Pass2] instant {instant_time} is in ordered_instants_list but absent from \
+                     instant_to_blocks_map. Skipping it would drop that instant's rows and \
+                     return Ok (Invariant 2)."
+                )));
+            }
         };
 
         let first_block = &instants_blocks[0];
@@ -369,24 +541,47 @@ pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
                 if instant_times_included.contains(&final_instant) {
                     continue;
                 }
-                if let Some(blocks) = pass1.instant_to_blocks_map.get(&final_instant) {
-                    let mut reversed = blocks.clone();
-                    reversed.reverse();
-                    for block in reversed {
-                        current_instant_log_blocks.push_back(block);
-                    }
+                // The value side of `block_time_to_compaction_block_time_map` is
+                // always an instant that the guard above already admitted: every
+                // insert takes `final_instant` either from the instant being
+                // visited (admitted this iteration) or from an existing value of
+                // the same map (admitted inductively), and nothing in this loop
+                // mutates `instant_to_blocks_map`. So this lookup cannot miss --
+                // but the old `if let` with no `else` fell through to the two
+                // pushes below, recording the instant in
+                // `instant_times_included`/`valid_block_instants` with **zero**
+                // blocks enqueued: Invariant 2 broken, `Ok` returned, rows gone.
+                let Some(blocks) = pass1.instant_to_blocks_map.get(&final_instant) else {
+                    return Err(CoreError::LogBlockError(format!(
+                        "[Pass2] instant {instant_time} resolves through compaction to \
+                         {final_instant}, which is absent from instant_to_blocks_map. Recording \
+                         it with no blocks would break Invariant 2 and return Ok."
+                    )));
+                };
+                let mut reversed = blocks.clone();
+                reversed.reverse();
+                for block in reversed {
+                    current_instant_log_blocks.push_back(block);
                 }
                 instant_times_included.insert(final_instant.clone());
                 valid_block_instants.push(final_instant);
             } else {
                 // Not compacted — add blocks directly
                 // Java: Collections.reverse(logBlocks) then forEach(addLast)
-                let blocks = pass1
-                    .instant_to_blocks_map
-                    .get(instant_time)
-                    .cloned()
-                    .unwrap_or_default();
-                let mut reversed = blocks;
+                //
+                // Same key as the guard at the top of this iteration, which already
+                // admitted it as present and non-empty; the lookup is repeated only
+                // because that borrow had to be released. `unwrap_or_default()` here
+                // would silently enqueue nothing for an instant it then records --
+                // the same Invariant 2 break as above.
+                let Some(blocks) = pass1.instant_to_blocks_map.get(instant_time) else {
+                    return Err(CoreError::LogBlockError(format!(
+                        "[Pass2] instant {instant_time} passed the block-list guard but is now \
+                         absent from instant_to_blocks_map. Enqueuing nothing for it would break \
+                         Invariant 2 and return Ok."
+                    )));
+                };
+                let mut reversed = blocks.clone();
                 reversed.reverse();
                 for block in reversed {
                     current_instant_log_blocks.push_back(block);
@@ -403,11 +598,11 @@ pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
         valid_block_instants,
     );
 
-    Pass2Result {
+    Ok(Pass2Result {
         current_instant_log_blocks,
         instant_times_included,
         valid_block_instants,
-    }
+    })
 }
 
 // =========================================================================
@@ -558,7 +753,7 @@ impl BaseHoodieLogRecordReader {
         self.total_rollbacks = pass1.total_rollbacks;
 
         // Pass 2: Reverse iteration with compaction resolution
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 = reverse_scan_pass2(&mut pass1)?;
 
         self.valid_block_instants = pass2.valid_block_instants;
 
@@ -947,7 +1142,13 @@ impl BaseHoodieLogRecordReader {
                         )?;
                     }
                 }
-                _ => {}
+                // Nothing to decode. Enumerated rather than left to `_ => {}` for
+                // the same reason as the Pass 1 classify match: a block type added
+                // to `BlockType` later must be a compile error here, not a silent
+                // pass-through. Pass 2 only ever enqueues the four data/delete
+                // types above (`instant_to_blocks_map` is filled by exactly that
+                // arm of Pass 1), so none of these three actually arrives.
+                BlockType::Command | BlockType::CdcData | BlockType::Corrupted => {}
             }
 
             match block.block_type {
@@ -967,10 +1168,17 @@ impl BaseHoodieLogRecordReader {
                         self.record_buffer.process_delete_block(block)
                     )?;
                 }
-                BlockType::Corrupted => {
-                    log::warn!("Found corrupt block not rolled back");
-                }
-                _ => {}
+                // Nothing to merge, and nothing reaches here: Pass 2 builds its
+                // deque only from `instant_to_blocks_map`, which Pass 1 fills from
+                // the data/delete arm alone -- a command block is consumed by the
+                // rollback arm, a corrupt block is skipped by Gate 1, and a CDC
+                // block is an error. The `BlockType::Corrupted =>
+                // warn!("Found corrupt block not rolled back")` that used to sit
+                // here is deleted rather than kept: it described a state that
+                // cannot occur, and a `warn` that can never fire is worse than no
+                // arm at all. Enumerated, not `_ => {}`, so a new `BlockType` is a
+                // compile error here.
+                BlockType::Command | BlockType::CdcData | BlockType::Corrupted => {}
             }
         }
         Ok(())
@@ -984,7 +1192,7 @@ impl BaseHoodieLogRecordReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_group::log_file::log_block::{CommandBlock, LogBlockContent};
+    use crate::file_group::log_file::log_block::LogBlockContent;
     use crate::file_group::log_file::log_format::LogFormatVersion;
     use crate::file_group::reader_v2::MAX_INSTANT_TIME;
 
@@ -1264,6 +1472,19 @@ mod tests {
             LogFormatVersion::V1,
             BlockType::Corrupted,
             HashMap::new(),
+            LogBlockContent::Empty,
+            HashMap::new(),
+        )
+    }
+
+    /// Create a CDC data block with given instant time.
+    fn make_cdc_block(instant_time: &str) -> LogBlock {
+        let mut header = HashMap::new();
+        header.insert(BlockMetadataKey::InstantTime, instant_time.to_string());
+        LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::CdcData,
+            header,
             LogBlockContent::Empty,
             HashMap::new(),
         )
@@ -1697,7 +1918,8 @@ mod tests {
             make_data_block("t3"),
         ];
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
-        let pass2 = reverse_scan_pass2(&mut pass1);
+        let pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         let included: HashSet<&String> = pass2.instant_times_included.iter().collect();
         let valid: HashSet<&String> = pass2.valid_block_instants.iter().collect();
@@ -1718,7 +1940,8 @@ mod tests {
             make_data_block("t3"),
         ];
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
-        let pass2 = reverse_scan_pass2(&mut pass1);
+        let pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // All blocks in deque belong to valid instants
         for block in &pass2.current_instant_log_blocks {
@@ -1755,7 +1978,8 @@ mod tests {
             make_compacted_block("i3", "i1,i2"),
         ];
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
-        let pass2 = reverse_scan_pass2(&mut pass1);
+        let pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // Only i3 (compacted) should be in valid_block_instants
         assert_eq!(pass2.valid_block_instants, vec!["i3"]);
@@ -1782,7 +2006,8 @@ mod tests {
             make_data_block("t3"),
         ];
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // pop_back drains tail-first = oldest first
         let first = pass2.current_instant_log_blocks.pop_back().unwrap();
@@ -1824,7 +2049,8 @@ mod tests {
         // Verify pass1 accumulated correctly
         assert_eq!(pass1.instant_to_blocks_map["t2"].len(), 2);
 
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // Drain via pop_back: should be t1's blocks, then t2's in original order
         let b1 = pass2.current_instant_log_blocks.pop_back().unwrap();
@@ -1862,7 +2088,8 @@ mod tests {
         assert_eq!(pass1.ordered_instants_list, vec!["20250101", "20250103"]);
         assert!(!pass1.instant_to_blocks_map.contains_key("20250102"));
 
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // pop_back: B1(20250101) first, then B4(20250103)
         let first = pass2.current_instant_log_blocks.pop_back().unwrap();
@@ -1896,7 +2123,8 @@ mod tests {
         assert_eq!(pass1.instant_to_blocks_map["t2"].len(), 1);
         assert_eq!(pass1.instant_to_blocks_map["t3"].len(), 2);
 
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // Deque has 5 blocks. pop_back should produce: A,B,C,D,E
         assert_eq!(pass2.current_instant_log_blocks.len(), 5);
@@ -2034,7 +2262,8 @@ mod tests {
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
         assert_eq!(pass1.ordered_instants_list, vec!["t1", "t2", "t3"]);
 
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         // Verify deque ordering: pop_back gives t1, t2, t3 (oldest first)
         let mut buffer = make_test_buffer();
@@ -2101,7 +2330,8 @@ mod tests {
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
         assert_eq!(pass1.instant_to_blocks_map["t1"].len(), 2);
 
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         let mut buffer = make_test_buffer();
         let mut order_instants = Vec::new();
@@ -2193,7 +2423,8 @@ mod tests {
         ];
 
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         let mut buffer = make_test_buffer();
         while let Some(mut block) = pass2.current_instant_log_blocks.pop_back() {
@@ -2242,7 +2473,8 @@ mod tests {
         ];
 
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc", None).unwrap();
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
 
         let mut buffer = make_test_buffer();
         while let Some(mut block) = pass2.current_instant_log_blocks.pop_back() {
@@ -2302,7 +2534,8 @@ mod tests {
         assert_eq!(pass1.ordered_instants_list, vec!["20250103"]);
         assert!(!pass1.instant_to_blocks_map.contains_key("20250102"));
 
-        let mut pass2 = reverse_scan_pass2(&mut pass1);
+        let mut pass2 =
+            reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is well formed by construction");
         let mut buffer = make_test_buffer();
         while let Some(mut block) = pass2.current_instant_log_blocks.pop_back() {
             buffer.process_data_block(&mut block).unwrap();
@@ -2380,5 +2613,295 @@ mod tests {
             gated.instant_to_blocks_map.contains_key("T2_done"),
             "the committed instant must still be merged"
         );
+    }
+
+    // =====================================================================
+    // Fail-loud on an unreadable log block header (OI-59 / RV-10)
+    //
+    // Java skips exactly one kind of block by design -- an explicit
+    // CORRUPT_BLOCK (`AbstractHoodieLogRecordScanner.java:488-493`, and the
+    // `readBlock` that manufactures it at `HoodieLogFileReader.java:128-146`).
+    // Every other unreadable header is loud there: a data/delete block with no
+    // INSTANT_TIME reaches `compareTimestamps(null, GREATER_THAN, ...)`
+    // (`AbstractHoodieLogRecordScanner.java:495`), whose predicate is
+    // `commit1.compareTo(commit2)` (`InstantComparison.java:32,37`) and throws;
+    // a rollback block with no TARGET_INSTANT_TIME reaches
+    // `targetInstantForCommandBlock.contentEquals(...)`
+    // (`AbstractHoodieLogRecordScanner.java:349`) and throws.
+    // =====================================================================
+
+    /// A data block whose header carries no instant time must fail the scan, not
+    /// be dropped: dropping it loses that instant's updates (MISSING rows) with
+    /// no trace at `warn` level.
+    #[test]
+    fn test_pass1_errs_on_a_data_block_with_no_instant_time() {
+        let mut block = make_data_block("20250101");
+        block.header.remove(&BlockMetadataKey::InstantTime);
+
+        let err = forward_scan_pass1(
+            vec![block, make_data_block("20250102")],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect_err("a block whose instant time cannot be read must not be skipped");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("instant time"),
+            "the error must name what could not be read, got: {msg}"
+        );
+    }
+
+    /// Same for a delete block -- dropping one silently resurrects the records it
+    /// deletes (wrong EXTRA rows).
+    #[test]
+    fn test_pass1_errs_on_a_delete_block_with_no_instant_time() {
+        let mut block = make_delete_block("20250101");
+        block.header.remove(&BlockMetadataKey::InstantTime);
+
+        forward_scan_pass1(vec![block], MAX_INSTANT_TIME, &None, "utc", None)
+            .expect_err("a delete block whose instant time cannot be read must not be skipped");
+    }
+
+    /// A rollback block whose TARGET_INSTANT_TIME cannot be read must fail the
+    /// scan. Ignoring it leaves the rolled-back instant merged into the result --
+    /// wrong EXTRA rows, and the failure mode the reviewer flagged.
+    #[test]
+    fn test_pass1_errs_on_a_rollback_block_with_no_target_instant() {
+        let mut rollback = make_rollback_block("20250102", "20250101");
+        rollback.header.remove(&BlockMetadataKey::TargetInstantTime);
+
+        let err = forward_scan_pass1(
+            vec![make_data_block("20250101"), rollback],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect_err("a rollback block with an unreadable target must not be ignored");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("target instant") || msg.contains("Target instant"),
+            "the error must name what could not be read, got: {msg}"
+        );
+    }
+
+    /// A command block whose COMMAND_BLOCK_TYPE header is missing cannot be
+    /// classified, and `is_rollback_block()` reports `false` for it exactly as it
+    /// does for a genuine non-rollback command. Falling through to the catch-all
+    /// arm would silently ignore a block that may well have been a rollback --
+    /// wrong EXTRA rows. Java throws `UnsupportedOperationException("Command type
+    /// not yet supported.")` at `AbstractHoodieLogRecordScanner.java:540` for both
+    /// shapes, so hudi-rs errors for both too.
+    #[test]
+    fn test_pass1_errs_on_a_command_block_with_no_command_block_type() {
+        let mut command = make_rollback_block("20250102", "20250101");
+        command.header.remove(&BlockMetadataKey::CommandBlockType);
+
+        let err = forward_scan_pass1(
+            vec![make_data_block("20250101"), command],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect_err("a command block that cannot be classified must not be ignored");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("command block type"),
+            "the error must name the missing header, got: {msg}"
+        );
+    }
+
+    /// Same rule for a header that is present but does not parse: `CommandBlock`
+    /// has exactly one variant, so any other value is a block this reader cannot
+    /// act on, and Java's `default:` arm throws.
+    #[test]
+    fn test_pass1_errs_on_a_command_block_with_an_unparsable_command_block_type() {
+        let mut command = make_rollback_block("20250102", "20250101");
+        command.header.insert(
+            BlockMetadataKey::CommandBlockType,
+            "not-a-number".to_string(),
+        );
+
+        forward_scan_pass1(
+            vec![make_data_block("20250101"), command],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect_err("an unparsable command block type must not be ignored");
+    }
+
+    /// A CDC data block was the one type the classify match's `_ => {}` arm still
+    /// swallowed. `is_data_block()` counts it as data and `log_file/scanner.rs`
+    /// decodes it as record content, so it is real, decodable data that pass 1
+    /// alone dropped with `Ok` -- MISSING rows, no trace. Java's `default:` arm
+    /// throws `UnsupportedOperationException("Block type not yet supported.")`
+    /// (`AbstractHoodieLogRecordScanner.java:543`), because CDC_DATA_BLOCK is not
+    /// in its switch either.
+    #[test]
+    fn test_pass1_errs_on_a_cdc_data_block() {
+        let err = forward_scan_pass1(
+            vec![make_data_block("20250101"), make_cdc_block("20250102")],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect_err("a CDC data block must not be silently dropped");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CDC") || msg.contains("CdcData"),
+            "the error must name the block type, got: {msg}"
+        );
+    }
+
+    /// The one sanctioned skip stays a skip: an explicit corrupt block is still
+    /// counted and stepped over, exactly as Java does, and does not become an
+    /// error just because the fail-loud rule above tightened.
+    #[test]
+    fn test_pass1_still_skips_an_explicit_corrupt_block() {
+        let result = forward_scan_pass1(
+            vec![make_corrupt_block(), make_data_block("20250101")],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect("a corrupt block is the one block type Java skips by design");
+
+        assert_eq!(result.total_corrupt_blocks, 1);
+        assert_eq!(result.ordered_instants_list, vec!["20250101"]);
+    }
+
+    /// Java never dereferences `INSTANT_TIME` for a command block, so hudi-rs must
+    /// not either. `AbstractHoodieLogRecordScanner.java:486` reads the header with
+    /// a plain map `get` (null on absence, no throw); `:494-495` dereferences it
+    /// only under `isDataOrDeleteBlock()`; `:499-509` gates on it only when
+    /// `getBlockType() != COMMAND_BLOCK`; and the `COMMAND_BLOCK` arm at `:530-540`
+    /// reads only `COMMAND_BLOCK_TYPE` and `TARGET_INSTANT_TIME`. A rollback block
+    /// with an absent `INSTANT_TIME` therefore rolls its target back in Java, and
+    /// hard-failing the whole scan on it would be a divergence FROM the gold
+    /// introduced BY the fail-loud wave.
+    #[test]
+    fn test_pass1_processes_a_command_block_with_no_instant_time() {
+        let mut rollback = make_rollback_block("20250102", "20250101");
+        rollback.header.remove(&BlockMetadataKey::InstantTime);
+
+        let result = forward_scan_pass1(
+            vec![make_data_block("20250101"), rollback],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect("Java processes a command block whose INSTANT_TIME header is absent");
+
+        assert_eq!(
+            result.total_rollbacks, 1,
+            "the rollback must be counted, not rejected"
+        );
+        assert!(
+            result.ordered_instants_list.is_empty(),
+            "the rollback's target must still be removed, got {:?}",
+            result.ordered_instants_list,
+        );
+        assert!(
+            !result.instant_to_blocks_map.contains_key("20250101"),
+            "the rolled-back instant's blocks must be dropped"
+        );
+    }
+
+    /// Invariant 2 of `reverse_scan_pass2` says every instant in
+    /// `instant_times_included`/`valid_block_instants` has its blocks in
+    /// `current_instant_log_blocks`. An instant that is in `ordered_instants_list`
+    /// but has no blocks in `instant_to_blocks_map` is the input that breaks it,
+    /// and the old `_ => continue` swallowed it: `Ok`, one instant fewer, no error
+    /// and nothing at `warn` -- the exact silent-wrong-row-count shape the R1 wave
+    /// removed one function up.
+    #[test]
+    fn test_pass2_errs_when_an_ordered_instant_has_no_blocks() {
+        let mut pass1 = forward_scan_pass1(
+            vec![make_data_block("20250101")],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect("pass 1 accepts a lone data block");
+        pass1.ordered_instants_list.push("20250102".to_string());
+
+        let err = reverse_scan_pass2(&mut pass1)
+            .expect_err("an ordered instant with no blocks must not be skipped in silence");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("20250102"),
+            "the error must name the instant, got: {msg}"
+        );
+        assert!(
+            msg.contains("Invariant 2"),
+            "the error must name the invariant it protects, got: {msg}"
+        );
+    }
+
+    /// The other half of the same guard: present in the map, but with an empty
+    /// block list. Pass 1 never produces one (`entry(..).or_default()` is followed
+    /// immediately by a `push`), and it is just as wrong to drop in silence.
+    #[test]
+    fn test_pass2_errs_when_an_ordered_instant_has_an_empty_block_list() {
+        let mut pass1 = forward_scan_pass1(
+            vec![make_data_block("20250101")],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect("pass 1 accepts a lone data block");
+        pass1.ordered_instants_list.push("20250102".to_string());
+        pass1
+            .instant_to_blocks_map
+            .insert("20250102".to_string(), Vec::new());
+
+        let err = reverse_scan_pass2(&mut pass1)
+            .expect_err("an empty block list must not be skipped in silence");
+
+        assert!(
+            err.to_string().contains("20250102"),
+            "the error must name the instant, got: {err}"
+        );
+    }
+
+    /// The well-formed path is unchanged: every instant Pass 1 ordered still gets
+    /// its blocks enqueued, newest-first, and Pass 2 still returns `Ok`.
+    #[test]
+    fn test_pass2_still_ok_for_a_well_formed_pass1_result() {
+        let mut pass1 = forward_scan_pass1(
+            vec![
+                make_data_block("20250101"),
+                make_data_block("20250102"),
+                make_delete_block("20250103"),
+            ],
+            MAX_INSTANT_TIME,
+            &None,
+            "utc",
+            None,
+        )
+        .expect("pass 1");
+
+        let pass2 = reverse_scan_pass2(&mut pass1).expect("a Pass 1 result is always well formed");
+
+        assert_eq!(
+            pass2.valid_block_instants,
+            vec!["20250103", "20250102", "20250101"]
+        );
+        assert_eq!(pass2.current_instant_log_blocks.len(), 3);
     }
 }

@@ -18,7 +18,7 @@
  */
 use crate::Result;
 use crate::config::HudiConfigs;
-use crate::file_group::log_file::log_block::{BlockType, LogBlock, LogBlockContent};
+use crate::file_group::log_file::log_block::{BlockType, CommandBlock, LogBlock, LogBlockContent};
 use crate::file_group::log_file::reader::LogFileReader;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::HFileRecord;
@@ -104,23 +104,55 @@ struct CollectedBlocks {
 }
 
 impl CollectedBlocks {
-    /// Iterate over all blocks, filtering out rollback blocks and rolled-back data.
-    fn iter_valid_blocks(self) -> impl Iterator<Item = LogBlock> {
+    /// Every block that survives rollback filtering, in log order.
+    ///
+    /// Loud where Java is loud (`AbstractHoodieLogRecordScanner`): a COMMAND block whose
+    /// `COMMAND_BLOCK_TYPE` cannot be read is an error (Java's `HoodieCommandBlock` fails in its own
+    /// header read), and a non-command block whose `INSTANT_TIME` cannot be read is an error (Java
+    /// dereferences it for every data/delete block). Before OI-63 both were skipped silently, which
+    /// let a rolled-back instant stay merged.
+    fn valid_blocks(self) -> Result<Vec<LogBlock>> {
         let rollback_targets = self.rollback_targets;
-        self.all_blocks.into_iter().flatten().filter(move |block| {
-            // Skip rollback command blocks (they have no content)
-            if block.is_rollback_block() {
-                return false;
+        let mut out = Vec::new();
+        for block in self.all_blocks.into_iter().flatten() {
+            if block.block_type == BlockType::Command {
+                // Defence in depth: `rollback_targets_of` already read every command block's
+                // type (and its own `?` would have failed loud) while collecting rollback
+                // targets, above. Exhaustive on purpose here too: a command type added later
+                // must be classified explicitly rather than falling into a silent skip.
+                let CommandBlock::Rollback = block.command_block_type()?;
+                continue; // rollback blocks carry no content
             }
-            // Skip blocks whose instant time was rolled back
-            match block.instant_time() {
-                Ok(instant) => !rollback_targets.contains(instant),
-                // If we can't get the instant time, include the block
-                // and let downstream handle the error
-                Err(_) => true,
+            if block.block_type == BlockType::Corrupted {
+                continue; // an explicit corrupt block was already reported (warned) by the reader; Java skips it too
             }
-        })
+            let instant = block.instant_time().map_err(|e| {
+                crate::error::CoreError::LogBlockError(format!(
+                    "{:?} block has no readable INSTANT_TIME: {e}",
+                    block.block_type
+                ))
+            })?;
+            if rollback_targets.contains(instant) {
+                continue;
+            }
+            out.push(block);
+        }
+        Ok(out)
     }
+}
+
+/// The instants the rollback command blocks in `blocks` target. An unreadable COMMAND_BLOCK_TYPE or
+/// TARGET_INSTANT_TIME on a command block is an error, not "not a rollback" (OI-63).
+fn rollback_targets_of(blocks: &[LogBlock]) -> Result<HashSet<String>> {
+    let mut targets = HashSet::new();
+    for block in blocks {
+        if block.block_type == BlockType::Command
+            && block.command_block_type()? == CommandBlock::Rollback
+        {
+            targets.insert(block.target_instant_time()?.to_string());
+        }
+    }
+    Ok(targets)
 }
 
 #[derive(Debug)]
@@ -152,11 +184,7 @@ impl LogFileScanner {
             let blocks = reader.read_all_blocks(instant_range).await?;
 
             // Collect rollback targets from command blocks
-            for block in &blocks {
-                if block.is_rollback_block() {
-                    rollback_targets.insert(block.target_instant_time()?.to_string());
-                }
-            }
+            rollback_targets.extend(rollback_targets_of(&blocks)?);
 
             all_blocks.push(blocks);
         }
@@ -230,14 +258,16 @@ impl LogFileScanner {
                             num_delete_batches += records.num_delete_batches();
                         }
                     }
-                    _ => {}
+                    // Enumerated, not `_ => {}`, so a new `BlockType` must be
+                    // classified here rather than silently left out of the count.
+                    BlockType::Command | BlockType::Corrupted | BlockType::HfileData => {}
                 }
             }
         }
 
         // Collect valid record batches
         let mut batches = RecordBatches::new_with_capacity(num_data_batches, num_delete_batches);
-        for block in collected.iter_valid_blocks() {
+        for block in collected.valid_blocks()? {
             if let LogBlockContent::Records(records) = block.content {
                 batches.extend(records);
             }
@@ -262,7 +292,7 @@ impl LogFileScanner {
 
         // Collect valid HFile records
         let mut records = Vec::with_capacity(total_records);
-        for block in collected.iter_valid_blocks() {
+        for block in collected.valid_blocks()? {
             if let LogBlockContent::HFileRecords(hfile_records) = block.content {
                 records.extend(hfile_records);
             }
@@ -304,6 +334,10 @@ impl LogFileScanner {
 mod tests {
     use super::*;
     use crate::config::HudiConfigs;
+    use crate::file_group::log_file::log_block::{
+        BlockMetadataKey, BlockType, LogBlock, LogBlockContent,
+    };
+    use crate::file_group::log_file::log_format::LogFormatVersion;
     use crate::file_group::record_batches::RecordBatches;
     use crate::hfile::HFileReader;
     use crate::metadata::table_record::{
@@ -312,7 +346,113 @@ mod tests {
     use crate::storage::util::parse_uri;
     use apache_avro::Schema as AvroSchema;
     use hudi_test::QuickstartTripsTable;
+    use std::collections::HashMap;
     use std::path::PathBuf;
+
+    // ============================================================================
+    // OI-63: v1 scanner fails loud on unreadable command-block type / instant time
+    // ============================================================================
+
+    fn block(block_type: BlockType, header: &[(BlockMetadataKey, &str)]) -> LogBlock {
+        let header = header
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string()))
+            .collect::<HashMap<_, _>>();
+        LogBlock::new(
+            LogFormatVersion::V1,
+            block_type,
+            header,
+            LogBlockContent::Empty,
+            HashMap::new(),
+        )
+    }
+
+    /// OI-63: a command block whose COMMAND_BLOCK_TYPE is missing is an error — before the fix it read as
+    /// "not a rollback" and the instant it targeted stayed merged.
+    #[test]
+    fn rollback_targets_err_on_a_command_block_with_no_command_block_type() {
+        let blocks = vec![block(
+            BlockType::Command,
+            &[
+                (BlockMetadataKey::InstantTime, "002"),
+                (BlockMetadataKey::TargetInstantTime, "001"),
+            ],
+        )];
+        let err = rollback_targets_of(&blocks)
+            .expect_err("an unreadable COMMAND_BLOCK_TYPE must be loud");
+        assert!(err.to_string().to_lowercase().contains("command"), "{err}");
+    }
+
+    #[test]
+    fn rollback_targets_collect_a_well_formed_rollback() {
+        let blocks = vec![block(
+            BlockType::Command,
+            &[
+                (BlockMetadataKey::InstantTime, "002"),
+                (BlockMetadataKey::TargetInstantTime, "001"),
+                (BlockMetadataKey::CommandBlockType, "0"),
+            ],
+        )];
+        let targets = rollback_targets_of(&blocks).unwrap();
+        assert_eq!(targets, ["001".to_string()].into_iter().collect());
+    }
+
+    /// OI-63: a data block with no INSTANT_TIME is an error (Java dereferences the header for every
+    /// data/delete block) — before the fix it was kept with a comment "let downstream handle the error".
+    #[test]
+    fn valid_blocks_err_on_a_data_block_with_no_instant_time() {
+        let collected = CollectedBlocks {
+            all_blocks: vec![vec![block(BlockType::AvroData, &[])]],
+            rollback_targets: HashSet::new(),
+        };
+        let err = collected
+            .valid_blocks()
+            .expect_err("a data block without INSTANT_TIME must be loud");
+        assert!(err.to_string().contains("INSTANT_TIME"), "{err}");
+    }
+
+    /// The rollback filter still applies: the rolled-back instant's data block is dropped, the command
+    /// block itself yields nothing, the surviving block comes through.
+    #[test]
+    fn valid_blocks_drop_rolled_back_instants_and_command_blocks() {
+        let collected = CollectedBlocks {
+            all_blocks: vec![vec![
+                block(
+                    BlockType::AvroData,
+                    &[(BlockMetadataKey::InstantTime, "001")],
+                ),
+                block(
+                    BlockType::Command,
+                    &[
+                        (BlockMetadataKey::InstantTime, "002"),
+                        (BlockMetadataKey::TargetInstantTime, "001"),
+                        (BlockMetadataKey::CommandBlockType, "0"),
+                    ],
+                ),
+                block(
+                    BlockType::AvroData,
+                    &[(BlockMetadataKey::InstantTime, "003")],
+                ),
+            ]],
+            rollback_targets: ["001".to_string()].into_iter().collect(),
+        };
+        let kept = collected.valid_blocks().unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].instant_time().unwrap(), "003");
+    }
+
+    /// A command block whose COMMAND_BLOCK_TYPE is unreadable must not pass through valid_blocks either.
+    #[test]
+    fn valid_blocks_err_on_a_command_block_with_no_command_block_type() {
+        let collected = CollectedBlocks {
+            all_blocks: vec![vec![block(
+                BlockType::Command,
+                &[(BlockMetadataKey::InstantTime, "002")],
+            )]],
+            rollback_targets: HashSet::new(),
+        };
+        assert!(collected.valid_blocks().is_err());
+    }
 
     // ============================================================================
     // ScanResult unit tests

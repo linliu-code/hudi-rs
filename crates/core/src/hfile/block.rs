@@ -213,8 +213,79 @@ impl DataBlock {
     }
 
     /// Read a key-value at the given offset within the data block.
-    pub fn read_key_value(&self, offset: usize) -> KeyValue {
-        KeyValue::parse(&self.data, offset)
+    ///
+    /// `Result`, and the bounds are checked HERE rather than at each caller,
+    /// because this is the single place block bytes become a `KeyValue`: the
+    /// iterator below and all three scanner call sites in `hfile::reader`
+    /// (`scan_block_for_key`, `next`, `current_key_value`) go through it. A guard
+    /// at one caller would leave the others reading clamped bytes.
+    ///
+    /// `KeyValue::parse` itself cannot make this check: it takes a byte slice and
+    /// knows only `bytes.len()`, while the bound that matters is the block's
+    /// `content_end`, which only the block knows. So `parse` stays infallible and
+    /// clamping, and this is the layer that refuses to call it out of bounds, and
+    /// that refuses a record whose declared lengths -- a negative one included --
+    /// do not fit inside the block.
+    pub fn read_key_value(&self, offset: usize) -> Result<KeyValue> {
+        // Room for the 4-byte key length and 4-byte value length. `saturating_add`
+        // to match the arithmetic below rather than for a reachable overflow --
+        // one function should not mix the two forms.
+        if offset.saturating_add(KEY_VALUE_HEADER_SIZE) > self.content_end {
+            return Err(HFileError::InvalidFormat(format!(
+                "truncated HFile data block: {} byte(s) left at offset {offset}, too few for a \
+                 {KEY_VALUE_HEADER_SIZE}-byte key/value header",
+                self.content_end.saturating_sub(offset),
+            )));
+        }
+
+        let kv = KeyValue::parse(&self.data, offset);
+
+        // Each length on its own, before `record_size()` sums them. Both are
+        // big-endian `i32` read `as usize`, so a negative one (`FF FF FF FF`) is near
+        // `usize::MAX`; an unchecked sum wrapped back to a small size in a release
+        // build, passed the bound below, and the iterator walked on emitting records
+        // read out of the corrupt one's bytes. `record_size()` saturates, but a
+        // length larger than the block is corrupt on its own, and saying so here
+        // names the field rather than the sum.
+        if kv.key_length() > self.content_end || kv.value_length() > self.content_end {
+            // Printed as the signed 4-byte values on disk, so a negative length reads
+            // as `-1` rather than as `usize::MAX`. Both came from an `i32`, so the
+            // cast back is exact.
+            return Err(HFileError::InvalidFormat(format!(
+                "corrupt HFile data block: the record at offset {offset} declares key={} \
+                 value={} bytes, and neither can exceed the block content end {}",
+                kv.key_length() as i32,
+                kv.value_length() as i32,
+                self.content_end,
+            )));
+        }
+
+        // `KeyValue::parse` clamps a record that overruns the block to the block
+        // end rather than failing, so without this an overrun surfaces as a
+        // silently short key or value -- a wrong seek result on the scanner path,
+        // not an error. O(1) per record: two adds and a compare against a field
+        // already in cache, on bytes the caller is about to read anyway.
+        //
+        // Bounded on `record_size()`, which includes the trailing MVCC byte
+        // (`key.rs`, `KEY_VALUE_HEADER_SIZE + key + value + 1`), because that is
+        // what the iterator and both scanner walks advance by. Bounding on
+        // key+value alone left one hole: a block truncated exactly at the final
+        // record's MVCC byte passed the guard, `next()` then advanced the offset
+        // one past `content_end`, `is_valid_offset` said false, and the iteration
+        // ended with `None` -- the truncation reported as a normal end of block.
+        let declared_end = offset.saturating_add(kv.record_size());
+        if declared_end > self.content_end {
+            return Err(HFileError::InvalidFormat(format!(
+                "corrupt HFile data block: the record at offset {offset} declares key={} \
+                 value={} bytes, ending at {declared_end} with its MVCC byte, past the block \
+                 content end {}",
+                kv.key_length(),
+                kv.value_length(),
+                self.content_end,
+            )));
+        }
+
+        Ok(kv)
     }
 
     /// Check if the offset is within valid content range.
@@ -223,7 +294,6 @@ impl DataBlock {
     }
 
     /// Iterate over all key-value pairs in the block.
-    #[allow(dead_code)]
     pub fn iter(&self) -> DataBlockIterator<'_> {
         DataBlockIterator {
             block: self,
@@ -245,21 +315,34 @@ pub struct DataBlockIterator<'a> {
 }
 
 impl<'a> Iterator for DataBlockIterator<'a> {
-    type Item = KeyValue;
+    /// `Result`, not a bare `KeyValue`: bytes inside the block that do not parse
+    /// are a corrupt block, not the end of one. Ending the iteration with `None`
+    /// handed the caller `Ok` and fewer records than the block holds -- the
+    /// silent-wrong-result shape D-8 forbids, and the one this type makes
+    /// unrepresentable. Java never reaches it: a block whose bytes do not parse
+    /// is turned into an explicit CORRUPT_BLOCK by `HoodieLogFileReader.readBlock`
+    /// (`HoodieLogFileReader.java:128-146`) or throws out of it (`:384-385`).
+    type Item = Result<KeyValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.block.is_valid_offset(self.offset) {
             return None;
         }
 
-        // Need at least 8 bytes for key/value lengths
-        if self.offset + KEY_VALUE_HEADER_SIZE > self.block.content_end {
-            return None;
+        // Both bounds checks live in `read_key_value`, so the iterator and the
+        // scanner cannot drift on what counts as a corrupt block. On failure the
+        // offset jumps to the end so a truncation is reported once, not once per
+        // remaining byte.
+        match self.block.read_key_value(self.offset) {
+            Ok(kv) => {
+                self.offset += kv.record_size();
+                Some(Ok(kv))
+            }
+            Err(e) => {
+                self.offset = self.block.content_end;
+                Some(Err(e))
+            }
         }
-
-        let kv = self.block.read_key_value(self.offset);
-        self.offset += kv.record_size();
-        Some(kv)
     }
 }
 
@@ -428,5 +511,245 @@ mod tests {
         assert!(data_block.is_valid_offset(49));
         assert!(!data_block.is_valid_offset(50));
         assert!(!data_block.is_valid_offset(100));
+    }
+
+    // =====================================================================
+    // The data-block iterator fails loud on a truncated block (OI-59 / RV-10)
+    //
+    // Ending the iterator with `None` on bytes that do not parse hands the
+    // caller `Ok` with fewer records than the block holds. Java never reaches
+    // that shape: a block whose bytes do not parse is turned into an explicit
+    // CORRUPT_BLOCK by `HoodieLogFileReader.readBlock`
+    // (`HoodieLogFileReader.java:128-146`) or throws out of it
+    // (`:384-385`), and only an explicit CORRUPT_BLOCK is skipped by design
+    // (`AbstractHoodieLogRecordScanner.java:488-493`).
+    // =====================================================================
+
+    /// One key/value: 4-byte key length, 4-byte value length, the key, the
+    /// value, and the trailing MVCC byte `KeyValue::record_size` accounts for.
+    fn one_key_value(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(key.len() as i32).to_be_bytes());
+        bytes.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(value);
+        bytes.push(0);
+        bytes
+    }
+
+    #[test]
+    fn test_data_block_iterator_yields_a_well_formed_record() {
+        let data = one_key_value(b"abc", b"xy");
+        let content_end = data.len();
+        let block = DataBlock { data, content_end };
+
+        let records: Vec<KeyValue> = block
+            .iter()
+            .collect::<Result<Vec<_>>>()
+            .expect("a well-formed block must iterate cleanly");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].value(), b"xy");
+    }
+
+    #[test]
+    fn test_data_block_iterator_errs_on_a_tail_too_short_for_a_header() {
+        // A whole record, then three trailing bytes -- not enough for the next
+        // 8-byte key/value header. Silently stopping here would return one
+        // record and call the block exhausted.
+        let mut data = one_key_value(b"abc", b"xy");
+        data.extend_from_slice(&[0u8; 3]);
+        let content_end = data.len();
+        let block = DataBlock { data, content_end };
+
+        let results: Vec<Result<KeyValue>> = block.iter().collect();
+        assert_eq!(results.len(), 2, "the truncated tail must be reported");
+        assert!(results[0].is_ok());
+        let err = results[1].as_ref().unwrap_err();
+        assert!(
+            matches!(err, HFileError::InvalidFormat(_)),
+            "expected InvalidFormat, got: {err:?}"
+        );
+    }
+
+    // `DataBlock::read_key_value` is the single place block bytes become a
+    // `KeyValue`: the iterator above and all three scanner call sites in
+    // `hfile::reader` (`:1264` scan_block_for_key, `:1370` next, `:1434`
+    // current_key_value) go through it. Guarding it there rather than at each
+    // caller is what puts the scanner path under the same rule as the iterator.
+
+    #[test]
+    fn test_read_key_value_errs_when_a_record_overruns_the_block() {
+        // What the scanner holds when a block declares a record longer than the
+        // bytes it has. `KeyValue::parse` clamps this to the block end, so the
+        // scanner used to seek and compare against a silently truncated key.
+        let mut data = Vec::new();
+        data.extend_from_slice(&3i32.to_be_bytes());
+        data.extend_from_slice(&200i32.to_be_bytes());
+        data.extend_from_slice(b"abcxy");
+        let content_end = data.len();
+        let block = DataBlock { data, content_end };
+
+        let err = block
+            .read_key_value(0)
+            .expect_err("an overrunning record must not be silently clamped");
+        assert!(
+            matches!(err, HFileError::InvalidFormat(_)),
+            "expected InvalidFormat, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_key_value_errs_when_the_offset_has_no_room_for_a_header() {
+        let data = vec![0u8; 5];
+        let content_end = data.len();
+        let block = DataBlock { data, content_end };
+
+        block
+            .read_key_value(0)
+            .expect_err("five bytes cannot hold an eight-byte key/value header");
+    }
+
+    #[test]
+    fn test_read_key_value_returns_a_well_formed_record() {
+        let data = one_key_value(b"abc", b"xy");
+        let content_end = data.len();
+        let block = DataBlock { data, content_end };
+
+        let kv = block
+            .read_key_value(0)
+            .expect("a well-formed record must parse");
+        assert_eq!(kv.value(), b"xy");
+    }
+
+    #[test]
+    fn test_data_block_iterator_errs_when_a_record_overruns_the_block() {
+        // The header declares a 200-byte value the block does not contain.
+        // `KeyValue::parse` clamps to the block end rather than failing, so
+        // without a check this surfaces as a short value, not an error.
+        let mut data = Vec::new();
+        data.extend_from_slice(&3i32.to_be_bytes());
+        data.extend_from_slice(&200i32.to_be_bytes());
+        data.extend_from_slice(b"abcxy");
+        let content_end = data.len();
+        let block = DataBlock { data, content_end };
+
+        let results: Vec<Result<KeyValue>> = block.iter().collect();
+        assert_eq!(results.len(), 1);
+        let err = results[0].as_ref().unwrap_err();
+        assert!(
+            matches!(err, HFileError::InvalidFormat(_)),
+            "expected InvalidFormat, got: {err:?}"
+        );
+    }
+
+    /// The one hole the key+value bound left: a block truncated exactly at the
+    /// final record's MVCC byte. `record_size()` counts that byte
+    /// (`key.rs`, `KEY_VALUE_HEADER_SIZE + key + value + 1`) and the iterator and
+    /// both scanner walks advance by it, so under the old bound the record passed,
+    /// the offset moved one past `content_end`, `is_valid_offset` said false and
+    /// the iteration ended with `None` -- a truncated block reported as a normal
+    /// end of block, with `Ok` and one record short.
+    #[test]
+    fn test_read_key_value_errs_when_the_block_is_truncated_at_the_mvcc_byte() {
+        let mut data = one_key_value(b"abc", b"xy");
+        data.pop().expect("drop the trailing MVCC byte");
+        let content_end = data.len();
+        let block = DataBlock { data, content_end };
+
+        let err = block
+            .read_key_value(0)
+            .expect_err("a record whose MVCC byte is missing overruns the block");
+        assert!(
+            matches!(err, HFileError::InvalidFormat(_)),
+            "expected InvalidFormat, got: {err:?}"
+        );
+    }
+
+    /// The same truncation seen through the iterator, which is where it used to
+    /// disappear: one `Err`, not one silent `None`.
+    #[test]
+    fn test_data_block_iterator_errs_when_the_block_is_truncated_at_the_mvcc_byte() {
+        let mut data = one_key_value(b"abc", b"xy");
+        data.pop().expect("drop the trailing MVCC byte");
+        let content_end = data.len();
+        let block = DataBlock { data, content_end };
+
+        let results: Vec<Result<KeyValue>> = block.iter().collect();
+        assert_eq!(
+            results.len(),
+            1,
+            "the truncation must be reported, not swallowed by an early None"
+        );
+        assert!(
+            results[0].is_err(),
+            "the only item must be the truncation error"
+        );
+    }
+
+    /// A record whose 4-byte key or value length is negative (`FF FF FF FF` for
+    /// `-1`), followed by a well-formed record so the corrupt one is not at the
+    /// end of the block.
+    ///
+    /// Both lengths are big-endian `i32`, so `FF FF FF FF` is `-1`, which
+    /// `as usize` turns into `usize::MAX`. `record_size()` then wrapped to 8 in a
+    /// release build, the bound on `offset + record_size()` passed, and the
+    /// iterator walked on in 8-byte steps emitting garbage records as `Ok`. In a
+    /// debug build the same add was an overflow panic.
+    fn block_with_negative_length(key_length: i32, value_length: i32) -> DataBlock {
+        let mut data = Vec::new();
+        data.extend_from_slice(&key_length.to_be_bytes());
+        data.extend_from_slice(&value_length.to_be_bytes());
+        data.extend_from_slice(&one_key_value(b"abc", b"xy"));
+        let content_end = data.len();
+        DataBlock { data, content_end }
+    }
+
+    #[test]
+    fn test_read_key_value_errs_on_a_negative_key_length() {
+        let block = block_with_negative_length(-1, 0);
+
+        let err = block
+            .read_key_value(0)
+            .expect_err("a negative key length must not parse as a record");
+        // The length guard, not only the `record_size()` bound after it: it names
+        // the declared field, printed as the signed value on disk.
+        match err {
+            HFileError::InvalidFormat(msg) => assert!(
+                msg.contains("declares key=-1 value=0") && msg.contains("neither can exceed"),
+                "expected the length guard's message, got: {msg}"
+            ),
+            other => panic!("expected InvalidFormat, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_read_key_value_errs_on_a_negative_value_length() {
+        let block = block_with_negative_length(3, -1);
+
+        let err = block
+            .read_key_value(0)
+            .expect_err("a negative value length must not parse as a record");
+        assert!(
+            matches!(err, HFileError::InvalidFormat(_)),
+            "expected InvalidFormat, got: {err:?}"
+        );
+    }
+
+    /// Through the iterator: one `Err` and then the end, not a run of `Ok`
+    /// records read out of the corrupt one's bytes.
+    #[test]
+    fn test_data_block_iterator_errs_on_a_negative_key_length() {
+        let block = block_with_negative_length(-1, 0);
+
+        let results: Vec<Result<KeyValue>> = block.iter().collect();
+        assert_eq!(
+            results.len(),
+            1,
+            "a negative length must be reported once, not walked past"
+        );
+        assert!(
+            matches!(results[0], Err(HFileError::InvalidFormat(_))),
+            "the only item must be the corrupt-record error"
+        );
     }
 }

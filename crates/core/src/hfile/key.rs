@@ -307,9 +307,19 @@ impl KeyValue {
     }
 
     /// Returns the total size of this key-value record including MVCC timestamp.
+    ///
+    /// Saturating: both lengths are read as `i32 as usize`, so a corrupt negative
+    /// length is near `usize::MAX`, which an unchecked sum wraps to a small,
+    /// plausible size in a release build and panics on in a debug one. `usize::MAX`
+    /// instead exceeds every bound a caller checks this against. `value()` does not
+    /// bound its slice, so a record must pass `DataBlock::read_key_value`'s checks
+    /// before its value is read.
     pub fn record_size(&self) -> usize {
         // header (8) + key + value + mvcc timestamp (1)
-        KEY_VALUE_HEADER_SIZE + self.key_length + self.value_length + 1
+        KEY_VALUE_HEADER_SIZE
+            .saturating_add(self.key_length)
+            .saturating_add(self.value_length)
+            .saturating_add(1)
     }
 
     /// Returns the key length.
@@ -500,6 +510,21 @@ mod tests {
 
         let kv = KeyValue::parse(&bytes, 0);
         assert!(format!("{kv}").contains("test"));
+    }
+
+    /// `FF FF FF FF` is a negative `i32` length, which reads as `usize::MAX`.
+    /// `record_size()` must not wrap it back into a small, plausible size (a
+    /// release build) or panic on the add (a debug build): it saturates, so any
+    /// bound a caller checks it against fails.
+    #[test]
+    fn test_record_size_does_not_wrap_on_a_negative_length() {
+        let mut bytes = vec![];
+        bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // key length -1
+        bytes.extend_from_slice(&0i32.to_be_bytes()); // value length
+        bytes.extend_from_slice(&[0u8; 16]);
+
+        let kv = KeyValue::parse(&bytes, 0);
+        assert_eq!(kv.record_size(), usize::MAX);
     }
 
     #[test]

@@ -440,10 +440,10 @@ impl HFileReader {
         // The shared helper, not a second copy of it: two places building an
         // `HFileRecord` from a `KeyValue` is how the predicate path and the scan path
         // would drift on what a record key is.
-        Ok(data_block
+        data_block
             .iter()
-            .map(|kv| Self::key_value_to_record(&kv))
-            .collect())
+            .map(|kv| Ok(Self::key_value_to_record(&kv?)))
+            .collect()
     }
 
     /// The data blocks a key predicate can be satisfied from.
@@ -610,7 +610,7 @@ impl HFileReader {
             }
             let data_block = DataBlock::from_block(block);
             for kv in data_block.iter() {
-                records.push(Self::key_value_to_record(&kv));
+                records.push(Self::key_value_to_record(&kv?));
             }
         }
         Ok(records)
@@ -1261,7 +1261,7 @@ impl HFileReader {
             let mut last_kv = self.cursor.cached_kv.clone();
 
             while block.is_valid_offset(offset) {
-                let kv = block.read_key_value(offset);
+                let kv = block.read_key_value(offset)?;
                 let cmp = compare_keys(kv.key(), lookup_key);
 
                 match cmp {
@@ -1367,7 +1367,7 @@ impl HFileReader {
         let kv = if let Some(cached) = &self.cursor.cached_kv {
             cached.clone()
         } else {
-            block.read_key_value(current_offset)
+            block.read_key_value(current_offset)?
         };
 
         let next_offset = current_offset + kv.record_size();
@@ -1431,7 +1431,7 @@ impl HFileReader {
         let block_start = self.current_block_entry.as_ref().unwrap().offset as usize;
         let offset = self.cursor.offset - block_start - BLOCK_HEADER_SIZE;
 
-        let kv = block.read_key_value(offset);
+        let kv = block.read_key_value(offset)?;
         self.cursor.cached_kv = Some(kv.clone());
 
         Ok(Some(kv))
