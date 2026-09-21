@@ -22,11 +22,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
+
+use once_cell::sync::Lazy;
 
 use async_recursion::async_recursion;
 use bytes::Bytes;
+use object_store::aws::AmazonS3ConfigKey;
+use object_store::azure::AzureConfigKey;
+use object_store::gcp::GoogleConfigKey;
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, ObjectStoreExt, parse_url_opts};
+use object_store::{ObjectStore, ObjectStoreExt, ObjectStoreScheme, parse_url_opts};
 use url::Url;
 
 use crate::config::HudiConfigs;
@@ -217,6 +223,115 @@ impl ReadVolume {
     }
 }
 
+/// Process-wide cache of built `ObjectStore`s.
+///
+/// `parse_url_opts` builds a fresh client per call, and for S3 that means a new
+/// credential chain and a new TLS connection pool. Embedders construct a
+/// `Storage` PER FILE GROUP (see `cpp/src/lib.rs`), so on a scan of N splits the
+/// uncached path pays that N times and shares no connections between them.
+///
+/// Keyed by the store-identifying part of the URL plus the options the store
+/// reads, so two stores that differ in bucket, container, endpoint or
+/// credentials never share an entry — see [`object_store_cache_key`].
+///
+/// Caveat, recorded deliberately: this map is unbounded and lives for the
+/// process. That is bounded in practice by the number of DISTINCT
+/// (store identity, read options) pairs a process sees, which is small — but a
+/// caller that mints per-request credentials would grow it without limit.
+/// Nothing here evicts; if that ever becomes a problem the fix is an
+/// entry-bounded cache, not a per-split rebuild.
+static OBJECT_STORE_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Identity of a built store: the part of `base_url` the store is bound to,
+/// plus the options it reads, in a stable order.
+///
+/// The URL part is everything up to the path, plus whatever leading path
+/// segments `parse_url_opts` consumes rather than hands back as the object
+/// path. That is the idea behind `object_store`'s own
+/// `DefaultObjectStoreRegistry`, and it matters because the bucket or container
+/// is not always the host:
+///
+/// - `abfss://container@account.dfs.core.windows.net/tbl` carries the container
+///   in the user-info, so scheme+host alone is the same for every container;
+/// - `https://account.dfs.core.windows.net/container/tbl`, path-style
+///   `https://s3.<region>.amazonaws.com/bucket/tbl` and R2 carry it in the first
+///   path segment, which `parse_url_opts` strips.
+///
+/// A key that missed either would hand one bucket's or container's client to a
+/// `Storage` for another. For the user-info form that read resolves the same
+/// relative path inside the wrong container and returns its data without error.
+///
+/// The consumed segments are counted by matching the raw URL segments against
+/// the path `parse_url_opts` returns, not by subtracting part counts: that path
+/// is percent-decoded, so a `%2F` inside a table name is one raw segment but two
+/// parts, and a subtraction would shift the bucket out of the key.
+///
+/// The options are load-bearing too — the same `s3://bucket/path` resolves to
+/// different physical stores under different endpoints or credentials — but
+/// only the ones the store's builder recognises: `parse_url_opts` drops every
+/// other key, so keying on them would split one store into an entry per
+/// distinct unrelated property.
+fn object_store_cache_key(base_url: &Url, options: &HashMap<String, String>) -> String {
+    let parsed = ObjectStoreScheme::parse(base_url).ok();
+    let url_part = match &parsed {
+        Some((_, path)) => {
+            let segments: Vec<&str> = base_url
+                .path()
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+            // The most leading segments whose removal still leaves exactly the
+            // path `parse_url_opts` returns. Two counts can only both match
+            // when the extra segments decode to nothing but a delimiter, and
+            // taking the larger keeps those in the key. No match keeps every
+            // segment. Either way the cache can only split, never merge two
+            // stores.
+            let consumed = (0..=segments.len())
+                .rev()
+                .find(|&k| {
+                    ObjPath::from_url_path(segments[k..].join("/")).is_ok_and(|p| &p == path)
+                })
+                .unwrap_or(segments.len());
+            let mut url_part = base_url[..url::Position::AfterPort].to_string();
+            for segment in &segments[..consumed] {
+                url_part.push('/');
+                url_part.push_str(segment);
+            }
+            url_part
+        }
+        // Unrecognised: `parse_url_opts` refuses it too, so nothing is cached
+        // under this key; the whole URL is the conservative identity.
+        None => base_url.as_str().to_string(),
+    };
+    let mut opts: Vec<(&String, &String)> = options
+        .iter()
+        .filter(|(k, _)| match parsed.as_ref().map(|(scheme, _)| scheme) {
+            Some(scheme) => store_reads_option(scheme, k),
+            None => true,
+        })
+        .collect();
+    opts.sort();
+    format!("{url_part}|{opts:?}")
+}
+
+/// Whether the store `parse_url_opts` builds for `scheme` reads option `key`.
+///
+/// Mirrors `parse_url_opts`, which lowercases each key and parses it as the
+/// scheme's config key, silently dropping keys that do not parse. Local and
+/// in-memory stores read no options. A scheme this does not know keeps every
+/// key, which can only split the cache, never merge two stores.
+fn store_reads_option(scheme: &ObjectStoreScheme, key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    match scheme {
+        ObjectStoreScheme::Local | ObjectStoreScheme::Memory => false,
+        ObjectStoreScheme::AmazonS3 => key.parse::<AmazonS3ConfigKey>().is_ok(),
+        ObjectStoreScheme::MicrosoftAzure => key.parse::<AzureConfigKey>().is_ok(),
+        ObjectStoreScheme::GoogleCloudStorage => key.parse::<GoogleConfigKey>().is_ok(),
+        _ => true,
+    }
+}
+
 impl Storage {
     pub const CLOUD_STORAGE_PREFIXES: [&'static str; 3] = ["AWS_", "AZURE_", "GOOGLE_"];
 
@@ -237,22 +352,114 @@ impl Storage {
             }
         };
 
-        match parse_url_opts(&base_url, options.as_ref()) {
-            Ok((object_store, _)) => Ok(Arc::new(Storage {
-                base_url: Arc::new(base_url),
-                object_store: Arc::new(object_store),
-                options,
-                hudi_configs,
-                read_volume: Arc::new(ReadVolume::default()),
-            })),
-            Err(e) => Err(Creation(format!("Failed to create storage: {e}"))),
-        }
+        let options = Self::with_region_fallback(&base_url, options);
+
+        // Consult the process-level store cache before building a new client.
+        // See OBJECT_STORE_CACHE.
+        let key = object_store_cache_key(&base_url, options.as_ref());
+        let object_store: Arc<dyn ObjectStore> = {
+            // A pure cache: a panic while the lock was held cannot leave the
+            // map half-updated, so a poisoned lock is recovered rather than
+            // turned into a panic in every later `Storage::new`.
+            let mut cache = OBJECT_STORE_CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(existing) = cache.get(&key) {
+                existing.clone()
+            } else {
+                // No runtime is entered here. Building a store spawns no task:
+                // hyper spawns a connection's task on the runtime driving the
+                // first request over it, so the caller's choice of runtime for
+                // its reads decides that lifetime (see
+                // `ffi_support::OBJECT_STORE_RUNTIME`).
+                match parse_url_opts(&base_url, options.as_ref()) {
+                    Ok((new_store, _)) => {
+                        let arc: Arc<dyn ObjectStore> = Arc::new(new_store);
+                        cache.insert(key, arc.clone());
+                        arc
+                    }
+                    Err(e) => return Err(Creation(format!("Failed to create storage: {e}"))),
+                }
+            }
+        };
+
+        Ok(Arc::new(Storage {
+            base_url: Arc::new(base_url),
+            object_store,
+            options,
+            hudi_configs,
+            read_volume: Arc::new(ReadVolume::default()),
+        }))
     }
 
     /// Clone of this `Storage`'s read-volume counters, for a consumer that
     /// outlives the read and reports them once the stream has drained.
     pub fn read_volume(&self) -> Arc<ReadVolume> {
         self.read_volume.clone()
+    }
+
+    /// Fall back to `AWS_REGION` / `AWS_DEFAULT_REGION` for S3 URLs when the
+    /// caller passed no region.
+    ///
+    /// Without this, `object_store::parse_url_opts` builds an `AmazonS3` client
+    /// against the default us-east-1 endpoint, and a HEAD to a bucket in any
+    /// other region fails with `BareRedirect`. Spark/EKS expose the region via
+    /// `AWS_REGION` (set by IRSA, or by `spark.executorEnv.AWS_REGION`), so
+    /// honouring it here means callers need not thread a region through the FFI
+    /// props map.
+    ///
+    /// Load-bearing only for options that did not pass through
+    /// `OptionResolver`, such as those of the C++ FFI's per-file-group
+    /// `Storage`, which it builds from its own props.
+    /// `Table::new` and `FileGroupReader::new_with_options` resolve options
+    /// first, and that copies every `AWS_*` environment variable into the
+    /// storage options (lowercased), so on those paths the map already carries
+    /// `aws_region` or `aws_default_region` whenever the environment does, and
+    /// this returns early.
+    ///
+    /// Any spelling of a region key counts as the caller passing one.
+    /// `object_store` lowercases every key before parsing it, so `AWS_REGION`
+    /// in the map is as explicit as `region`, and injecting `region` beside it
+    /// would leave `object_store` resolving two region settings in `HashMap`
+    /// order, a different answer from one run to the next. A caller's
+    /// `aws_default_region` / `default_region` is not order-dependent (it only
+    /// fills a region nothing else set), but an injected `region` would always
+    /// beat it, so it is treated as explicit too and the caller's default wins
+    /// over the environment.
+    ///
+    /// Returns the SAME `Arc` when nothing applies, so the common path neither
+    /// copies the map nor touches the environment.
+    fn with_region_fallback(
+        base_url: &Url,
+        options: Arc<HashMap<String, String>>,
+    ) -> Arc<HashMap<String, String>> {
+        let scheme = base_url.scheme();
+        if scheme != "s3" && scheme != "s3a" {
+            return options;
+        }
+        let has_region = options.keys().any(|k| {
+            matches!(
+                k.to_ascii_lowercase().as_str(),
+                "region" | "aws_region" | "default_region" | "aws_default_region"
+            )
+        });
+        if has_region {
+            return options;
+        }
+        let region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .ok();
+        let Some(region) = region else { return options };
+        if region.is_empty() {
+            return options;
+        }
+        // debug!, not info!: embedders construct a Storage per file group, so on
+        // an s3 table whose region arrives only from the environment this fires
+        // once per split rather than once per process.
+        log::debug!("hudi-rs Storage: injecting region={region} from env for {scheme} url");
+        let mut merged: HashMap<String, String> = (*options).clone();
+        merged.insert("region".to_string(), region);
+        Arc::new(merged)
     }
 
     /// Build storage over a caller-supplied object store.
@@ -435,9 +642,507 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::Path;
+
+    // ── with_region_fallback ──────────────────────────────────────────
+    //
+    // These tests cover the env-driven region injection. Tests that touch
+    // process env are marked `#[serial(env_vars)]` so concurrent execution
+    // doesn't clobber state. The env-var manipulations are inside `unsafe`
+    // blocks per the 2024-edition std::env safety rules.
+    //
+    // The fallback semantics under test:
+    //   - non-S3 schemes  → options returned unchanged.
+    //   - a region already set under any spelling (`region`, `aws_region`,
+    //     `default_region`, `aws_default_region`, in any case) → never
+    //     overridden.
+    //   - S3 URL + AWS_REGION env set → `region` injected.
+    //   - S3 URL + only AWS_DEFAULT_REGION set → `region` injected.
+    //   - S3 URL + no env / empty env value → options returned unchanged.
+
+    fn s3_url() -> Url {
+        Url::parse("s3://example-bucket/path/").unwrap()
+    }
+
+    fn s3a_url() -> Url {
+        Url::parse("s3a://example-bucket/path/").unwrap()
+    }
+
+    #[test]
+    fn test_region_fallback_non_s3_scheme_is_passthrough() {
+        let in_opts = Arc::new(HashMap::from([(
+            "some_key".to_string(),
+            "some_val".to_string(),
+        )]));
+        let url = Url::parse("file:///tmp/path/").unwrap();
+        let out = Storage::with_region_fallback(&url, in_opts.clone());
+
+        // Same Arc — no copy, no mutation.
+        assert!(Arc::ptr_eq(&in_opts, &out));
+        assert!(!out.contains_key("region"));
+    }
+
+    #[test]
+    fn test_region_fallback_preserves_explicit_region() {
+        let in_opts = Arc::new(HashMap::from([(
+            "region".to_string(),
+            "ap-south-1".to_string(),
+        )]));
+        let out = Storage::with_region_fallback(&s3_url(), in_opts.clone());
+
+        // Caller-supplied region wins; we don't even peek at env.
+        assert!(Arc::ptr_eq(&in_opts, &out));
+        assert_eq!(out.get("region"), Some(&"ap-south-1".to_string()));
+    }
+
+    #[test]
+    fn test_region_fallback_preserves_explicit_aws_region_alias() {
+        let in_opts = Arc::new(HashMap::from([(
+            "aws_region".to_string(),
+            "eu-central-1".to_string(),
+        )]));
+        let out = Storage::with_region_fallback(&s3_url(), in_opts.clone());
+
+        // `aws_region` is the alias object_store accepts — also respected.
+        assert!(Arc::ptr_eq(&in_opts, &out));
+        assert!(!out.contains_key("region"));
+        assert_eq!(out.get("aws_region"), Some(&"eu-central-1".to_string()));
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_injects_from_aws_region_env() {
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::set_var("AWS_REGION", "us-west-2");
+        }
+        let in_opts = Arc::new(HashMap::new());
+        let out = Storage::with_region_fallback(&s3_url(), in_opts.clone());
+
+        assert_eq!(out.get("region"), Some(&"us-west-2".to_string()));
+        // A new Arc was returned — not the same pointer as input.
+        assert!(!Arc::ptr_eq(&in_opts, &out));
+
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+        }
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_injects_from_aws_default_region_env() {
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::set_var("AWS_DEFAULT_REGION", "us-west-2");
+        }
+        let out = Storage::with_region_fallback(&s3_url(), Arc::new(HashMap::new()));
+
+        // AWS_REGION takes priority when both set; here only DEFAULT is set.
+        assert_eq!(out.get("region"), Some(&"us-west-2".to_string()));
+
+        unsafe {
+            std::env::remove_var("AWS_DEFAULT_REGION");
+        }
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_aws_region_wins_over_default_region() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-west-2");
+            std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+        }
+        let out = Storage::with_region_fallback(&s3_url(), Arc::new(HashMap::new()));
+
+        assert_eq!(out.get("region"), Some(&"us-west-2".to_string()));
+
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+        }
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_no_env_is_passthrough() {
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+        }
+        let in_opts = Arc::new(HashMap::new());
+        let out = Storage::with_region_fallback(&s3_url(), in_opts.clone());
+
+        // No env, no mutation, no region inserted.
+        assert!(Arc::ptr_eq(&in_opts, &out));
+        assert!(!out.contains_key("region"));
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_empty_env_value_is_passthrough() {
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::set_var("AWS_REGION", "");
+        }
+        let in_opts = Arc::new(HashMap::new());
+        let out = Storage::with_region_fallback(&s3_url(), in_opts.clone());
+
+        // Empty string in env shouldn't be propagated as a "region" key —
+        // object_store would build an invalid endpoint URL otherwise.
+        assert!(Arc::ptr_eq(&in_opts, &out));
+        assert!(!out.contains_key("region"));
+
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+        }
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_s3a_scheme_also_works() {
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::set_var("AWS_REGION", "us-west-2");
+        }
+        let out = Storage::with_region_fallback(&s3a_url(), Arc::new(HashMap::new()));
+
+        // Hadoop-style `s3a://` URLs hit the same injection path.
+        assert_eq!(out.get("region"), Some(&"us-west-2".to_string()));
+
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+        }
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_respects_an_explicit_region_in_any_key_spelling() {
+        // object_store lowercases every key before parsing it, and reads both
+        // default-region spellings as a region, so each of these is the caller
+        // passing a region. None may get an env region injected beside it.
+        unsafe {
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        for key in [
+            "AWS_REGION",
+            "Region",
+            "REGION",
+            "aws_default_region",
+            "AWS_DEFAULT_REGION",
+            "default_region",
+        ] {
+            let in_opts = Arc::new(HashMap::from([(key.to_string(), "eu-west-1".to_string())]));
+            let out = Storage::with_region_fallback(&s3_url(), in_opts.clone());
+            assert!(
+                Arc::ptr_eq(&in_opts, &out),
+                "an explicit `{key}` must not get `region` injected beside it, got {out:?}"
+            );
+        }
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+        }
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_region_fallback_keeps_an_uppercase_explicit_region_deterministic() {
+        // Fold the result through the key parsing `parse_url_opts` applies.
+        // Each iteration builds a fresh HashMap, so each has its own iteration
+        // order: an injected `region` beside `AWS_REGION` would make the
+        // resolved region follow that order instead of the caller.
+        unsafe {
+            std::env::remove_var("AWS_DEFAULT_REGION");
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        for _ in 0..64 {
+            let in_opts = Arc::new(HashMap::from([(
+                "AWS_REGION".to_string(),
+                "eu-west-1".to_string(),
+            )]));
+            let out = Storage::with_region_fallback(&s3_url(), in_opts);
+            let builder = out.iter().fold(
+                object_store::aws::AmazonS3Builder::new(),
+                |builder, (k, v)| match k
+                    .to_ascii_lowercase()
+                    .parse::<object_store::aws::AmazonS3ConfigKey>()
+                {
+                    Ok(key) => builder.with_config(key, v),
+                    Err(_) => builder,
+                },
+            );
+            assert_eq!(
+                builder
+                    .get_config_value(&object_store::aws::AmazonS3ConfigKey::Region)
+                    .as_deref(),
+                Some("eu-west-1"),
+                "the caller's region must win over the environment, every time"
+            );
+        }
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+        }
+    }
+
+    // ── OBJECT_STORE_CACHE ────────────────────────────────────────────
+    //
+    // "The same store is reused, and distinct stores are not" is exactly the
+    // property the cache exists for, and nothing else pins it.
+
+    #[test]
+    fn test_object_store_cache_key_separates_distinct_option_sets() {
+        let url = Url::parse("s3://example-bucket/path/").unwrap();
+        let a = HashMap::from([("region".to_string(), "us-west-2".to_string())]);
+        let b = HashMap::from([("region".to_string(), "eu-west-1".to_string())]);
+        assert_ne!(
+            object_store_cache_key(&url, &a),
+            object_store_cache_key(&url, &b),
+            "the same bucket under a different region is a different store"
+        );
+    }
+
+    #[test]
+    fn test_object_store_cache_key_is_order_independent() {
+        // HashMap iteration order is arbitrary, so a key built from it must be
+        // sorted or two identical option sets would miss each other's entry.
+        let url = Url::parse("s3://example-bucket/path/").unwrap();
+        let a = HashMap::from([
+            ("region".to_string(), "us-west-2".to_string()),
+            ("endpoint".to_string(), "http://x".to_string()),
+        ]);
+        let b = HashMap::from([
+            ("endpoint".to_string(), "http://x".to_string()),
+            ("region".to_string(), "us-west-2".to_string()),
+        ]);
+        assert_eq!(
+            object_store_cache_key(&url, &a),
+            object_store_cache_key(&url, &b)
+        );
+    }
+
+    #[test]
+    fn test_storage_new_reuses_one_object_store_per_identity() {
+        // The point of the cache: an embedder builds a Storage PER FILE GROUP,
+        // and every one of those must share a client rather than mint a new
+        // credential chain and TLS pool.
+        let base = canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap();
+        let url = Url::from_directory_path(&base).unwrap();
+        let mut opts = HashMap::new();
+        opts.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            url.as_str().to_string(),
+        );
+        let configs = Arc::new(HudiConfigs::new(opts));
+
+        let first = Storage::new(Arc::new(HashMap::new()), configs.clone()).unwrap();
+        let second = Storage::new(Arc::new(HashMap::new()), configs).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first.object_store, &second.object_store),
+            "two Storages over the same store identity must share one ObjectStore"
+        );
+    }
+
+    #[test]
+    fn test_object_store_cache_key_separates_stores_that_differ_only_in_bucket_or_container() {
+        // Every pair names two different stores whose scheme and host are the
+        // same: the bucket or container lives in the user-info or the first
+        // path segment. Each pair must key apart, or the second read is served
+        // by the first store's client.
+        let no_options = HashMap::new();
+        let pairs = [
+            (
+                "abfss://container-a@acct.dfs.core.windows.net/tbl",
+                "abfss://container-b@acct.dfs.core.windows.net/tbl",
+            ),
+            (
+                "abfs://container-a@acct.blob.core.windows.net/tbl",
+                "abfs://container-b@acct.blob.core.windows.net/tbl",
+            ),
+            (
+                "https://acct.dfs.core.windows.net/container-a/tbl",
+                "https://acct.dfs.core.windows.net/container-b/tbl",
+            ),
+            (
+                "https://acct.blob.core.windows.net/container-a/tbl",
+                "https://acct.blob.core.windows.net/container-b/tbl",
+            ),
+            (
+                "https://s3.us-west-2.amazonaws.com/bucket-a/tbl",
+                "https://s3.us-west-2.amazonaws.com/bucket-b/tbl",
+            ),
+            (
+                "https://acct.r2.cloudflarestorage.com/bucket-a/tbl",
+                "https://acct.r2.cloudflarestorage.com/bucket-b/tbl",
+            ),
+            ("s3://bucket-a/tbl", "s3://bucket-b/tbl"),
+            // A percent-encoded `/` in the table path decodes into an extra
+            // path part, which must not shift the bucket out of the key.
+            (
+                "https://s3.us-west-2.amazonaws.com/bucket-a/x%2Fy",
+                "https://s3.us-west-2.amazonaws.com/bucket-b/x%2Fy",
+            ),
+            (
+                "https://acct.r2.cloudflarestorage.com/bucket-a/x%2Fy",
+                "https://acct.r2.cloudflarestorage.com/bucket-b/x%2Fy",
+            ),
+            (
+                "https://acct.dfs.core.windows.net/container-a/x%2Fy",
+                "https://acct.dfs.core.windows.net/container-b/x%2Fy",
+            ),
+            // The path ends at the bucket or container, trailing slash or not.
+            (
+                "https://acct.dfs.core.windows.net/container-a",
+                "https://acct.dfs.core.windows.net/container-b",
+            ),
+            (
+                "https://s3.us-west-2.amazonaws.com/bucket-a/",
+                "https://s3.us-west-2.amazonaws.com/bucket-b/",
+            ),
+            // A first segment that decodes to nothing but a delimiter names a
+            // different (if invalid) bucket from no segment at all.
+            (
+                "https://s3.us-west-2.amazonaws.com/%2F",
+                "https://s3.us-west-2.amazonaws.com/",
+            ),
+        ];
+        for (a, b) in pairs {
+            assert_ne!(
+                object_store_cache_key(&Url::parse(a).unwrap(), &no_options),
+                object_store_cache_key(&Url::parse(b).unwrap(), &no_options),
+                "{a} and {b} are different stores"
+            );
+        }
+    }
+
+    #[test]
+    fn test_object_store_cache_key_is_shared_by_tables_in_one_store() {
+        // The other direction: the table path inside a store is not part of
+        // its identity, so tables in one bucket or container share a client.
+        let no_options = HashMap::new();
+        let pairs = [
+            (
+                "abfss://container@acct.dfs.core.windows.net/tbl-a",
+                "abfss://container@acct.dfs.core.windows.net/db/tbl-b",
+            ),
+            (
+                "https://acct.dfs.core.windows.net/container/tbl-a",
+                "https://acct.dfs.core.windows.net/container/db/tbl-b",
+            ),
+            (
+                "https://s3.us-west-2.amazonaws.com/bucket/tbl-a",
+                "https://s3.us-west-2.amazonaws.com/bucket/db/tbl-b",
+            ),
+            ("s3://bucket/tbl-a", "s3://bucket/db/tbl-b"),
+            ("file:///tmp/tbl-a", "file:///var/db/tbl-b"),
+        ];
+        for (a, b) in pairs {
+            assert_eq!(
+                object_store_cache_key(&Url::parse(a).unwrap(), &no_options),
+                object_store_cache_key(&Url::parse(b).unwrap(), &no_options),
+                "{a} and {b} are the same store"
+            );
+        }
+    }
+
+    #[test]
+    fn test_storage_new_does_not_share_an_object_store_across_containers() {
+        // The negative half of the reuse test, through `Storage::new`: two
+        // Azure containers under one account must get two clients.
+        let storage_for = |base_path: &str| {
+            let configs = Arc::new(HudiConfigs::new([(
+                HudiTableConfig::BasePath.as_ref().to_string(),
+                base_path.to_string(),
+            )]));
+            Storage::new(Arc::new(HashMap::new()), configs).unwrap()
+        };
+        let prod = storage_for("abfss://prod@acct.dfs.core.windows.net/sales");
+        let staging = storage_for("abfss://staging@acct.dfs.core.windows.net/sales");
+        let prod_again = storage_for("abfss://prod@acct.dfs.core.windows.net/orders");
+
+        assert!(
+            !Arc::ptr_eq(&prod.object_store, &staging.object_store),
+            "two containers must not share one ObjectStore"
+        );
+        assert!(
+            Arc::ptr_eq(&prod.object_store, &prod_again.object_store),
+            "two tables in one container share one ObjectStore"
+        );
+    }
+
+    #[test]
+    fn test_object_store_cache_key_ignores_options_the_store_does_not_read() {
+        let s3 = Url::parse("s3://example-bucket/path/").unwrap();
+        let region = HashMap::from([("region".to_string(), "us-west-2".to_string())]);
+        let mut with_unread = region.clone();
+        with_unread.insert("spark.sql.shuffle.partitions".to_string(), "8".to_string());
+        with_unread.insert("azure_storage_account_key".to_string(), "k".to_string());
+        assert_eq!(
+            object_store_cache_key(&s3, &region),
+            object_store_cache_key(&s3, &with_unread),
+            "options the S3 builder drops must not split its cache entry"
+        );
+
+        let local = Url::parse("file:///tmp/tbl").unwrap();
+        assert_eq!(
+            object_store_cache_key(&local, &HashMap::new()),
+            object_store_cache_key(&local, &region),
+            "a local store reads no options"
+        );
+    }
+
+    #[test]
+    fn test_object_store_cache_key_keeps_every_option_the_store_reads() {
+        // Recognised keys stay in the key whatever their case, because the
+        // builder lowercases them before parsing.
+        let cases = [
+            ("s3://example-bucket/path/", "AWS_ENDPOINT"),
+            ("s3://example-bucket/path/", "aws_secret_access_key"),
+            (
+                "abfss://container@acct.dfs.core.windows.net/tbl",
+                "AZURE_STORAGE_ACCOUNT_KEY",
+            ),
+            ("gs://bucket/tbl", "google_service_account"),
+        ];
+        for (url, key) in cases {
+            let url = Url::parse(url).unwrap();
+            let a = HashMap::from([(key.to_string(), "value-a".to_string())]);
+            let b = HashMap::from([(key.to_string(), "value-b".to_string())]);
+            assert_ne!(
+                object_store_cache_key(&url, &a),
+                object_store_cache_key(&url, &b),
+                "`{key}` configures the store at {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_storage_new_survives_a_poisoned_object_store_cache_lock() {
+        // Poison the process-wide cache lock the way any panic while holding
+        // it would. Every later `Storage::new` must still work, not panic.
+        // The spawned thread's panic message on stderr is expected.
+        let _ = std::thread::spawn(|| {
+            let _held = OBJECT_STORE_CACHE.lock();
+            panic!("poison OBJECT_STORE_CACHE for the test");
+        })
+        .join();
+        assert!(OBJECT_STORE_CACHE.is_poisoned());
+
+        let base = canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap();
+        let url = Url::from_directory_path(&base).unwrap();
+        let configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            url.as_str().to_string(),
+        )]));
+        assert!(Storage::new(Arc::new(HashMap::new()), configs).is_ok());
+    }
 
     #[test]
     fn test_storage_new_error_no_base_path() {
