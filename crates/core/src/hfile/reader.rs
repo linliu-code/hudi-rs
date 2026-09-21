@@ -183,6 +183,13 @@ pub struct HFileReader {
     current_block: Option<DataBlock>,
     /// Current block's index entry
     current_block_entry: Option<BlockIndexEntry>,
+    /// How many data blocks this reader has decompressed.
+    ///
+    /// Exists so a test can assert the COST of a lookup, not just its result. The
+    /// index probe in `find_block_for_key` fails silently -- a broken probe still
+    /// returns the right record via a linear walk -- so result-only assertions cannot
+    /// tell an O(log n) seek from an O(blocks) scan. This is the only thing that can.
+    data_block_load_count: usize,
 }
 
 /// Cursor tracking current position in the file.
@@ -222,6 +229,7 @@ impl HFileReader {
             cursor: Cursor::default(),
             current_block: None,
             current_block_entry: None,
+            data_block_load_count: 0,
         }
     }
 
@@ -1192,10 +1200,34 @@ impl HFileReader {
     }
 
     /// Find the block that may contain the lookup key.
+    ///
+    /// The probe MUST be built with [`Key::from_content`], not [`Key::from_bytes`].
+    /// `Key`'s ordering compares [`Key::content`], which skips the first two bytes and
+    /// reads them as an i16 length; `Utf8Key::as_bytes` returns raw content with no such
+    /// prefix. Handing raw content to `from_bytes` therefore reads the first two
+    /// characters AS the length -- for "hudi-key-..." that is 0x6875 = 26741, which
+    /// overruns the buffer, so `content()` yields the empty slice, which sorts below
+    /// every real index key and makes `range(..=probe).next_back()` return `None`
+    /// EVERY time.
+    ///
+    /// That failure is silent and correctness-preserving: `forward_seek` just falls
+    /// through to a linear walk and still returns the right record, so no test fails --
+    /// only the O() collapses. Measured on the 1429-block deep-index fixture, a
+    /// single lookup of the last key decompressed all 1429 data blocks and compared
+    /// 10000 records, while `blocks_for_keys` (which already used `from_content`)
+    /// selected exactly 1 block for the same key.
+    ///
+    /// `blocks_for_keys`'s own doc says its arithmetic is "what `find_block_for_key`
+    /// does for a single key" -- that was the intent, and only one of them had the
+    /// prefix. Guarded by `data_block_load_count` in the tests below, because nothing
+    /// else would catch a regression here.
     fn find_block_for_key(&mut self, lookup_key: &Utf8Key) -> Result<()> {
-        // Binary search using BTreeMap's range
-        let lookup_bytes = lookup_key.as_bytes();
-        let fake_key = Key::from_bytes(lookup_bytes.to_vec());
+        // A key longer than i16::MAX cannot be represented as a probe; leave the cursor
+        // where it is and let the caller's forward scan handle it, which is what the
+        // pre-fix behaviour did for EVERY key.
+        let Some(fake_key) = Key::from_content(lookup_key.as_bytes()) else {
+            return Ok(());
+        };
 
         // Find the entry with greatest key <= lookup_key
         let entry = self
@@ -1291,8 +1323,20 @@ impl HFileReader {
         }
     }
 
+    /// Data blocks decompressed by this reader so far. See the field's note: this is
+    /// how a test asserts a lookup's COST, which its RESULT cannot reveal.
+    ///
+    /// `pub(crate)` and `#[cfg(test)]`: the only caller is this file's own
+    /// `tests` module, so restricting to `pub(crate)` alone leaves the method
+    /// dead code (and warning) outside test builds.
+    #[cfg(test)]
+    pub(crate) fn data_block_load_count(&self) -> usize {
+        self.data_block_load_count
+    }
+
     /// Load a data block.
     fn load_data_block(&mut self, entry: &BlockIndexEntry) -> Result<()> {
+        self.data_block_load_count += 1;
         let block = self.read_block_at(entry.offset as usize, entry.size as usize)?;
         if block.block_type() != HFileBlockType::Data {
             return Err(HFileError::UnexpectedBlockType {
@@ -1641,6 +1685,52 @@ mod tests {
             .join("tests")
             .join("data")
             .join("hfile")
+    }
+
+    /// The index probe must actually locate the block: a single point lookup on a
+    /// 1429-block file must NOT decompress the whole file.
+    ///
+    /// This is a COST assertion, and it is the only kind that works here. The bug this
+    /// guards was a probe built with `Key::from_bytes` on unprefixed content, which made
+    /// `range(..=probe).next_back()` return `None` for every key. `forward_seek` then fell
+    /// through to a linear walk and STILL RETURNED THE CORRECT RECORD -- so all 137 hfile
+    /// tests passed both before and after the fix. Only the block count shows it: last-key
+    /// lookup was 1429 blocks / 10000 records compared, versus 1 block after.
+    #[test]
+    fn a_point_lookup_reads_one_block_not_the_whole_file() {
+        let path =
+            test_data_dir().join("hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile");
+        let bytes = std::fs::read(&path).expect("deep-index fixture");
+        let mut reader = HFileReader::new(bytes).expect("open");
+
+        let total_blocks = reader.data_block_entries().len();
+        assert!(
+            total_blocks > 1000,
+            "fixture must be multi-block for this to mean anything, got {total_blocks}"
+        );
+
+        // The LAST key is the worst case: a linear walk has to cross every block to reach it.
+        let last = reader
+            .collect_records()
+            .expect("scan")
+            .last()
+            .and_then(|r| r.key_as_str().map(str::to_string))
+            .expect("a last key");
+
+        let mut probe = HFileReader::new(std::fs::read(&path).expect("re-read")).expect("open");
+        let before = probe.data_block_load_count();
+        let found = probe.lookup_records(&[last.as_str()]).expect("lookup");
+        let loaded = probe.data_block_load_count() - before;
+
+        assert_eq!(found.len(), 1, "the key must still be found");
+        assert!(found[0].1.is_some(), "and must resolve to a record");
+        assert!(
+            loaded <= 2,
+            "a point lookup for the LAST key of a {total_blocks}-block file decompressed \
+             {loaded} blocks; the index probe is not locating the block (it degraded to a \
+             linear walk). Expected 1, allowing 2 = seek_to_first's block-1 scaffold \
+             load + the probed target block."
+        );
     }
 
     fn read_test_hfile(filename: &str) -> Vec<u8> {
