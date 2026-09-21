@@ -521,6 +521,96 @@ fn avro_byte_string(value: &serde_json::Value, bad: &dyn Fn(&str) -> CoreError) 
         .collect()
 }
 
+/// True iff `source` can be reconciled to `target` by name-metadata ALONE — i.e.
+/// they are structurally identical apart from nested child-FIELD names (arrow-avro
+/// "item"/"entries" vs Parquet "element"/"key_value") or field metadata, so the
+/// underlying buffers are byte-compatible. A primitive or layout difference
+/// (e.g. Int64 vs Int32, List vs LargeList) is NOT reconcilable — reconciling it
+/// would reinterpret or drop bytes — so it returns false and the caller treats it
+/// as a genuine mismatch. Conservative by construction: anything unrecognized is
+/// false.
+///
+/// A nested child's NULLABILITY is part of the type, not a name, and may only
+/// widen: a non-null `source` child fits a nullable `target` child, but a nullable
+/// `source` child under a non-null `target` child asserts something the data need
+/// not satisfy. Re-tagged that way, the rebuild fails on the first batch holding a
+/// null element and succeeds on one without — so this predicate refuses the
+/// pairing. Widening can never fail the rebuild, so it is admitted.
+///
+/// Which direction a caller meets depends on its argument order. arrow-avro
+/// declares an Avro `array<long>`'s child non-null, while a parquet base file may
+/// declare `element` nullable (a writer that does not derive the file from that
+/// Avro schema, or a nullable-to-non-null evolution). Where the SOURCE is an Avro
+/// log column and the target carries a parquet-style nullable child
+/// (`pad_partial_to_target`, output projection), that pairing widens; where the
+/// source is such a parquet base row and the target a log record's type
+/// (`reconcile_defaults_from_prior`) it narrows, and is declined: the log value is
+/// kept, as it was before this predicate reconciled names there. Two
+/// arrow-avro-derived sides are simply equal.
+///
+/// One caller deliberately does not use this rule:
+/// `overlay_partial_over_prior` keeps the nullability-blind reconciliation it had
+/// before the rule existed ([`is_name_reconcilable_ignoring_child_nullability`]),
+/// because refusing there drops a column the partial update never touched to a
+/// typed NULL. It propagates the rebuild's error, so a null element that cannot
+/// be re-tagged fails the read loudly rather than silently.
+///
+/// `FixedSizeList` has no arm, although the rebuild could re-tag one: neither
+/// arrow-avro nor the parquet reader produces it on the paths that consult this,
+/// so a child-name difference there is refused like any other unrecognized pair.
+pub(crate) fn is_name_reconcilable(
+    source: &arrow_schema::DataType,
+    target: &arrow_schema::DataType,
+) -> bool {
+    name_reconcilable(source, target, false)
+}
+
+/// [`is_name_reconcilable`] with nested child nullability ignored in both
+/// directions. Admitting a narrowing hands the decision to the rebuild, which
+/// fails when the data holds a null the target child cannot: a caller must
+/// propagate that failure, never swallow it into a null.
+pub(crate) fn is_name_reconcilable_ignoring_child_nullability(
+    source: &arrow_schema::DataType,
+    target: &arrow_schema::DataType,
+) -> bool {
+    name_reconcilable(source, target, true)
+}
+
+fn name_reconcilable(
+    source: &arrow_schema::DataType,
+    target: &arrow_schema::DataType,
+    ignore_child_nullability: bool,
+) -> bool {
+    use arrow_schema::DataType::{LargeList, List, Map, Struct};
+    let child_reconcilable = |source: &arrow_schema::Field, target: &arrow_schema::Field| {
+        (ignore_child_nullability || !source.is_nullable() || target.is_nullable())
+            && name_reconcilable(
+                source.data_type(),
+                target.data_type(),
+                ignore_child_nullability,
+            )
+    };
+    if source == target {
+        return true;
+    }
+    match (source, target) {
+        // List/LargeList/Map wrapper field NAME (+ metadata) may differ; recurse
+        // into the element/entries field. Map also requires the sorted flag to match.
+        (List(a), List(b)) | (LargeList(a), LargeList(b)) => child_reconcilable(a, b),
+        (Map(a, sa), Map(b, sb)) => sa == sb && child_reconcilable(a, b),
+        // Struct field NAMES are user data (must match); recurse into each field in
+        // order.
+        (Struct(fa), Struct(fb)) => {
+            fa.len() == fb.len()
+                && fa
+                    .iter()
+                    .zip(fb.iter())
+                    .all(|(x, y)| x.name() == y.name() && child_reconcilable(x, y))
+        }
+        _ => false,
+    }
+}
+
 /// Whether `from` -> `to` is a type change Hudi permits as schema evolution, and
 /// so one [`evolve_array`] should convert.
 ///
@@ -2838,5 +2928,103 @@ mod tests {
             .expect_err("a 16-character non-UUID default must not fill")
             .to_string();
         assert!(err.contains("a UUID string"), "got: {err}");
+    }
+
+    /// `is_name_reconcilable`, row by row. Its whole job is to be conservative:
+    /// a `true` licenses re-tagging buffers under another type, so every negative
+    /// row here is a pairing that must keep reaching its caller's decline or error.
+    #[test]
+    fn is_name_reconcilable_admits_only_name_and_widening_differences() {
+        use super::is_name_reconcilable;
+        let f = |name: &str, dt: DataType, nullable: bool| Arc::new(Field::new(name, dt, nullable));
+        let list =
+            |child: &str, dt: DataType, nullable: bool| DataType::List(f(child, dt, nullable));
+        let large =
+            |child: &str, dt: DataType, nullable: bool| DataType::LargeList(f(child, dt, nullable));
+        let map = |entries: &str, value_nullable: bool, sorted: bool| {
+            DataType::Map(
+                f(
+                    entries,
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Int64, value_nullable),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                ),
+                sorted,
+            )
+        };
+        let strukt = |children: Vec<(&str, DataType, bool)>| {
+            DataType::Struct(
+                children
+                    .into_iter()
+                    .map(|(n, dt, nullable)| Field::new(n, dt, nullable))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        };
+        let with_md = |child: &str| {
+            DataType::List(Arc::new(
+                Field::new(child, DataType::Int64, true).with_metadata(
+                    [("avro.name".to_string(), "x".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            ))
+        };
+        let fixed = |child: &str| DataType::FixedSizeList(f(child, DataType::Int64, true), 2);
+
+        #[rustfmt::skip]
+        // (label, source, target, is_name_reconcilable, is_name_reconcilable_ignoring_child_nullability)
+        let rows: Vec<(&str, DataType, DataType, bool, bool)> = vec![
+            // --- reconcilable: names, metadata, and nullability that WIDENS ---
+            ("identical", list("item", DataType::Int64, true), list("item", DataType::Int64, true), true, true),
+            ("list child name", list("item", DataType::Int64, true), list("element", DataType::Int64, true), true, true),
+            ("large list child name", large("item", DataType::Int64, true), large("element", DataType::Int64, true), true, true),
+            ("map entries name", map("entries", true, false), map("key_value", true, false), true, true),
+            ("child metadata", with_md("item"), list("element", DataType::Int64, true), true, true),
+            ("struct child recursion", strukt(vec![("tags", list("item", DataType::Int64, true), true)]), strukt(vec![("tags", list("element", DataType::Int64, true), true)]), true, true),
+            ("list child non-null -> nullable", list("item", DataType::Int64, false), list("element", DataType::Int64, true), true, true),
+            ("map value non-null -> nullable", map("entries", false, false), map("key_value", true, false), true, true),
+            ("struct child non-null -> nullable", strukt(vec![("a", DataType::Int64, false)]), strukt(vec![("a", DataType::Int64, true)]), true, true),
+            // --- not reconcilable: nullability that NARROWS ---
+            ("list child nullable -> non-null", list("item", DataType::Int64, true), list("element", DataType::Int64, false), false, true),
+            ("large list child nullable -> non-null", large("item", DataType::Int64, true), large("element", DataType::Int64, false), false, true),
+            ("map value nullable -> non-null", map("entries", true, false), map("key_value", false, false), false, true),
+            ("struct child nullable -> non-null", strukt(vec![("a", DataType::Int64, true)]), strukt(vec![("a", DataType::Int64, false)]), false, true),
+            ("nested narrowing under a struct", strukt(vec![("tags", list("item", DataType::Int64, true), true)]), strukt(vec![("tags", list("element", DataType::Int64, false), true)]), false, true),
+            // --- not reconcilable: layout or value differences ---
+            ("list vs large list", list("item", DataType::Int64, true), large("item", DataType::Int64, true), false, false),
+            ("leaf Int64 vs Int32", DataType::Int64, DataType::Int32, false, false),
+            ("list child Int64 vs Int32", list("item", DataType::Int64, true), list("element", DataType::Int32, true), false, false),
+            ("struct field count", strukt(vec![("a", DataType::Int64, true)]), strukt(vec![("a", DataType::Int64, true), ("b", DataType::Int64, true)]), false, false),
+            ("struct field name", strukt(vec![("a", DataType::Int64, true)]), strukt(vec![("b", DataType::Int64, true)]), false, false),
+            ("map sorted flag", map("entries", true, false), map("key_value", true, true), false, false),
+            // Pinned, not endorsed: the rebuild could re-tag a FixedSizeList, but
+            // neither arrow-avro nor the parquet reader produces one here.
+            ("fixed size list child name", fixed("item"), fixed("element"), false, false),
+            ("fixed size list vs list", fixed("item"), list("item", DataType::Int64, true), false, false),
+        ];
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter(|(_, source, target, want, _)| is_name_reconcilable(source, target) != *want)
+            .map(|(name, _, _, want, _)| format!("{name}: expected {want}"))
+            .collect();
+        assert!(wrong.is_empty(), "rows answered wrongly: {wrong:#?}");
+
+        // The nullability-blind variant differs exactly on the narrowing rows.
+        use super::is_name_reconcilable_ignoring_child_nullability as blind;
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter(|(_, source, target, _, want_blind)| blind(source, target) != *want_blind)
+            .map(|(name, _, _, _, want_blind)| format!("{name}: expected {want_blind}"))
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "nullability-blind rows answered wrongly: {wrong:#?}"
+        );
     }
 }
