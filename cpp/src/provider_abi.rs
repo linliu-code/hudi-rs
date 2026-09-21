@@ -1,0 +1,721 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+//! C ABI for injecting a base-file data provider, and the Rust adapter that
+//! presents it as a [`BaseFileDataProvider`].
+//!
+//! hudi-core defines the source-agnostic [`BaseFileDataProvider`] trait but
+//! implements no source. The composition root that constructs a concrete
+//! provider lives **outside** hudi-rs, and hudi-rs makes no assumption about
+//! what backs it. That provider is handed to hudi-rs across a plain
+//! C ABI — a small vtable of function pointers — so `libhudi.so` never links or
+//! names any provider implementation.
+//!
+//! Flow:
+//! 1. The provider's cdylib produces a [`HudiBaseFileDataProviderVTable`] + an
+//!    opaque `ctx`.
+//! 2. The composition root calls [`hudi_base_file_data_provider_new`] to wrap them
+//!    into an owning handle and stashes the handle on
+//!    `FfiReaderContext.base_file_provider_handle`.
+//! 3. `new_file_group_reader_with_context` consumes the handle into a
+//!    [`CApiBaseFileDataProvider`] and injects it via `with_base_file_provider`.
+//!
+//! The matching C declarations are shipped in `cpp/include/hudi_base_file_data_provider.h`;
+//! the two must stay layout-identical. The [`HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION`]
+//! marker guards against silent layout drift once the two sides are built apart.
+//!
+//! **Async boundary.** The trait method is `async`, but the vtable call is a
+//! synchronous C function that itself blocks (a provider typically drives
+//! discovery and data-fetch calls behind its own runtime). hudi-core drives readers on the
+//! multi-thread `OBJECT_STORE_RUNTIME`, and calling `block_on` from a runtime
+//! worker thread panics — so the adapter runs the C call inside `spawn_blocking`,
+//! moving it onto a blocking-pool thread that carries no runtime context.
+
+use std::os::raw::{c_int, c_void};
+
+use arrow_array::RecordBatchReader;
+use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow_schema::ffi::FFI_ArrowSchema;
+use async_trait::async_trait;
+
+use crate::base_file_provider::{
+    BaseFileDataProvider, BaseFileDataProviderRef, BaseFileDataRequest, BaseFileProviderStats,
+};
+
+/// Layout/behaviour version of the base-file provider C ABI.
+///
+/// Bump on any change to the vtable, request, result, or stats struct layout.
+/// [`CApiBaseFileDataProvider::from_raw`] rejects a vtable whose `abi_version` does not
+/// match, degrading to "no provider" rather than reading an unknown layout.
+pub const HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION: u32 = 1;
+
+/// Return code: the provider served the base file (a valid stream is in `stream`).
+pub const HUDI_PROVIDER_OUTCOME_SERVED: c_int = 1;
+/// Return code: the provider did not serve the base file (read from object storage).
+pub const HUDI_PROVIDER_OUTCOME_NOT_SERVED: c_int = 0;
+
+/// A borrowed UTF-8 string slice across the ABI: pointer + byte length, no NUL.
+///
+/// The pointer is valid only for the duration of the `try_base_file` call.
+#[repr(C)]
+pub struct HudiStrSlice {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+impl HudiStrSlice {
+    fn from_str(s: &str) -> Self {
+        Self {
+            ptr: s.as_ptr(),
+            len: s.len(),
+        }
+    }
+}
+
+/// Everything the provider needs to try one base file. Mirrors
+/// [`BaseFileDataRequest`] field for field; all pointers are borrowed for the
+/// duration of the call only.
+#[repr(C)]
+pub struct HudiBaseFileDataRequest {
+    /// Absolute storage URI of the base file (the identity a provider keys by).
+    pub file_uri: HudiStrSlice,
+    /// Projected ("intersection") schema the read wants back, as an Arrow C
+    /// schema. Never null.
+    pub projected_schema: *const FFI_ArrowSchema,
+    /// Whether a pushed predicate may be applied to this file: true when the split
+    /// has no log files, or the predicate is primary-key-safe (ENG-47506; was a
+    /// table-type check, so this is now true for a MOR slice with no log files
+    /// where it previously was not). When false, the provider must serve
+    /// unfiltered.
+    pub can_push_predicate: bool,
+    /// Partition path of the split (e.g. `year=2024/month=01`).
+    pub partition_path: HudiStrSlice,
+    /// Partition field names, in order; `partition_fields_len` entries.
+    pub partition_fields: *const HudiStrSlice,
+    pub partition_fields_len: usize,
+    /// Table data schema (Arrow C schema), or null if unavailable.
+    pub data_schema: *const FFI_ArrowSchema,
+}
+
+/// Client-side counters for one base-file provider attempt. Mirrors hudi-core's
+/// source-agnostic [`BaseFileProviderStats`] field for field (all `u64`,
+/// FFI-safe).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct HudiBaseFileProviderStats {
+    pub files_served: u64,
+    pub storage_fallbacks: u64,
+    pub local_served: u64,
+    pub remote_served: u64,
+    pub rows_served: u64,
+    pub bytes_served: u64,
+    pub batches_received: u64,
+    pub discover_wall_nanos: u64,
+    pub connect_wall_nanos: u64,
+    pub fetch_wall_nanos: u64,
+}
+
+impl From<HudiBaseFileProviderStats> for BaseFileProviderStats {
+    fn from(s: HudiBaseFileProviderStats) -> Self {
+        BaseFileProviderStats {
+            files_served: s.files_served,
+            storage_fallbacks: s.storage_fallbacks,
+            local_served: s.local_served,
+            remote_served: s.remote_served,
+            rows_served: s.rows_served,
+            // Wire field keeps the name `bytes_served` (it is part of the frozen
+            // C ABI and its consumers); hudi-core's field is `bytes_materialized`
+            // because that is what the number actually measures on the served
+            // path. Deliberate name difference, not an oversight.
+            bytes_materialized: s.bytes_served,
+            batches_received: s.batches_received,
+            discover_wall_nanos: s.discover_wall_nanos,
+            connect_wall_nanos: s.connect_wall_nanos,
+            fetch_wall_nanos: s.fetch_wall_nanos,
+        }
+    }
+}
+
+/// Out-parameter the provider fills. When `outcome == HUDI_PROVIDER_OUTCOME_SERVED`,
+/// `stream` holds a valid Arrow C stream of the projected batches; otherwise
+/// `outcome == HUDI_PROVIDER_OUTCOME_NOT_SERVED` and `stream` is left empty.
+/// `stats` is filled either way (a file that was not served still reports its
+/// timings).
+#[repr(C)]
+pub struct HudiBaseFileDataResult {
+    pub outcome: c_int,
+    pub stream: FFI_ArrowArrayStream,
+    pub stats: HudiBaseFileProviderStats,
+}
+
+impl HudiBaseFileDataResult {
+    fn empty() -> Self {
+        Self {
+            outcome: HUDI_PROVIDER_OUTCOME_NOT_SERVED,
+            stream: FFI_ArrowArrayStream::empty(),
+            stats: HudiBaseFileProviderStats::default(),
+        }
+    }
+}
+
+/// The provider's function-pointer table. Copied by value into the adapter, so the
+/// storage backing this struct need not outlive [`hudi_base_file_data_provider_new`].
+///
+/// **Concurrency contract (must hold for the C implementor):** `try_base_file`
+/// MAY be called concurrently from several threads on the same `ctx`. The
+/// implementation must be `Send + Sync`-equivalent. `destroy` is called exactly
+/// once, after the last `try_base_file` has returned.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HudiBaseFileDataProviderVTable {
+    /// Must equal [`HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION`].
+    pub abi_version: u32,
+    /// Try to serve one base file. Returns `HUDI_PROVIDER_OUTCOME_SERVED` or
+    /// `HUDI_PROVIDER_OUTCOME_NOT_SERVED`. Any internal failure must be reported
+    /// as not-served, never as an error that fails the read.
+    pub try_base_file: extern "C" fn(
+        ctx: *mut c_void,
+        req: *const HudiBaseFileDataRequest,
+        out: *mut HudiBaseFileDataResult,
+    ) -> c_int,
+    /// Release `ctx`. Called exactly once when the owning reader is dropped.
+    pub destroy: extern "C" fn(ctx: *mut c_void),
+}
+
+/// Owns the provider `ctx` and forwards trait calls through the vtable.
+///
+/// Holds the vtable by value (it is `Copy`) and the opaque `ctx`. The `ctx` is
+/// released via `destroy` exactly once, on drop.
+pub struct CApiBaseFileDataProvider {
+    vtable: HudiBaseFileDataProviderVTable,
+    ctx: *mut c_void,
+}
+
+// SAFETY: the ABI concurrency contract (documented on `HudiBaseFileDataProviderVTable`)
+// requires the C implementation to tolerate concurrent `try_base_file` calls on
+// the same `ctx`; the raw pointer is only ever passed back to the vtable, never
+// dereferenced on the Rust side. `destroy` runs once, on drop, after all calls.
+unsafe impl Send for CApiBaseFileDataProvider {}
+unsafe impl Sync for CApiBaseFileDataProvider {}
+
+impl CApiBaseFileDataProvider {
+    /// Build an adapter from a raw vtable pointer and an owned `ctx`.
+    ///
+    /// Returns `None` (and does **not** take ownership of `ctx`) if the vtable is
+    /// null or its `abi_version` is incompatible — the caller then falls back to
+    /// "no provider". On `Some`, ownership of `ctx` transfers to the returned value,
+    /// which releases it via `destroy` on drop.
+    ///
+    /// # Safety
+    /// `vtable` must point to a valid [`HudiBaseFileDataProviderVTable`] for the duration
+    /// of this call, and `ctx` must be the matching context the vtable expects.
+    unsafe fn from_raw(
+        vtable: *const HudiBaseFileDataProviderVTable,
+        ctx: *mut c_void,
+    ) -> Option<Self> {
+        if vtable.is_null() {
+            log::error!("[hudi-provider-abi] null vtable; falling back to no provider");
+            return None;
+        }
+        // Copy the vtable by value; storage behind `vtable` need not outlive us.
+        let vtable = unsafe { *vtable };
+        if vtable.abi_version != HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION {
+            // Do not touch `ctx` or call `destroy` — a mismatched vtable's
+            // `destroy` cannot be trusted. Degrade to no provider and leak `ctx`
+            // (rare, and safer than calling an unknown-layout function pointer).
+            log::error!(
+                "[hudi-provider-abi] vtable abi_version {} != expected {}; falling back to no provider",
+                vtable.abi_version,
+                HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION
+            );
+            return None;
+        }
+        Some(Self { vtable, ctx })
+    }
+
+    /// Adapt a served result's Arrow C stream into a **lazy**
+    /// [`RecordBatchReader`], or `None` if the stream cannot be imported (which
+    /// the caller maps to "not served" so the read falls back to object storage).
+    ///
+    /// The reader is pulled downstream inside the merge loop, one batch at a
+    /// time, so the served file is never fully materialized here. This is the
+    /// R3 memory fix for the provider path.
+    ///
+    /// **Fallback tradeoff (accepted SLA change).** Import failure *before*
+    /// streaming starts still degrades to a storage read (returns `None`). An
+    /// error surfaced *mid-stream* cannot: the merge loop is already consuming, so
+    /// it propagates as a read error rather than silently re-reading the whole
+    /// file from storage. This is a deliberate resilience/availability change from
+    /// the old materialize-then-classify path (where any per-batch error fell back
+    /// transparently): a base file provider dying mid-stream now fails the query
+    /// instead of degrading. It is **safe** (no partial or duplicated data — the
+    /// merge never restarts), and the peak-memory win is the point. A provider
+    /// must therefore only report `SERVED` when confident it can deliver the whole
+    /// stream (source-availability failures classified as not-served *before*
+    /// returning), and operators should monitor the provider's mid-stream error
+    /// rate since it is now query-visible.
+    fn served_reader(
+        result: &mut HudiBaseFileDataResult,
+    ) -> Option<Box<dyn RecordBatchReader + Send>> {
+        // SAFETY: on a served outcome the provider filled `stream` with a valid Arrow C stream;
+        // `from_raw` moves it out and marks the source released, so `result`
+        // dropping afterwards is a no-op (no double free).
+        match unsafe { ArrowArrayStreamReader::from_raw(&mut result.stream) } {
+            Ok(reader) => Some(Box::new(reader)),
+            Err(e) => {
+                log::warn!(
+                    "[hudi-provider-abi] served stream import failed; falling back to storage read: {e}"
+                );
+                None
+            }
+        }
+    }
+}
+
+impl Drop for CApiBaseFileDataProvider {
+    fn drop(&mut self) {
+        (self.vtable.destroy)(self.ctx);
+    }
+}
+
+#[async_trait]
+impl BaseFileDataProvider for CApiBaseFileDataProvider {
+    async fn try_base_file(
+        &self,
+        req: BaseFileDataRequest<'_>,
+    ) -> (
+        Option<Box<dyn RecordBatchReader + Send>>,
+        BaseFileProviderStats,
+    ) {
+        // ── Marshal the request into OWNED, Send data. The Arrow C schemas are
+        //    Send; the strings become owned copies. This data is moved into the
+        //    blocking closure below, where the borrowed C pointer struct is
+        //    built pointing into it — so nothing non-`Send` (raw pointers) is
+        //    ever held across the `.await`, keeping the future `Send` as the
+        //    trait requires. ────────────────────────────────────────────────
+        let projected_schema = match FFI_ArrowSchema::try_from(req.projected_schema.as_ref()) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!(
+                    "[hudi-provider-abi] projected schema export failed; falling back to storage read: {e}"
+                );
+                return (None, BaseFileProviderStats::default());
+            }
+        };
+        let data_schema: Option<FFI_ArrowSchema> = match req.data_schema {
+            Some(s) => match FFI_ArrowSchema::try_from(s.as_ref()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    // Non-fatal: the provider can resolve partition types without it.
+                    log::debug!("[hudi-provider-abi] data schema export failed; sending null: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let file_uri = req.file_uri.to_string();
+        let partition_path = req.partition_path.to_string();
+        let partition_fields: Vec<String> = req.partition_fields.to_vec();
+        let can_push_predicate = req.can_push_predicate;
+        let vtable = self.vtable;
+        let ctx_addr = self.ctx as usize;
+
+        // ── Cross the C boundary on a blocking-pool thread. The C call blocks
+        //    on the provider's own runtime; doing that on an OBJECT_STORE_RUNTIME
+        //    worker would panic, so we escape to `spawn_blocking`, whose thread
+        //    carries no runtime context. All C-pointer data is built and lives
+        //    inside the closure, valid for the whole synchronous call. ────────
+        let call = tokio::task::spawn_blocking(move || {
+            let field_slices: Vec<HudiStrSlice> = partition_fields
+                .iter()
+                .map(|f| HudiStrSlice::from_str(f))
+                .collect();
+            let c_req = HudiBaseFileDataRequest {
+                file_uri: HudiStrSlice::from_str(&file_uri),
+                projected_schema: &projected_schema,
+                can_push_predicate,
+                partition_path: HudiStrSlice::from_str(&partition_path),
+                partition_fields: field_slices.as_ptr(),
+                partition_fields_len: field_slices.len(),
+                data_schema: data_schema
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s as *const FFI_ArrowSchema),
+            };
+            let mut c_res = HudiBaseFileDataResult::empty();
+            // SAFETY: `c_req` borrows only data owned by this closure, alive for
+            // the whole synchronous call; `c_res` is a fresh out-parameter.
+            let code = (vtable.try_base_file)(
+                ctx_addr as *mut c_void,
+                &c_req as *const HudiBaseFileDataRequest,
+                &mut c_res as *mut HudiBaseFileDataResult,
+            );
+            (code, c_res)
+        })
+        .await;
+
+        let (outcome_code, mut c_res) = match call {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::warn!(
+                    "[hudi-provider-abi] provider call task failed; falling back to storage read: {e}"
+                );
+                return (None, BaseFileProviderStats::default());
+            }
+        };
+
+        let mut stats: BaseFileProviderStats = c_res.stats.into();
+        if outcome_code != HUDI_PROVIDER_OUTCOME_SERVED {
+            return (None, stats);
+        }
+        match Self::served_reader(&mut c_res) {
+            Some(reader) => {
+                // On the served path the drain counters are hudi-core's to fill:
+                // the CountingBatchReader tallies rows/bytes/batches as the stream
+                // is consumed and merges them into the live stats slot. Zero
+                // whatever the provider reported for them here, so a provider that
+                // (against the contract) also populated these cannot cause a
+                // double-count. Setup counters are kept.
+                stats.rows_served = 0;
+                stats.bytes_materialized = 0;
+                stats.batches_received = 0;
+                (Some(reader), stats)
+            }
+            None => {
+                // The provider claimed SERVED but its stream could not be
+                // imported, so the read below actually goes to object storage.
+                // Reclassify to match what happened: leaving `files_served`
+                // incremented would over-count served files and under-count
+                // fallbacks in precisely the failure case an operator needs to
+                // see. `saturating_sub` because a provider is not obliged to have
+                // set `files_served` at all.
+                stats.files_served = stats.files_served.saturating_sub(1);
+                stats.storage_fallbacks += 1;
+                stats.rows_served = 0;
+                stats.bytes_materialized = 0;
+                stats.batches_received = 0;
+                (None, stats)
+            }
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// C ABI entry points (defined by hudi-rs; called by the composition root)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Wrap a provider vtable + `ctx` into an owning handle for
+/// `FfiReaderContext.base_file_provider_handle`.
+///
+/// Returns 0 if the vtable is null or its version is incompatible (the reader
+/// then runs with no provider). On success, ownership of `ctx` transfers into the
+/// handle; release it either by handing the handle to
+/// `new_file_group_reader_with_context` (which consumes it) or, if the reader is
+/// never built, by calling [`hudi_base_file_data_provider_free`].
+///
+/// # Safety
+/// `vtable` must point to a valid [`HudiBaseFileDataProviderVTable`]; `ctx` must be the
+/// context that vtable expects.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hudi_base_file_data_provider_new(
+    vtable: *const HudiBaseFileDataProviderVTable,
+    ctx: *mut c_void,
+) -> u64 {
+    match unsafe { CApiBaseFileDataProvider::from_raw(vtable, ctx) } {
+        Some(provider) => {
+            let provider: BaseFileDataProviderRef = std::sync::Arc::new(provider);
+            Box::into_raw(Box::new(provider)) as u64
+        }
+        None => 0,
+    }
+}
+
+/// Release a handle from [`hudi_base_file_data_provider_new`] that was **not** consumed
+/// by `new_file_group_reader_with_context` (e.g. the reader build was aborted).
+/// Drops the provider, which runs its `destroy` exactly once. A 0 handle
+/// is ignored.
+///
+/// # Safety
+/// `handle` must have come from [`hudi_base_file_data_provider_new`] and not already been
+/// consumed or freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hudi_base_file_data_provider_free(handle: u64) {
+    if handle != 0 {
+        drop(unsafe { Box::from_raw(handle as *mut BaseFileDataProviderRef) });
+    }
+}
+
+/// Consume a handle into the injectable provider reference. Returns `None` for a
+/// 0 handle. Used by `new_file_group_reader_with_context`.
+///
+/// # Safety
+/// `handle` must have come from [`hudi_base_file_data_provider_new`] and not already been
+/// consumed or freed; ownership transfers to the returned value.
+pub(crate) unsafe fn take_provider_from_handle(handle: u64) -> Option<BaseFileDataProviderRef> {
+    if handle == 0 {
+        return None;
+    }
+    Some(*unsafe { Box::from_raw(handle as *mut BaseFileDataProviderRef) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Shared across a single-threaded test via the provided ctx pointer.
+    struct StubCtx {
+        batches: Vec<RecordBatch>,
+        outcome: c_int,
+        /// When true, report SERVED but leave `out.stream` as hudi-rs
+        /// pre-initialised it (empty). Models a provider that claims a serve it
+        /// cannot back with a usable stream.
+        serve_without_stream: bool,
+        destroy_counter: *const AtomicUsize,
+    }
+
+    fn sample_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+    }
+
+    fn sample_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            sample_schema(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap()
+    }
+
+    extern "C" fn stub_try(
+        ctx: *mut c_void,
+        _req: *const HudiBaseFileDataRequest,
+        out: *mut HudiBaseFileDataResult,
+    ) -> c_int {
+        let stub = unsafe { &*(ctx as *const StubCtx) };
+        let out = unsafe { &mut *out };
+        out.stats = HudiBaseFileProviderStats {
+            files_served: (stub.outcome == HUDI_PROVIDER_OUTCOME_SERVED) as u64,
+            storage_fallbacks: (stub.outcome != HUDI_PROVIDER_OUTCOME_SERVED) as u64,
+            rows_served: 3,
+            ..Default::default()
+        };
+        if stub.outcome == HUDI_PROVIDER_OUTCOME_SERVED && !stub.serve_without_stream {
+            let schema = stub.batches[0].schema();
+            let iter = RecordBatchIterator::new(stub.batches.clone().into_iter().map(Ok), schema);
+            out.stream = FFI_ArrowArrayStream::new(Box::new(iter));
+        }
+        stub.outcome
+    }
+
+    extern "C" fn stub_destroy(ctx: *mut c_void) {
+        let stub = unsafe { Box::from_raw(ctx as *mut StubCtx) };
+        unsafe { &*stub.destroy_counter }.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn make_handle(outcome: c_int, counter: &AtomicUsize, version: u32) -> u64 {
+        make_handle_inner(outcome, counter, version, false)
+    }
+
+    fn make_handle_inner(
+        outcome: c_int,
+        counter: &AtomicUsize,
+        version: u32,
+        serve_without_stream: bool,
+    ) -> u64 {
+        let stub = Box::new(StubCtx {
+            batches: vec![sample_batch()],
+            outcome,
+            serve_without_stream,
+            destroy_counter: counter as *const AtomicUsize,
+        });
+        let vtable = HudiBaseFileDataProviderVTable {
+            abi_version: version,
+            try_base_file: stub_try,
+            destroy: stub_destroy,
+        };
+        unsafe { hudi_base_file_data_provider_new(&vtable, Box::into_raw(stub) as *mut c_void) }
+    }
+
+    fn sample_request<'a>(
+        schema: &'a Arc<Schema>,
+        fields: &'a [String],
+    ) -> BaseFileDataRequest<'a> {
+        BaseFileDataRequest {
+            file_uri: "s3://bucket/table/part/base.parquet",
+            projected_schema: schema,
+            can_push_predicate: true,
+            partition_path: "year=2024/month=01",
+            partition_fields: fields,
+            data_schema: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn served_outcome_roundtrips_batches() {
+        let counter = AtomicUsize::new(0);
+        let handle = make_handle(
+            HUDI_PROVIDER_OUTCOME_SERVED,
+            &counter,
+            HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+        );
+        let provider = unsafe { take_provider_from_handle(handle) }.expect("provider");
+
+        let schema = sample_schema();
+        let fields = vec!["year".to_string(), "month".to_string()];
+        let (served, stats) = provider
+            .try_base_file(sample_request(&schema, &fields))
+            .await;
+
+        // The served source is lazy: drain it here to assert the batches
+        // survive the C round-trip.
+        let reader = served.expect("expected served data");
+        let batches: Vec<RecordBatch> = reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("drain served stream");
+        assert_eq!(batches.len(), 1, "one batch expected");
+        assert_eq!(
+            batches[0],
+            sample_batch(),
+            "batch survives the C round-trip"
+        );
+        assert_eq!(stats.files_served, 1);
+        // The stub deliberately mis-reports a drain counter (rows_served: 3). On
+        // the served path hudi-core owns the drain counters — CountingBatchReader
+        // fills them as it consumes the stream — so provider-abi zeroes whatever
+        // the provider claimed, preventing a double-count. Setup counters stay.
+        assert_eq!(
+            stats.rows_served, 0,
+            "served-path drain counters are zeroed to avoid double-counting"
+        );
+
+        drop(provider);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "destroy runs exactly once"
+        );
+    }
+
+    /// A provider that reports SERVED but hands back a stream that cannot be
+    /// imported must degrade to "not served" so the read falls back to object
+    /// storage — this is the one failure the streaming shape can still classify
+    /// before any data has moved.
+    ///
+    /// Also pins the stats reclassification: the attempt must NOT be left counted
+    /// as a served file, because the bytes actually came from storage. Getting
+    /// that wrong inflates the served-file count and hides the fallback in exactly
+    /// the case an operator is trying to diagnose.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn served_with_unimportable_stream_falls_back_and_reclassifies_stats() {
+        let counter = AtomicUsize::new(0);
+        let handle = make_handle_inner(
+            HUDI_PROVIDER_OUTCOME_SERVED,
+            &counter,
+            HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+            /* serve_without_stream */ true,
+        );
+        let provider = unsafe { take_provider_from_handle(handle) }.expect("provider");
+
+        let schema = sample_schema();
+        let (served, stats) = provider.try_base_file(sample_request(&schema, &[])).await;
+
+        assert!(
+            served.is_none(),
+            "an unimportable stream must degrade to a storage read, not a partial serve"
+        );
+        // The stub set files_served: 1 alongside its SERVED outcome; since the
+        // stream was unusable, that has to be walked back.
+        assert_eq!(
+            stats.files_served, 0,
+            "a failed import must not stay counted as a served file"
+        );
+        assert_eq!(
+            stats.storage_fallbacks, 1,
+            "a failed import must be counted as a storage fallback"
+        );
+        // Drain counters are hudi-core's on the served path and meaningless here.
+        assert_eq!(stats.rows_served, 0, "no rows were served");
+        assert_eq!(stats.bytes_materialized, 0, "no bytes were materialized");
+        assert_eq!(stats.batches_received, 0, "no batches were received");
+
+        drop(provider);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "destroy still runs exactly once on the failed-import path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn not_served_falls_through_but_reports_stats() {
+        let counter = AtomicUsize::new(0);
+        let handle = make_handle(
+            HUDI_PROVIDER_OUTCOME_NOT_SERVED,
+            &counter,
+            HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+        );
+        let provider = unsafe { take_provider_from_handle(handle) }.expect("provider");
+
+        let schema = sample_schema();
+        let (served, stats) = provider.try_base_file(sample_request(&schema, &[])).await;
+
+        assert!(served.is_none(), "expected no served data");
+        assert_eq!(
+            stats.storage_fallbacks, 1,
+            "a storage fallback still reports its counters"
+        );
+
+        drop(provider);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn version_mismatch_yields_no_provider() {
+        let counter = AtomicUsize::new(0);
+        // Wrong ABI version → new returns 0 (no provider). ctx is intentionally
+        // leaked (destroy not trusted for a mismatched vtable), so the counter
+        // stays at 0 — asserting we never called the untrusted destroy.
+        let handle = make_handle(
+            HUDI_PROVIDER_OUTCOME_SERVED,
+            &counter,
+            HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION + 1,
+        );
+        assert_eq!(handle, 0, "incompatible version must not produce a handle");
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn free_unconsumed_handle_runs_destroy_once() {
+        let counter = AtomicUsize::new(0);
+        let handle = make_handle(
+            HUDI_PROVIDER_OUTCOME_SERVED,
+            &counter,
+            HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+        );
+        assert_ne!(handle, 0);
+        unsafe { hudi_base_file_data_provider_free(handle) };
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "free drops the provider once"
+        );
+    }
+}

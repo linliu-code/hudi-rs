@@ -36,8 +36,7 @@
 ///
 /// Comparison is lexicographic on purpose — instant times are zero-padded
 /// fixed-width strings.
-#[allow(dead_code)]
-pub(crate) const MAX_INSTANT_TIME: &str = "99991231235959999";
+pub const MAX_INSTANT_TIME: &str = "99991231235959999";
 
 pub(crate) mod adapter;
 pub(crate) mod buffer;

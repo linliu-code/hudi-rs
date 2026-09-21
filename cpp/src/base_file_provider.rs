@@ -1,0 +1,198 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+//! **Phase 1 note.** These types live in the cpp crate, not hudi-core,
+//! because OSS core has no provider seam yet. The cxx ABI still carries the
+//! provider handle so velox needs no changes, but nothing is handed to core --
+//! base files take core's own object-store read, which is the documented
+//! fallback. Phase 2 moves this file into hudi-core and wires it up.
+
+//! Injectable base-file data provider — an interface for serving base-file
+//! data from an alternative source instead of the object-store read.
+//!
+//! hudi-rs defines this trait and calls it; it does **not** implement it and has
+//! no dependency on any particular source. A downstream crate provides a
+//! concrete [`BaseFileDataProvider`] and injects it via
+//! `with_base_file_provider`. The composition
+//! root that constructs the provider (the native FFI bridge) is the only place
+//! that names both hudi-rs and the concrete source — so this file, and hudi-core
+//! as a whole, name no source at all.
+//!
+//! Scope: **base files only.** Log files are never served by a provider, and the
+//! reader skips the provider entirely when position-based merge is active (which
+//! needs the synthetic row-index column a provider does not produce). A provider
+//! that returns `None` — or none being injected at all — falls straight through
+//! to the normal object-store read.
+
+use arrow_array::RecordBatchReader;
+use arrow_schema::SchemaRef;
+use async_trait::async_trait;
+use std::sync::Arc;
+
+/// Source-agnostic, client-side counters for one base-file provider attempt.
+///
+/// hudi-core neither produces nor interprets these beyond summing them across
+/// the base files of a read; a provider fills in whatever it tracks and leaves
+/// the rest zero. In this crate they are surfaced to backends (e.g. the Gluten
+/// JNI metrics bridge) as the `base_file_provider_stats` getter on the cxx
+/// bridge's `HoodieFileGroupReader` — plain text, not a rustdoc link, because
+/// neither the `mod ffi` bridge block nor the method backing it is public.
+/// The field set is intentionally generic — no wire/protocol type of any
+/// concrete provider leaks here.
+///
+/// ## When each field is populated
+/// The provider is served **lazily** (see [`BaseFileDataProvider::try_base_file`]):
+/// the batches stream through the merge loop rather than being materialized up
+/// front. So the counters split by when they become known:
+/// - **Setup counters** — `files_served`, `storage_fallbacks`, `local_served`,
+///   `remote_served`, `discover_wall_nanos`, `connect_wall_nanos`,
+///   `fetch_wall_nanos` — are known the moment the provider decides to serve, so
+///   the provider fills them in the [`BaseFileProviderStats`] it returns from
+///   `try_base_file`.
+/// - **Drain counters** — `rows_served`, `bytes_materialized`, `batches_received`
+///   — are only knowable once the stream has been consumed, which happens *after*
+///   `try_base_file` returns. A streaming provider therefore leaves them zero;
+///   **hudi-core** counts them as it pulls the served source and folds them into
+///   the same slot, so a consumer that reads the stats after draining sees the
+///   complete picture. A provider that fills them anyway would be double-counted
+///   on the eager path, so leaving them zero is part of the contract (the C-ABI
+///   adapter enforces it for C providers by zeroing them on the served path).
+#[derive(Clone, Debug, Default)]
+pub struct BaseFileProviderStats {
+    /// Base files served by the provider.
+    pub files_served: u64,
+    /// Base files the provider could not serve (fell through to object storage).
+    pub storage_fallbacks: u64,
+    /// Subset of `files_served` served from a source local to this reader.
+    pub local_served: u64,
+    /// Subset of `files_served` served from a remote source.
+    pub remote_served: u64,
+    /// Rows served by the provider across all served files. Drain counter —
+    /// filled by hudi-core while consuming the served source, not by the provider.
+    pub rows_served: u64,
+    /// In-memory Arrow footprint of the served batches, summed across all served
+    /// files. Drain counter — filled by hudi-core while consuming the source.
+    ///
+    /// **Not a transfer volume.** This is measured *after* projection to the
+    /// read's required schema, from `RecordBatch::get_array_memory_size()`, which
+    /// reports *allocated buffer capacity* — so shared dictionary buffers and any
+    /// over-allocated child buffer are counted in full, per batch. It can
+    /// therefore exceed the bytes a provider actually transferred, sometimes by a
+    /// large factor. Use it to reason about reader memory, never to reconcile
+    /// against a provider-side byte counter; the two measure different things.
+    /// Named `bytes_materialized` rather than `bytes_served` for exactly this
+    /// reason.
+    pub bytes_materialized: u64,
+    /// Arrow record batches received from the provider across all served files.
+    /// Drain counter — filled by hudi-core while consuming the source.
+    pub batches_received: u64,
+    /// Wall-clock nanoseconds spent discovering the serving endpoint.
+    pub discover_wall_nanos: u64,
+    /// Wall-clock nanoseconds spent connecting to the serving endpoint.
+    pub connect_wall_nanos: u64,
+    /// Wall-clock nanoseconds spent in the data fetch itself.
+    pub fetch_wall_nanos: u64,
+}
+
+impl BaseFileProviderStats {
+    /// Accumulate another set of counters into this one (per-base-file → per-read).
+    pub fn merge(&mut self, other: &BaseFileProviderStats) {
+        self.files_served += other.files_served;
+        self.storage_fallbacks += other.storage_fallbacks;
+        self.local_served += other.local_served;
+        self.remote_served += other.remote_served;
+        self.rows_served += other.rows_served;
+        self.bytes_materialized += other.bytes_materialized;
+        self.batches_received += other.batches_received;
+        self.discover_wall_nanos += other.discover_wall_nanos;
+        self.connect_wall_nanos += other.connect_wall_nanos;
+        self.fetch_wall_nanos += other.fetch_wall_nanos;
+    }
+}
+
+/// Everything a provider needs to serve one base file, expressed entirely in
+/// hudi-core's own vocabulary. Deliberately carries **no** predicate or filter
+/// type: the composition root decodes the predicate once and bakes any filters
+/// into the concrete provider at construction, so no provider/query type
+/// crosses this boundary.
+pub struct BaseFileDataRequest<'a> {
+    /// Absolute storage URI of the base file — the same URL the object-store read
+    /// resolves to, and the identity a provider is expected to key the file by.
+    pub file_uri: &'a str,
+    /// The projected ("intersection") schema the read wants back.
+    pub projected_schema: &'a SchemaRef,
+    /// Whether it is safe to apply a pushed predicate to this file: true when the
+    /// split has no log files (nothing merges, so the base rows are final) or the
+    /// predicate is primary-key-safe. See
+    /// `HoodieFileGroupReader::base_read_pushdown_is_safe` — ENG-47506 replaced the
+    /// former table-type check, so this is now true for a MOR slice with no log
+    /// files where it previously was not. A provider that pushes a predicate must
+    /// honor this: when `false`, serve unfiltered so a post-merge filter can apply
+    /// it.
+    pub can_push_predicate: bool,
+    /// Partition path of the split (e.g. `year=2024/month=01`), used to report
+    /// partition-column metadata to the provider.
+    pub partition_path: &'a str,
+    /// Partition field names from `hoodie.table.partition.fields`, in order.
+    pub partition_fields: &'a [String],
+    /// The table's data schema, used to resolve partition-column types.
+    pub data_schema: Option<&'a SchemaRef>,
+}
+
+/// A pluggable source that may serve a base file instead of the object-store
+/// read.
+///
+/// Implemented downstream (never in hudi-core) and injected via
+/// `with_base_file_provider`. Called once per
+/// base file, before the object-store read. Implementations must map any
+/// internal error to `None` — a provider failure is never allowed to fail the
+/// read.
+#[async_trait]
+pub trait BaseFileDataProvider: Send + Sync {
+    /// Try to serve `req.file_uri`. Returns `Some(reader)` — a **lazy**
+    /// [`RecordBatchReader`] yielding batches at the request's
+    /// `projected_schema`, exactly the shape the object-store projected read
+    /// would have returned — or `None` when the provider cannot serve the file,
+    /// in which case the caller reads from object storage as usual. Also returns
+    /// the client-side setup counters for this attempt (a fallback still reports
+    /// its timings; see [`BaseFileProviderStats`] for which counters the provider
+    /// fills versus which hudi-core fills during drain).
+    ///
+    /// ## Streaming / threading contract
+    /// The returned reader is consumed lazily inside the merge loop, so the whole
+    /// served file never needs to be resident at once. On OSS, that merge loop is
+    /// driven by `next_chunk().await`, itself invoked from inside
+    /// `OBJECT_STORE_RUNTIME.block_on(...)` — so a tokio `Handle` is current
+    /// wherever `RecordBatchReader::next` runs. A provider whose `next` calls
+    /// `block_on` (e.g. to drive an async fetch) will therefore panic on nested
+    /// re-entry, and a panic unwinding across the FFI boundary is undefined
+    /// behavior. A Phase-2 provider must not `block_on` inside `next()`; hand the
+    /// async work off via a channel or `spawn_blocking` instead. The reader must
+    /// be `Send` so it can move from this async method into that driver.
+    async fn try_base_file(
+        &self,
+        req: BaseFileDataRequest<'_>,
+    ) -> (
+        Option<Box<dyn RecordBatchReader + Send>>,
+        BaseFileProviderStats,
+    );
+}
+
+/// Shared handle to an injected provider.
+pub type BaseFileDataProviderRef = Arc<dyn BaseFileDataProvider>;
