@@ -179,8 +179,23 @@ impl HudiBaseFileDataResult {
 ///
 /// **Concurrency contract (must hold for the C implementor):** `try_base_file`
 /// MAY be called concurrently from several threads on the same `ctx`. The
-/// implementation must be `Send + Sync`-equivalent. `destroy` is called exactly
-/// once, after the last `try_base_file` has returned.
+/// implementation must be `Send + Sync`-equivalent.
+///
+/// **Lifetime contract (guaranteed to the C implementor):** `destroy` is called
+/// exactly once, after the last `try_base_file` has returned AND after every
+/// `ArrowArrayStream` this provider served has been fully drained or released. So
+/// a served stream's `get_next`/`release` callbacks may point into `ctx`.
+///
+/// "after the last `try_base_file` has returned" alone would NOT be enough, and
+/// used to be all this said. The reader that calls `try_base_file` is a local of
+/// [`HoodieFileGroupReader::get_closable_iterator`](crate::HoodieFileGroupReader)
+/// and dies when that function returns, while the stream it produced is handed to
+/// C++ and drained afterwards — two objects with no ordering between their frees.
+/// The guarantee is now structural rather than a rule the caller must remember:
+/// `hudi-core`'s `served_batch_stream` moves a strong reference to the provider
+/// onto the task that owns the served reader, so the provider cannot outlive
+/// its own streams by construction. Pinned by
+/// `a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct HudiBaseFileDataProviderVTable {
@@ -194,7 +209,9 @@ pub struct HudiBaseFileDataProviderVTable {
         req: *const HudiBaseFileDataRequest,
         out: *mut HudiBaseFileDataResult,
     ) -> c_int,
-    /// Release `ctx`. Called exactly once when the owning reader is dropped.
+    /// Release `ctx`. Called exactly once, once the owning reader AND every
+    /// stream that reader served have been released — see the lifetime contract
+    /// on this struct.
     pub destroy: extern "C" fn(ctx: *mut c_void),
 }
 

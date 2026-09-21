@@ -295,6 +295,19 @@ impl BaseSource {
 /// fails, and the producer returns. There is no path on which it outlives its
 /// consumer by more than one batch.
 ///
+/// **The provider outlives the reader it returned.** A clone of the provider is
+/// moved onto the same task and dropped only when the task ends. That is not
+/// bookkeeping: a provider is free to return a reader that borrows its own state
+/// — the C-ABI adapter returns an `ArrowArrayStream` whose `get_next`/`release`
+/// callbacks point into the provider's `ctx`, and `CApiBaseFileDataProvider`'s
+/// `Drop` calls `destroy(ctx)`. Without this, the last strong reference is the
+/// one on the FFI reader handle, and that handle is a different object from the
+/// stream the C++ caller is draining; nothing in the FFI ownership contract makes
+/// the caller free them in an order that keeps `ctx` alive. Holding the clone
+/// here makes "the provider outlives every stream it served" true by
+/// construction, on every call path, at the cost of one `Arc` clone per served
+/// file.
+///
 /// It does occupy a blocking-pool slot for the whole served read rather than for
 /// one batch, so the ceiling is concurrently-open file groups, not batches. That
 /// is bounded by the caller's split concurrency (~16 for Velox) against tokio's
@@ -305,9 +318,14 @@ fn served_batch_stream(
     reader: Box<dyn arrow_array::RecordBatchReader + Send>,
     evolve_to: SchemaRef,
     stats: Arc<StdMutex<BaseFileProviderStats>>,
+    provider: BaseFileDataProviderRef,
 ) -> BaseBatchStream {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
     tokio::task::spawn_blocking(move || {
+        // `provider` is moved in and never called: it is here to OUTLIVE the
+        // reader it handed back. See this function's doc for why that is a
+        // lifetime requirement rather than a stray clone.
+        let _provider_kept_alive = provider;
         for item in reader {
             let projected = match item {
                 Ok(batch) => {
@@ -1255,6 +1273,7 @@ impl HoodieFileGroupReader {
                         served,
                         base_read_schema,
                         self.base_file_provider_stats.clone(),
+                        provider.clone(),
                     ),
                 });
             }
@@ -4653,6 +4672,106 @@ mod tests {
             3,
             "the producer must stay blocked until the merge takes another batch \
              — reaching 4 means the served file is being drained up front"
+        );
+    }
+
+    /// A provider must outlive every reader it handed back.
+    ///
+    /// A provider is free to return a reader that borrows its own state — the
+    /// C-ABI adapter returns an `ArrowArrayStream` whose callbacks point into the
+    /// provider's `ctx`, and dropping `CApiBaseFileDataProvider` calls
+    /// `destroy(ctx)`. On the FFI path the core reader is a local of
+    /// `get_closable_iterator` and dies when that function returns, while the
+    /// stream it produced is handed to C++ and drained afterwards. So "the caller
+    /// keeps the provider alive" cannot be assumed: the FFI reader handle and the
+    /// stream are separate objects with no ordering between their frees.
+    ///
+    /// This pins the property that makes that safe — the served stream's own task
+    /// holds a strong reference — by dropping EVERY other reference and checking
+    /// the provider is still alive. Deleting `let _provider_kept_alive = provider;`
+    /// from `served_batch_stream` fails it, which is the point: that binding looks
+    /// like dead code and is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+        /// Flips `0` when the provider holding it is dropped.
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Relaxed);
+            }
+        }
+        struct DropTrackingProvider {
+            batches: usize,
+            _flag: DropFlag,
+        }
+        #[async_trait::async_trait]
+        impl crate::file_group::reader_v2::base_file_provider::BaseFileDataProvider
+            for DropTrackingProvider
+        {
+            async fn try_base_file(
+                &self,
+                req: BaseFileDataRequest<'_>,
+            ) -> (
+                Option<Box<dyn arrow_array::RecordBatchReader + Send + 'static>>,
+                BaseFileProviderStats,
+            ) {
+                (
+                    Some(Box::new(ProbeReader {
+                        remaining: self.batches,
+                        schema: req.projected_schema.clone(),
+                        threads: Arc::new(StdMutex::new(Vec::new())),
+                        block_on_each_next: false,
+                    })),
+                    BaseFileProviderStats {
+                        files_served: 1,
+                        ..Default::default()
+                    },
+                )
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), base_name, schema).await;
+        // Constructed inline: the test deliberately keeps NO reference of its own,
+        // so after the drop below the only strong reference left is the one the
+        // served stream's task holds.
+        reader.base_file_provider = Some(Arc::new(DropTrackingProvider {
+            batches: 4,
+            _flag: DropFlag(dropped.clone()),
+        }));
+
+        let source = reader.base_file_source().await.unwrap();
+        drop(reader);
+
+        assert!(
+            !dropped.load(Relaxed),
+            "the provider was dropped while its served stream was still live — a \
+             provider whose reader borrows its own state is now reading freed \
+             memory"
+        );
+
+        // And it is released once the stream is done, so this is a lifetime
+        // extension and not a leak. The producer task ends after the last batch
+        // is taken, so poll rather than sleep a guessed interval.
+        let out = drain_base_source(source).await;
+        assert_eq!(out.num_rows(), 0, "the probe serves empty batches");
+        for _ in 0..200 {
+            if dropped.load(Relaxed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            dropped.load(Relaxed),
+            "and it must be released once the stream is exhausted, or the \
+             reference is a leak rather than a lifetime extension"
         );
     }
 
