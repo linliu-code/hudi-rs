@@ -308,7 +308,14 @@ impl ParquetBaseFileReader {
         Ok(builder.metadata().as_ref().clone())
     }
 
-    /// Get the Arrow schema from a Parquet file's footer.
+    /// Get the Arrow schema from a Parquet file's footer, reading it every time.
+    ///
+    /// The uncached primitive.
+    /// [`read_schema`](BaseFileReader::read_schema) is the one the read path
+    /// calls and serves the same answer from
+    /// [`parquet_schema_cache`](crate::storage::parquet_schema_cache); this one
+    /// always pays the `HEAD` + footer `GET`. Use it when the file may have been
+    /// rewritten in place — which a Hudi base file never is.
     pub async fn get_schema(&self, relative_path: &str) -> Result<arrow_schema::Schema> {
         let builder = self.open_builder(relative_path, None).await?;
         let parquet_meta = builder.metadata();
@@ -355,12 +362,29 @@ impl BaseFileReader for ParquetBaseFileReader {
 
     /// Answered from the footer alone: no stream is built, and no read-volume
     /// counter moves for a call that reads no data.
+    ///
+    /// Served from the process-wide
+    /// [`parquet_schema_cache`](crate::storage::parquet_schema_cache), so a warm
+    /// read issues no round trip at all. Sound because a Hudi base file is
+    /// immutable — see that module for the invariant and the escape hatch for
+    /// callers it does not hold for. `options` is ignored here (it is by the
+    /// uncached path too): a parquet footer's schema does not depend on the
+    /// projection or predicate the read that follows will use, which is what
+    /// makes the file's URI a complete key.
     fn read_schema<'a>(
         &'a self,
         relative_path: &'a str,
         _options: BaseFileReadOptions,
     ) -> BoxFuture<'a, Result<arrow_schema::SchemaRef>> {
-        Box::pin(async move { Ok(Arc::new(self.get_schema(relative_path).await?)) })
+        Box::pin(async move {
+            let file_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
+            crate::storage::parquet_schema_cache::get_or_load(
+                &file_url,
+                &self.storage.options,
+                || async { Ok(Arc::new(self.get_schema(relative_path).await?)) },
+            )
+            .await
+        })
     }
 
     fn get_metadata_and_stats<'a>(
@@ -796,6 +820,106 @@ mod tests {
             with_predicate.num_rows(),
             all.num_rows(),
             "a format that cannot seek by key must return every row, not fewer"
+        );
+    }
+    /// The read path's schema call is served by the process-wide cache: the
+    /// second read of a file issues no IO at all.
+    ///
+    /// The witness is a `CountingObjectStore` wrapped around the real store,
+    /// which counts `get`/`head` at the OBJECT STORE boundary — the boundary a
+    /// footer read actually crosses.
+    ///
+    /// It is NOT `Storage::read_volume()`, which this test used to assert on.
+    /// `read_volume` counts only inside `ReadVolume::add_bytes`, reached solely
+    /// from `CountingReader::get_bytes`/`get_byte_ranges`; a schema-only read
+    /// calls neither. The footer `GET` runs on the BARE `ParquetObjectReader`
+    /// before the `CountingReader` wrapper is applied (see `parquet_reader`), and
+    /// the `HEAD` in `object_path_and_size` goes straight to the object store. So
+    /// `io_calls` was 0 both cold and warm and `warm_calls == cold_calls` could
+    /// not fail — measured, not reasoned: with `assert!(cold_calls > 0)` spliced
+    /// in, this test failed with "io_calls after the COLD schema read = 0".
+    ///
+    /// Hence `assert!(cold_gets + cold_heads > 0)` below. It is not decoration:
+    /// it is what stops this assertion from silently becoming `0 == 0` again if
+    /// the read path stops going through the wrapped store.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn read_schema_is_served_from_the_cache_on_the_second_read() {
+        use crate::config::HudiConfigs;
+        use crate::config::table::HudiTableConfig;
+        use crate::storage::counting::CountingObjectStore;
+        use std::collections::HashMap;
+        crate::storage::parquet_schema_cache::clear();
+
+        let base_url =
+            Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
+        let (store, counts) =
+            CountingObjectStore::new(Arc::new(object_store::local::LocalFileSystem::new()));
+        let mut hudi_options = HashMap::new();
+        hudi_options.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            base_url.as_str().to_string(),
+        );
+        let storage = Storage::new_with_object_store(
+            base_url,
+            store,
+            Arc::new(HudiConfigs::new(hudi_options)),
+        );
+        let reader = ParquetBaseFileReader::new(storage);
+
+        let cold = reader
+            .read_schema("a.parquet", BaseFileReadOptions::default())
+            .await
+            .expect("cold schema read");
+        let (cold_gets, cold_heads) = (counts.gets(), counts.heads());
+
+        let warm = reader
+            .read_schema("a.parquet", BaseFileReadOptions::default())
+            .await
+            .expect("warm schema read");
+        let (warm_gets, warm_heads) = (counts.gets(), counts.heads());
+
+        assert!(
+            cold_gets + cold_heads > 0,
+            "the cold read must actually hit the object store, or the comparison \
+             below is 0 == 0 and pins nothing (saw {cold_gets} gets, \
+             {cold_heads} heads)"
+        );
+        assert_eq!(
+            (warm_gets, warm_heads),
+            (cold_gets, cold_heads),
+            "a warm schema read must issue no request at all — cold \
+             ({cold_gets} gets, {cold_heads} heads) vs warm ({warm_gets} gets, \
+             {warm_heads} heads)"
+        );
+        assert_eq!(cold, warm, "the cached schema must equal the fetched one");
+        assert!(
+            Arc::ptr_eq(&cold, &warm),
+            "the warm read returns the interned Arc rather than re-parsing the footer"
+        );
+    }
+
+    /// The cached answer is the same schema the uncached footer read produces.
+    ///
+    /// Guards the seam rather than the cache: `read_schema` and `get_schema` are
+    /// two ways to the same fact, and only one of them is cached, so a divergence
+    /// would show up as a schema-evolution bug far from here.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_cached_schema_matches_the_uncached_footer_read() {
+        crate::storage::parquet_schema_cache::clear();
+        let reader = ParquetBaseFileReader::new(test_storage());
+
+        let cached = reader
+            .read_schema("a.parquet", BaseFileReadOptions::default())
+            .await
+            .expect("cached read");
+        let uncached = reader.get_schema("a.parquet").await.expect("uncached read");
+
+        assert_eq!(
+            cached.as_ref(),
+            &uncached,
+            "the cache must not change the answer"
         );
     }
 }

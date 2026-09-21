@@ -48,8 +48,16 @@ use crate::storage::util::join_url_segments;
 pub(crate) mod counting;
 pub mod error;
 pub mod file_metadata;
+pub mod parquet_schema_cache;
 pub mod reader;
 pub mod util;
+
+// Re-exported at `storage::` because that is where an embedder looks for them:
+// they are process-wide knobs on the read path, not part of any one reader.
+pub use parquet_schema_cache::{
+    ParquetSchemaCacheStats, clear as parquet_schema_cache_clear,
+    stats as parquet_schema_cache_stats,
+};
 
 /// Builds a parquet `RowFilter` for a read, given the file's parquet schema and
 /// the Arrow schema it maps to. Returning `None` means no filter is pushed.

@@ -125,6 +125,18 @@ because everything below the row mask (which base file, which log blocks) is a
 requested-time decision. Translating twice selects nothing; that is the bug the
 single translation point exists to prevent.
 
+### Arrow-schema cache (read hot path)
+
+`crates/core/src/storage/parquet_schema_cache.rs` keeps a process-wide cache of
+per-file arrow schemas, so the schema-evolution check on every base-file read
+(`ParquetBaseFileReader::read_schema`) skips the S3 `HEAD` + footer `GET` on a warm
+read. Safe because base files are immutable. Config:
+`HUDI_PARQUET_SCHEMA_CACHE_ENABLED` (default on) /
+`HUDI_PARQUET_SCHEMA_CACHE_MAX_ENTRIES`; hit/miss/entries via
+`storage::parquet_schema_cache_stats()` for embedders to export;
+`storage::parquet_schema_cache_clear()` for non-Hudi callers that overwrite files in
+place.
+
 ## Cloud storage & config
 
 Storage backends route by URI scheme (`file://`, `s3://`, `az://`, `gs://`) through
