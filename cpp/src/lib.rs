@@ -661,9 +661,15 @@ pub(crate) fn repair_risk_columns_for(
         //
         // So when the predicate is opaque, fall back to the TABLE: every column
         // the repair could reinterpret is a candidate, and each file's footer
-        // still decides. That costs a footer comparison on tables that have such
-        // a column AND a predicate we could not read — both conditions, so in
-        // practice rarely — and never costs correctness.
+        // still decides.
+        //
+        // The cost, stated honestly: on a table with such a column and a predicate
+        // we could not read, every file whose footer DOES mislabel loses the
+        // provider's pushdown — including when the predicate that failed to decode
+        // touched an entirely unrelated column and could never have been misread.
+        // That is the blunt direction, and it is the one to be blunt in: the
+        // alternative is dropping rows that match, silently, with no way to
+        // recover them downstream.
         return match table_schema {
             Some(table_schema) => {
                 let every_column: Vec<String> = table_schema
@@ -676,7 +682,12 @@ pub(crate) fn repair_risk_columns_for(
                     &every_column,
                 );
                 if !at_risk.is_empty() {
-                    log::warn!(
+                    // `debug!`, not `warn!`: this runs once per FILE GROUP, and it
+                    // fires on every predicate-free scan of any table with a
+                    // tz-aware-millis column — a completely benign read. At the
+                    // default `info` filter a 10k-split scan would emit 10k warnings
+                    // for nothing (CLAUDE.md §10: never warn per item).
+                    log::debug!(
                         "[ENG-48206] no decoded predicate, so the repair gate cannot \
                          be scoped to the columns actually filtered; treating every \
                          repair-eligible column in the table as at risk \
@@ -701,6 +712,21 @@ pub(crate) fn repair_risk_columns_for(
             }
         };
     };
+    if !pf.referenced_columns_are_complete() {
+        // At least one field index did not resolve to a name, so the list below
+        // is SHORT of what the predicate touches. Screening against it would
+        // disarm the gate for a column the predicate really reads — the same
+        // under-approximation as having no predicate at all, so take the same
+        // fallback. `build_row_filter` refuses this plan, so hudi-rs's own read is
+        // already safe; this is for the provider, which applies the caller's copy.
+        log::warn!(
+            "[ENG-48206] a pushed predicate references a field index that does not \
+             resolve to a column name (a wire-format bug on the C++ side); \
+             screening the repair gate against the table instead of a truncated \
+             reference list"
+        );
+        return repair_risk_columns_for(None, table_schema);
+    }
     let referenced = pf.referenced_columns();
     match table_schema {
         Some(table_schema) => {
@@ -1918,6 +1944,17 @@ pub(crate) mod tests {
     /// comparison, so it clears the ENG-42276 selectivity gate and the only
     /// remaining reason to skip is column resolution.
     fn pushdown_gt_filter_bytes(names: &[&str]) -> Vec<u8> {
+        pushdown_gt_filter_bytes_at(0, names)
+    }
+
+    /// `pushdown_gt_filter_bytes`, but with the referenced field INDEX under the
+    /// test's control.
+    ///
+    /// A `field` at or beyond `names.len()` is the wire-format bug
+    /// `repair_risk_columns_for`'s completeness fallback exists for: a plan whose
+    /// expression references a column its own `base_schema.names` does not carry.
+    /// Substrait allows the bytes to say it, so the reader has to answer for it.
+    fn pushdown_gt_filter_bytes_at(field: i32, names: &[&str]) -> Vec<u8> {
         use prost::Message;
         use substrait::proto::{
             Expression, ExtendedExpression, FunctionArgument, NamedStruct,
@@ -1937,10 +1974,7 @@ pub(crate) mod tests {
                     reference_type: Some(field_reference::ReferenceType::DirectReference(
                         ReferenceSegment {
                             reference_type: Some(reference_segment::ReferenceType::StructField(
-                                Box::new(reference_segment::StructField {
-                                    field: 0,
-                                    child: None,
-                                }),
+                                Box::new(reference_segment::StructField { field, child: None }),
                             )),
                         },
                     )),
@@ -2551,6 +2585,136 @@ pub(crate) mod tests {
         fn reader(table_path: &str, handle: u64) -> Box<HoodieFileGroupReader> {
             new_file_group_reader_with_context(base_only_context(table_path, handle))
                 .expect("build FFI reader")
+        }
+
+        /// A table schema carrying a repair-eligible column, plus `id` so the
+        /// projection still resolves.
+        const TZ_MILLIS_AVRO_JSON: &str = r#"{"type":"record","name":"trip","fields":[{"name":"id","type":["null","int"],"default":null},{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}"#;
+
+        /// The opaque-predicate fallback must be WIRED, not merely implemented.
+        ///
+        /// `repair_risk_columns_for`'s own doc says it is standalone "so the
+        /// production activation path is reachable from a test" — but every test
+        /// of it called the function directly with a hand-built schema, so
+        /// replacing the argument at the call site with `None` reinstated the
+        /// exact gap the fallback closes while both suites stayed green.
+        ///
+        /// This drives the real builder: a table with a tz-aware-millis column and
+        /// NO substrait bytes, i.e. a predicate opaque to us. The gate must arm
+        /// from the table schema.
+        #[test]
+        fn an_opaque_predicate_arms_the_gate_through_the_production_builder() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let mut ctx = base_only_context(&table_path, 0);
+            ctx.data_schema_json = TZ_MILLIS_AVRO_JSON.to_string();
+            assert!(
+                ctx.substrait_filter_bytes.is_empty(),
+                "fixture check: the predicate must be opaque for this to test anything"
+            );
+
+            let reader = new_file_group_reader_with_context(ctx).expect("build FFI reader");
+
+            assert_eq!(
+                reader.reader_context.repair_risk_columns,
+                vec!["ts".to_string()],
+                "with no decoded predicate the gate must arm from the TABLE schema; \
+                 an empty set here hands an injected provider an unconditional \
+                 'safe to push' over a possibly-mislabelled file"
+            );
+        }
+
+        /// A table with TWO repair-eligible columns, so "scoped to the referenced
+        /// one" is distinguishable from "every column in the table".
+        const TWO_TZ_MILLIS_AVRO_JSON: &str = r#"{"type":"record","name":"trip","fields":[{"name":"id","type":["null","int"],"default":null},{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},{"name":"other_ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}"#;
+
+        /// A DECODED predicate must scope the gate to the columns it references,
+        /// and that scoping must reach production.
+        ///
+        /// The opaque-predicate tests below drive contexts with no substrait bytes,
+        /// so none of them exercises the decoded branch — replacing
+        /// `pushed_filter.as_ref()` with `None` at the call site survived every
+        /// suite. This is the same unpinned-wiring defect as the table-schema
+        /// argument, one parameter over.
+        ///
+        /// `pushdown_gt_filter_bytes` references field 0 only, so with both `ts`
+        /// and `other_ts` repair-eligible, a gate that ignored the predicate would
+        /// arm on both — costing pushdown over a column the predicate never reads,
+        /// which `referenced_columns`' doc calls out as the reason it exists.
+        #[test]
+        fn a_decoded_predicate_scopes_the_gate_to_its_referenced_columns() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let mut ctx = base_only_context(&table_path, 0);
+            ctx.data_schema_json = TWO_TZ_MILLIS_AVRO_JSON.to_string();
+            ctx.substrait_filter_bytes = super::pushdown_gt_filter_bytes(&["ts", "other_ts"]);
+
+            let reader = new_file_group_reader_with_context(ctx).expect("build FFI reader");
+
+            assert_eq!(
+                reader.reader_context.repair_risk_columns,
+                vec!["ts".to_string()],
+                "the gate must be scoped to the REFERENCED column; arming on \
+                 `other_ts` too would cost pushdown over a column the predicate \
+                 never reads"
+            );
+        }
+
+        /// A predicate whose references do NOT all resolve falls back to the
+        /// TABLE, rather than screening against the truncated name list.
+        ///
+        /// `referenced_columns` resolves substrait field indices through
+        /// `base_schema.names` and silently drops any index that lands past the
+        /// end of it. That list is then SHORT of what the predicate really reads,
+        /// and screening the gate against it under-approximates: here the one
+        /// reference resolves to nothing at all, so a gate keyed on it sees an
+        /// empty reference set, finds no overlap with the table's repair-eligible
+        /// columns, and disarms — on a table where BOTH columns can carry the
+        /// #18132 mislabel and an injected provider is about to apply the caller's
+        /// own copy of that predicate to one of them.
+        ///
+        /// `build_row_filter` refuses this plan outright, so hudi-rs's own read is
+        /// safe either way; the exposure is the provider's, which is exactly what
+        /// the whole-table fallback covers. Deleting the `!referenced_columns_are_complete()`
+        /// branch passes the entire `hudi-cpp` suite without this test.
+        #[test]
+        fn a_predicate_with_an_unresolvable_reference_falls_back_to_the_whole_table() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let mut ctx = base_only_context(&table_path, 0);
+            ctx.data_schema_json = TWO_TZ_MILLIS_AVRO_JSON.to_string();
+            // Field 5 against a two-name base schema: the reference resolves to
+            // nothing, so `referenced_columns()` returns an EMPTY list.
+            ctx.substrait_filter_bytes = super::pushdown_gt_filter_bytes_at(5, &["ts", "other_ts"]);
+
+            let reader = new_file_group_reader_with_context(ctx).expect("build FFI reader");
+
+            let mut armed = reader.reader_context.repair_risk_columns.clone();
+            armed.sort();
+            assert_eq!(
+                armed,
+                vec!["other_ts".to_string(), "ts".to_string()],
+                "an unresolvable reference must widen the gate to every \
+                 repair-eligible column in the table, not narrow it to the empty \
+                 set the truncated name list produces"
+            );
+        }
+
+        /// The complement, so the test above cannot be satisfied by arming always.
+        ///
+        /// Same opaque-predicate path over a table with no repair-eligible column:
+        /// nothing to screen, so the gate stays disarmed and the provider keeps its
+        /// pushdown.
+        #[test]
+        fn an_opaque_predicate_over_a_plain_table_leaves_the_gate_disarmed() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let ctx = base_only_context(&table_path, 0);
+            assert!(ctx.substrait_filter_bytes.is_empty(), "fixture check");
+
+            let reader = new_file_group_reader_with_context(ctx).expect("build FFI reader");
+
+            assert!(
+                reader.reader_context.repair_risk_columns.is_empty(),
+                "no column in this table can carry the mislabel, so there is nothing \
+                 to withdraw pushdown for"
+            );
         }
 
         /// A REFUSED `read_record_batch` must leave the set-once stats cell
