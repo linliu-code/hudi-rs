@@ -104,7 +104,7 @@ pub(crate) fn index_of_ci(schema: &arrow_schema::Schema, name: &str) -> Result<O
 /// same logical value before and after.
 ///
 /// That distinction is what makes base-read predicate pushdown sound — see
-/// `HoodieFileGroupReader::make_base_file_source`.
+/// `HoodieFileGroupReader::base_file_source`.
 fn is_value_reinterpreting(file: &DataType, table: &DataType) -> bool {
     matches!(
         (file, table),

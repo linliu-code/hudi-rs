@@ -17,6 +17,7 @@
  * under the License.
  */
 pub mod blocking_merge_stream;
+pub mod cache_abi;
 pub mod context;
 pub mod provider_abi;
 mod util;
@@ -98,6 +99,19 @@ static LOGGER: OnceLock<()> = OnceLock::new();
 /// `RUST_LOG` when set and falls back to `info` only when it is absent, with no
 /// environment mutation.
 fn init_logger() {
+    // Not under `cfg(test)`. `log`'s logger slot is process-global and first-come:
+    // `provider_abi`'s tests install a capturing logger to assert on the
+    // diagnostics its guards emit, and those assertions are worthless if this
+    // races them for the slot. `try_init()` fails silently, so whichever runs
+    // first simply wins — and this one is reached from
+    // `new_file_group_reader_with_context`, which several tests in this same
+    // binary call. They were green only because libtest dispatches in sorted name
+    // order and `provider_abi::` sorts before `tests::`; renaming a test flipped
+    // it. Review round 8. The cdylib is unaffected — `cfg(test)` is the lib test
+    // binary only.
+    #[cfg(test)]
+    let _ = &LOGGER;
+    #[cfg(not(test))]
     LOGGER.get_or_init(|| {
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .try_init();
@@ -602,7 +616,7 @@ pub(crate) fn counting_row_filter_builder(
 /// millis-semantics literal reads those values as 1970 and the scan drops rows
 /// that match. The repair arm fires only when the TABLE side is tz-aware millis,
 /// which makes the candidate set decidable here. The result arms the per-file
-/// footer check in `HoodieFileGroupReader::make_base_file_source`; empty means no
+/// footer check in `HoodieFileGroupReader::base_file_source`; empty means no
 /// base read does any per-file work, which is every table Spark wrote with micros.
 ///
 /// Scoped to [`PushedFilter::referenced_columns`], not `columns()`: the latter is
@@ -613,6 +627,10 @@ pub(crate) fn counting_row_filter_builder(
 /// `pushed_filter` alone and would still be pushed, so the referenced columns pass
 /// through as candidates and each file's footer decides.
 ///
+/// Fails closed when `pushed_filter` is absent too, and for a different reason —
+/// see the body. Briefly: an injected provider applies the CALLER's predicate,
+/// not ours, so "we have no predicate" does not mean "nothing is filtered".
+///
 /// Standalone rather than inline in `new_file_group_reader_with_context` so the
 /// production activation path is reachable from a test — reader-level tests inject
 /// `ReaderContext::repair_risk_columns` by hand and cannot see a regression here.
@@ -621,7 +639,67 @@ pub(crate) fn repair_risk_columns_for(
     table_schema: Option<&arrow_schema::SchemaRef>,
 ) -> Vec<String> {
     let Some(pf) = pushed_filter else {
-        return Vec::new();
+        // NO DECODED PREDICATE — which is not the same as "nothing will be
+        // filtered", and the difference is a correctness one.
+        //
+        // hudi-rs's own read is safe here: `row_filter` and `row_group_selector`
+        // are both built from `pushed_filter`, so with none there is nothing
+        // pushed and the base read returns every row. But an injected provider is
+        // told `can_push_predicate` regardless, and it holds the CALLER's copy of
+        // the predicate — Velox decodes its own filter and applies it whether or
+        // not the substrait blob round-tripped to us. Decode failure is a
+        // tolerated, logged path (`new_file_group_reader_with_context` drops the
+        // filter and relies on Velox's post-scan filter), so this is reached in
+        // normal operation, not only on malformed input.
+        //
+        // Returning an empty set there disarmed the repair gate and handed the
+        // provider an unconditional "safe to push" for a file whose footer may
+        // carry the #18132 mislabel — the provider then filters micros-labelled,
+        // millis-stored values, reads matching rows as 1970 and drops them, and
+        // nothing downstream can restore them. The gate was most confident
+        // exactly where hudi-rs knew least.
+        //
+        // So when the predicate is opaque, fall back to the TABLE: every column
+        // the repair could reinterpret is a candidate, and each file's footer
+        // still decides. That costs a footer comparison on tables that have such
+        // a column AND a predicate we could not read — both conditions, so in
+        // practice rarely — and never costs correctness.
+        return match table_schema {
+            Some(table_schema) => {
+                let every_column: Vec<String> = table_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+                let at_risk = hudi_dep::schema::batch_evolution::repair_risk_columns(
+                    table_schema,
+                    &every_column,
+                );
+                if !at_risk.is_empty() {
+                    log::warn!(
+                        "[ENG-48206] no decoded predicate, so the repair gate cannot \
+                         be scoped to the columns actually filtered; treating every \
+                         repair-eligible column in the table as at risk \
+                         ({at_risk:?}). An injected provider may still be applying \
+                         the caller's own predicate to these."
+                    );
+                }
+                at_risk
+            }
+            None => {
+                // Neither a predicate nor a table schema: there is nothing to
+                // enumerate, so the gate cannot arm. An injected provider is then
+                // told the base read's merge verdict alone. Narrow — it needs the
+                // substrait decode to fail AND `data_schema` to be absent or
+                // unparseable — but it is the one shape this function cannot
+                // screen, and it is better named than discovered.
+                log::warn!(
+                    "[ENG-48206] neither a decoded predicate nor a table schema; \
+                     the #18132 repair gate cannot be armed for this read"
+                );
+                Vec::new()
+            }
+        };
     };
     let referenced = pf.referenced_columns();
     match table_schema {
@@ -1122,6 +1200,28 @@ impl HoodieFileGroupReader {
             self.reader_context.merge_mode.as_str(),
         );
 
+        // C3 — tokio re-entry guard. `block_on` panics if called from within a
+        // tokio runtime thread, and a panic unwinding across the FFI boundary is
+        // UB. This entry point is meant to be called from a non-async C++ thread;
+        // if a caller ever drives it from inside a tokio runtime, surface a loud
+        // error here instead of letting `block_on` panic across FFI.
+        //
+        // FIRST, before the reader is built — the order `get_closable_iterator`
+        // already uses, and the same reasoning the stats claim below spells out:
+        // a call that is going to be REFUSED should do nothing on the way to
+        // refusing it. Building first constructs a core reader (and an extra
+        // strong reference to the injected provider) only to drop it, on a path
+        // where the provider's `destroy` may then run on this thread for a read
+        // that never happened.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(
+                "read_record_batch must not be called from within a tokio runtime: \
+                 it uses block_on on OBJECT_STORE_RUNTIME, which panics on re-entry \
+                 (call it from a plain C++/native thread instead)"
+                    .to_string(),
+            );
+        }
+
         // ENG-42276 / ENG-42866 — the row_filter_builder + mor_pk_safe live
         // on reader_context (set at FFI entry, see new_file_group_reader_with_context).
         // The FG reader gate at make_base_file_batches and the parquet log
@@ -1159,6 +1259,12 @@ impl HoodieFileGroupReader {
         // would shadow it, reporting zeros for the stream. One read per FFI
         // reader is the shape every caller uses; the alternative trades a
         // correct streaming path for a repeated-eager-read case that has none.
+
+        // Claimed after the re-entry guard above, matching `get_closable_iterator`.
+        // This is a SET-ONCE cell: claiming it before a call that may be REFUSED binds
+        // it permanently to a slot nothing will ever write, and a later successful
+        // call then reports a wall of zeros for a read that really was served —
+        // the exact failure mode the counters exist to eliminate.
         if self
             .base_file_provider_stats
             .set(hudi_dep::ffi_support::base_file_provider_live_stats(
@@ -1169,20 +1275,6 @@ impl HoodieFileGroupReader {
             log::debug!(
                 "[hudi-rs-reader] read_record_batch called again on one reader; \
                  base_file_provider_stats keeps reporting the first read"
-            );
-        }
-
-        // C3 — tokio re-entry guard. `block_on` panics if called from within a
-        // tokio runtime thread, and a panic unwinding across the FFI boundary is
-        // UB. This entry point is meant to be called from a non-async C++ thread;
-        // if a caller ever drives it from inside a tokio runtime, surface a loud
-        // error here instead of letting `block_on` panic across FFI.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(
-                "read_record_batch must not be called from within a tokio runtime: \
-                 it uses block_on on OBJECT_STORE_RUNTIME, which panics on re-entry \
-                 (call it from a plain C++/native thread instead)"
-                    .to_string(),
             );
         }
 
@@ -1576,7 +1668,7 @@ fn avro_json_to_arrow_schema(avro_json: &str) -> std::result::Result<arrow_schem
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The FFI mapping copies every `BaseFileProviderStats` field onto the FFI
@@ -1941,6 +2033,56 @@ mod tests {
             .expect("gt is a known function, so it must decode")
     }
 
+    /// An OPAQUE predicate must arm the gate from the table, not disarm it.
+    ///
+    /// Velox decodes and applies its own filter whether or not the substrait blob
+    /// round-trips to us, and an injected provider acts on `can_push_predicate`.
+    /// So "we could not decode a predicate" cannot mean "nothing is filtered" —
+    /// returning an empty set here handed the provider an unconditional
+    /// "safe to push" over a file whose footer may carry the #18132 mislabel.
+    ///
+    /// This replaces `gate_one_is_empty_without_a_pushed_filter`, which asserted
+    /// the opposite on the premise that "no predicate means nothing can be
+    /// misread, whatever the table schema says". That premise holds for hudi-rs's
+    /// OWN read — it pushes nothing without a decoded filter — and fails for the
+    /// injected provider, which was not a consumer when it was written.
+    #[test]
+    fn gate_one_arms_from_the_table_when_the_predicate_is_opaque() {
+        let table_schema = repair_table_schema(&["ts", "created_at"], &["other"]);
+
+        assert_eq!(
+            repair_risk_columns_for(None, Some(&table_schema)),
+            vec!["ts".to_string(), "created_at".to_string()],
+            "with no decoded predicate every repair-eligible column in the table \
+             is a candidate; the per-file footer check still decides"
+        );
+    }
+
+    /// The complement, so the fix above cannot be "arm on everything, always".
+    ///
+    /// A table with no repair-eligible column has nothing for the gate to screen,
+    /// so an opaque predicate costs it nothing — the provider keeps its pushdown.
+    #[test]
+    fn an_opaque_predicate_over_a_table_with_no_risky_column_stays_disarmed() {
+        let table_schema = repair_table_schema(&[], &["other", "id"]);
+
+        assert!(
+            repair_risk_columns_for(None, Some(&table_schema)).is_empty(),
+            "no column here can carry the mislabel, so there is nothing to withdraw \
+             pushdown for"
+        );
+    }
+
+    /// Both absent: the one shape this function cannot screen, pinned so it is a
+    /// recorded limit rather than an assumption.
+    #[test]
+    fn with_neither_a_predicate_nor_a_table_schema_the_gate_cannot_arm() {
+        assert!(
+            repair_risk_columns_for(None, None).is_empty(),
+            "nothing to enumerate; the warning logged here is the only signal"
+        );
+    }
+
     #[test]
     fn gate_one_arms_on_a_tz_aware_millis_predicate_column() {
         // `pushdown_gt_filter_bytes` references field 0 only, so this is `ts > 100`.
@@ -2003,16 +2145,6 @@ mod tests {
             vec!["ts".to_string()],
             "no table schema means no pre-screen, so every referenced column is a candidate"
         );
-    }
-
-    #[test]
-    fn gate_one_is_empty_without_a_pushed_filter() {
-        let table_schema = repair_table_schema(&["ts"], &[]);
-        assert!(
-            repair_risk_columns_for(None, Some(&table_schema)).is_empty(),
-            "no predicate means nothing can be misread, whatever the table schema says"
-        );
-        assert!(repair_risk_columns_for(None, None).is_empty());
     }
 
     #[test]
@@ -2288,7 +2420,7 @@ mod tests {
     // bridge held the provider without injecting it, and a wall of zeros is
     // what the gap looked like, so both are asserted.
     // ════════════════════════════════════════════════════════════════════
-    mod provider_e2e {
+    pub(crate) mod provider_e2e {
         use super::*;
         use crate::provider_abi::{
             HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION, HUDI_PROVIDER_OUTCOME_NOT_SERVED,
@@ -2419,6 +2551,47 @@ mod tests {
         fn reader(table_path: &str, handle: u64) -> Box<HoodieFileGroupReader> {
             new_file_group_reader_with_context(base_only_context(table_path, handle))
                 .expect("build FFI reader")
+        }
+
+        /// A REFUSED `read_record_batch` must leave the set-once stats cell
+        /// unclaimed.
+        ///
+        /// The tokio re-entry guard sits above the reader build and above the
+        /// stats claim deliberately: a call that is going to be refused should do
+        /// nothing on the way to refusing it. Moving the guard back below them
+        /// passes the entire `hudi-cpp` suite, so the ordering was justified in a
+        /// comment and pinned by nothing.
+        ///
+        /// It matters because the cell is `OnceLock` — written exactly once. If a
+        /// refused call claims it, every later successful call on the same reader
+        /// writes its counters into a slot bound to a read that never happened,
+        /// and `OnceLock` gives no way to take it back.
+        #[tokio::test]
+        async fn a_refused_read_record_batch_leaves_the_stats_cell_unclaimed() {
+            let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+            let reader = reader(&table_path, 0);
+
+            assert!(
+                reader.base_file_provider_stats.get().is_none(),
+                "fixture check: the cell must start unclaimed"
+            );
+
+            // Inside `#[tokio::test]`, so this is the re-entrant case the guard
+            // exists to refuse.
+            let err = reader
+                .read_record_batch()
+                .expect_err("a re-entrant call must be refused, not panic across FFI");
+            assert!(
+                err.contains("must not be called from within a tokio runtime"),
+                "unexpected error text: {err}"
+            );
+
+            assert!(
+                reader.base_file_provider_stats.get().is_none(),
+                "a refused call must not claim the set-once cell — once claimed it \
+                 cannot be reclaimed, and every later read would report into a slot \
+                 bound to a read that never happened"
+            );
         }
 
         /// Baseline: without a provider the file group reads its two rows off

@@ -293,10 +293,15 @@ impl BaseSource {
 /// The task is not tracked by a `JoinHandle` because the channel already bounds
 /// it: dropping the returned stream drops the receiver, the next `blocking_send`
 /// fails, and the producer returns. There is no path on which it outlives its
-/// consumer by more than one batch.
+/// consumer by more than one batch OF WORK — but that is a bound on work, not on
+/// time. A `next()` already in flight is not cancelled, so a provider blocked on
+/// IO keeps the task, and the provider reference it holds, alive until that call
+/// returns. `destroy(ctx)` is therefore deferred until then, however long after
+/// the caller released both the reader handle and the stream.
 ///
 /// **The provider outlives the reader it returned.** A clone of the provider is
-/// moved onto the same task and dropped only when the task ends. That is not
+/// moved onto the same task, in a `ServedReader` struct whose field order makes
+/// the drop order structural, and is released only when the task ends. That is not
 /// bookkeeping: a provider is free to return a reader that borrows its own state
 /// — the C-ABI adapter returns an `ArrowArrayStream` whose `get_next`/`release`
 /// callbacks point into the provider's `ctx`, and `CApiBaseFileDataProvider`'s
@@ -306,7 +311,9 @@ impl BaseSource {
 /// the caller free them in an order that keeps `ctx` alive. Holding the clone
 /// here makes "the provider outlives every stream it served" true by
 /// construction, on every call path, at the cost of one `Arc` clone per served
-/// file.
+/// file. Pinned by
+/// `a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`, which
+/// fails if the provider field is removed from `ServedReader`.
 ///
 /// It does occupy a blocking-pool slot for the whole served read rather than for
 /// one batch, so the ceiling is concurrently-open file groups, not batches. That
@@ -320,42 +327,217 @@ fn served_batch_stream(
     stats: Arc<StdMutex<BaseFileProviderStats>>,
     provider: BaseFileDataProviderRef,
 ) -> BaseBatchStream {
+    /// Owns the served reader and the provider that produced it, in that order.
+    ///
+    /// The order is the point, and a struct is how it is made STRUCTURAL rather
+    /// than a property of how rustc happens to order closure captures. Struct
+    /// fields drop in declaration order, so `reader` — whose `release` callback
+    /// may point into the provider's `ctx` — is always released before the
+    /// provider whose `Drop` calls `destroy(ctx)`. That holds on every path,
+    /// including the one no test can reach: a task queued and then discarded
+    /// without ever running.
+    struct ServedReader {
+        reader: Box<dyn arrow_array::RecordBatchReader + Send>,
+        _provider: BaseFileDataProviderRef,
+    }
+    let served = ServedReader {
+        reader,
+        _provider: provider,
+    };
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
+    // A clone kept OUTSIDE the unwind-catching closure, so a panic still has a
+    // channel to report itself on — see the `catch_unwind` note below.
+    let panic_tx = tx.clone();
     tokio::task::spawn_blocking(move || {
-        // `provider` is moved in and never called: it is here to OUTLIVE the
-        // reader it handed back. See this function's doc for why that is a
-        // lifetime requirement rather than a stray clone.
-        let _provider_kept_alive = provider;
-        for item in reader {
-            let projected = match item {
-                Ok(batch) => {
-                    crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)
+        // A PANIC here must fail the read, not end it.
+        //
+        // This is a detached `spawn_blocking` whose `JoinHandle` is dropped, so
+        // without this every panic in the producer is captured by tokio's task
+        // harness, `tx` drops, and the consumer sees a clean end-of-stream: the
+        // query returns a SHORT RESULT and reports success. Not hypothetical —
+        // arrow-rs panics when importing a malformed `ArrowArray`/`ArrowSchema`,
+        // which is precisely what a buggy C provider hands us, and
+        // `project_batch_to_schema` indexes columns. Silent truncation of a query
+        // is the worst failure mode this seam has (ISSUES OI-2).
+        //
+        // `AssertUnwindSafe` is sound here, but not for the reason it first looks:
+        // state IS observed afterwards. The captured `stats` slot is the live one
+        // `base_file_provider_live_stats()` hands out, and the reader's owner reads
+        // it after the panic. It is safe because that slot is ADVISORY and is
+        // consistent at every point a panic can occur — each update is a complete
+        // `+=` under the guard with nothing fallible between them — and because
+        // lock poison is already tolerated below. A future edit that puts a
+        // fallible operation under that lock would invalidate this, and nothing
+        // would catch it. `served` itself is dropped by the unwind, reader before
+        // provider, because the field order still holds.
+        let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            // Capture the WHOLE struct, not one field. Since edition 2021 a closure
+            // captures disjoint fields, so a body that only ever names `served.reader`
+            // captures just that — and `served._provider` would be dropped when this
+            // function returns, silently undoing the lifetime extension the struct
+            // exists for. Naming the binding itself is what forces the whole value in.
+            // `a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`
+            // catches the mistake; it caught this one.
+            let mut served = served;
+            for item in served.reader.by_ref() {
+                let projected = match item {
+                    Ok(batch) => {
+                        crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)
+                    }
+                    Err(e) => Err(CoreError::ReadFileSliceError(format!(
+                        "base-file provider stream failed: {e}"
+                    ))),
+                };
+                if let Ok(batch) = &projected {
+                    // Ignore lock poison defensively: the counters are advisory and
+                    // must never fail a read.
+                    if let Ok(mut slot) = stats.lock() {
+                        slot.batches_received += 1;
+                        slot.rows_served += batch.num_rows() as u64;
+                        slot.bytes_materialized += batch.get_array_memory_size() as u64;
+                    }
                 }
-                Err(e) => Err(CoreError::ReadFileSliceError(format!(
-                    "base-file provider stream failed: {e}"
-                ))),
-            };
-            if let Ok(batch) = &projected {
-                // Ignore lock poison defensively: the counters are advisory and
-                // must never fail a read.
-                if let Ok(mut slot) = stats.lock() {
-                    slot.batches_received += 1;
-                    slot.rows_served += batch.num_rows() as u64;
-                    slot.bytes_materialized += batch.get_array_memory_size() as u64;
+                let was_err = projected.is_err();
+                // `Err` here means the consumer dropped the stream: stop pulling the
+                // provider for a read nobody is reading.
+                if tx.blocking_send(projected).is_err() || was_err {
+                    return;
                 }
             }
-            let was_err = projected.is_err();
-            // `Err` here means the consumer dropped the stream: stop pulling the
-            // provider for a read nobody is reading.
-            if tx.blocking_send(projected).is_err() || was_err {
-                return;
-            }
+        }));
+        if let Err(payload) = drained {
+            // `blocking_send`, NOT `try_send`, and that is load-bearing.
+            //
+            // The channel has capacity ONE and the producer has usually just
+            // filled it, so `try_send` returns `Full` on the common path, the
+            // error is dropped, the channel closes and the consumer sees a clean
+            // end-of-stream — OI-2 reinstated verbatim, on any read whose consumer
+            // is a batch behind. That is not the rare case; it is the normal one
+            // for a fast provider feeding a busy engine. Review round 9 built it
+            // as mutation 36 and it survived the suite, because the only test
+            // consuming this path was `collect()`, the fastest consumer possible.
+            //
+            // Blocking here parks one blocking-pool thread until the consumer
+            // takes the error or goes away. Both terminate: the `Err` result
+            // drops the sender either way. `let _` because a consumer that has
+            // ALREADY gone away is the one case where losing the panic is
+            // correct — nobody is left to tell.
+            let _ = panic_tx.blocking_send(Err(CoreError::ReadFileSliceError(format!(
+                "base-file provider stream PANICKED: {}. The read is failed rather \
+                 than truncated — a panicking provider must not turn into a short \
+                 result that reports success",
+                panic_message(&*payload)
+            ))));
         }
     });
     futures::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
     })
     .boxed()
+}
+
+/// The human-readable half of a `catch_unwind` payload.
+///
+/// BOTH arms are load-bearing and each needs its own test. `panic!("literal")`
+/// yields a `&'static str` — and so do `unwrap()`, `expect(..)`, `assert!(..)`
+/// and arrow-rs's own panics in the FFI import path, i.e. exactly the payloads
+/// this seam exists for. `panic!("{x}")` yields a `String`. Any other payload
+/// type carries nothing renderable, and saying so beats an empty message.
+///
+/// Review round 9 deleted the `&'static str` arm as "two arms that do the same
+/// thing" and the suite stayed green, because the only stub panicked with a
+/// FORMATTED message. Every literal panic would have rendered as
+/// `<non-string panic payload>` — caught, but not diagnosable.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Why a served stream's schema is not the one the provider was asked for, or
+/// `None` if it matches.
+///
+/// Compares field NAMES and DATA TYPES positionally. Deliberately ignores
+/// nullability and schema/field metadata: a provider that widens a non-null
+/// column to nullable, or that carries extra key-value metadata through its own
+/// transport, is still serving the right data, and declining it would cost a
+/// re-read for nothing. A name, a position, a type or a count is the shape the
+/// read is about to interpret the buffers as, so any of those differing means
+/// the batches are not what was asked for.
+///
+/// That exemption is TOP-LEVEL ONLY, and the asymmetry is worth stating because
+/// the code reads as though it were uniform. Only `name()` and `data_type()` are
+/// compared here, so a top-level `nullable` or metadata difference cannot reach
+/// the comparison at all. Inside a nested type it can: `DataType`'s own
+/// `PartialEq` compares the child `Field`s, and `Field::eq` includes `nullable`
+/// and `metadata`. So a `Struct` whose child differs only in nullability IS
+/// declined, while the same difference on a flat column is served.
+///
+/// Left as it stands rather than normalised recursively: the strictness is
+/// harmless (a conforming provider echoes the schema it was handed, children
+/// included) and loosening it would mean walking every nested `DataType` arm to
+/// rebuild it with children normalised, which is a real behaviour change on a
+/// path whose whole job is to refuse anything it cannot vouch for. Pinned by
+/// `the_shape_checks_nullability_exemption_is_top_level_only`.
+///
+/// Types are compared EXACTLY, dictionary encoding included: `Dictionary(Int32,
+/// Utf8)` where `Utf8` was requested is a different physical layout, and the
+/// caller asked for a schema rather than for something convertible to one.
+///
+/// The field COUNT is compared with `!=`, in BOTH directions, and the `<`
+/// direction is the load-bearing one — which is not obvious here, so: `wanted` is
+/// the read's `intersection`, and every field in it was read out of THIS file's
+/// own footer. None of them can be legitimately absent from a serve of this file.
+/// A provider returning FEWER fields is therefore not an old file missing a
+/// column — the case `project_batch_to_schema`'s null-fill exists for — it is a
+/// provider serving the wrong bytes, and null-filling it is exactly the silent
+/// data loss this function prevents. Relaxing `!=` to `>` reads as a sensible
+/// tightening and reopens that path; mutation 25 in `MATRIX.md`, killed by
+/// `a_served_stream_that_drops_or_reorders_a_column_is_declined`.
+///
+/// The check is on the reader's DECLARED schema (`RecordBatchReader::schema()`),
+/// not on the batches it yields. That is sufficient on the C-ABI path, where the
+/// `ArrowArrayStream`'s declared schema governs the import and the batches cannot
+/// disagree with it. A Rust-native provider could declare one schema and yield
+/// another; nothing here catches that.
+fn served_schema_mismatch(
+    served: &arrow_schema::Schema,
+    wanted: &arrow_schema::Schema,
+) -> Option<String> {
+    if served.fields().len() != wanted.fields().len() {
+        return Some(format!(
+            "served {} field(s), wanted {}",
+            served.fields().len(),
+            wanted.fields().len()
+        ));
+    }
+    for (i, (got, want)) in served
+        .fields()
+        .iter()
+        .zip(wanted.fields().iter())
+        .enumerate()
+    {
+        if got.name() != want.name() {
+            return Some(format!(
+                "field {i} is named '{}', wanted '{}'",
+                got.name(),
+                want.name()
+            ));
+        }
+        if got.data_type() != want.data_type() {
+            return Some(format!(
+                "field {i} ('{}') has type {:?}, wanted {:?}",
+                want.name(),
+                got.data_type(),
+                want.data_type()
+            ));
+        }
+    }
+    None
 }
 
 /// `schema` without the internal row-position column.
@@ -1031,7 +1213,52 @@ impl HoodieFileGroupReader {
         // always supplies a required_schema). It reads the file as one batch,
         // because its schema is only known once the file has been read, so the
         // instant-range decision below cannot be made before reading it.
+        //
+        // This branch returns before the projected path's footer read, so it runs
+        // the repair gate ITSELF, through the same three helpers — it used to run
+        // it not at all, and a #18132-mislabelled file kept a pushdown here that
+        // drops rows which match (ISSUES OI-11). It was latent rather than live:
+        // no FFI caller reaches this path, because the FFI always supplies a
+        // required schema. "Unreachable from the surface that ships today" is a
+        // property of the callers, not of this function, and the guard is
+        // cheaper than the argument.
+        //
+        // The footer read is gated on `repair_gate_is_armed`, which the common
+        // scan answers `false` to — so the ordinary read pays nothing, and the
+        // scan that does pay reads a footer the `read_data` below reads anyway
+        // (and which `parquet_schema_cache` has usually already served).
         let Some(required_schema) = self.schema_handler.required_schema.clone() else {
+            if self.repair_gate_is_armed(pushdown_is_safe) {
+                let file_schema = self
+                    .base_file_reader()?
+                    .read_schema(
+                        &path,
+                        base_read_options(
+                            row_filter.clone(),
+                            row_group_selector.clone(),
+                            key_predicate.clone(),
+                            self.schema_handler.reader_schema_json.clone(),
+                            use_position,
+                        ),
+                    )
+                    .await
+                    .map_err(|e| {
+                        CoreError::ReadFileSliceError(format!(
+                            "Failed to read base file footer schema '{path}': {e:?}"
+                        ))
+                    })?;
+                let repair_conflict = self.repair_conflict_from(
+                    &file_schema,
+                    self.schema_handler.table_schema.as_deref(),
+                    pushdown_is_safe,
+                )?;
+                self.withdraw_pushdown_for_repair(
+                    &path,
+                    &repair_conflict,
+                    &mut row_filter,
+                    &mut row_group_selector,
+                );
+            }
             let batch = self
                 .base_file_reader()?
                 .read_data(
@@ -1146,27 +1373,69 @@ impl HoodieFileGroupReader {
         // absent from the projection is still decoded and still misread, because a
         // `RowFilter` builder derives its own `ProjectionMask` from the parquet
         // schema rather than from `intersection`.
+        //
+        // With no table schema, `required_schema` may stand in — but ONLY when it
+        // carries every repair-risk column.
+        //
+        // It used to stand in unconditionally, which silently inverted the rule the
+        // paragraph above states. `reinterpreted_columns` skips any candidate missing
+        // from either side, so a risk column pruned out of the projection produced an
+        // EMPTY conflict — the gate answering "nothing to repair" about a file it had
+        // simply not been shown the column of, and the row filter surviving on exactly
+        // the mislabelled file it exists to disarm.
+        //
+        // Withdrawing whenever the table schema is absent would close that, and is
+        // what an earlier cut of this did, but it is too blunt: `cpp/` leaves
+        // `table_schema` unset whenever `data_schema` is absent or unparseable, so
+        // every such read would lose pushdown and full-scan even on an honestly
+        // labelled file. The coverage test is the precise line — when the projection
+        // carries all the risk columns it IS a sound table side for the only
+        // comparison the gate makes, and when it does not, there is no answer and the
+        // fail-safe arm is correct.
+        //
+        // Pinned in both directions by
+        // `an_out_of_projection_filter_column_withdraws_pushdown_with_no_table_schema`
+        // (missing risk column, must withdraw) and
+        // `base_read_keeps_pushdown_when_the_file_is_honestly_labelled` (covered risk
+        // column, must keep).
+        let table_side = match self.schema_handler.table_schema.as_deref() {
+            Some(table) => Some(table),
+            None => {
+                let mut covers_every_risk_column = true;
+                for col in &self.reader_context.repair_risk_columns {
+                    if crate::schema::batch_evolution::index_of_ci(&required_schema, col)?.is_none()
+                    {
+                        covers_every_risk_column = false;
+                        break;
+                    }
+                }
+                covers_every_risk_column.then(|| required_schema.as_ref())
+            }
+        };
         let repair_conflict =
-            if pushdown_is_safe && !self.reader_context.repair_risk_columns.is_empty() {
-                let table_side = self
-                    .schema_handler
-                    .table_schema
-                    .as_ref()
-                    .unwrap_or(&required_schema);
-                crate::schema::batch_evolution::reinterpreted_columns(
-                    &file_schema,
-                    table_side,
-                    &self.reader_context.repair_risk_columns,
-                )?
-            } else {
-                Vec::new()
-            };
+            self.repair_conflict_from(&file_schema, table_side, pushdown_is_safe)?;
 
-        // ONE verdict, THREE consumers. This SHADOWS the merge-safety gate bound
-        // above: the row filter, the row-group selector and the injected
-        // provider's `can_push_predicate` all read the narrowed value from here
-        // down, so a consumer cannot be left behind by a later edit. That is the
-        // same property the merge gate is bound once for, one layer in.
+        // ONE verdict, THREE consumers — but reaching them by two mechanisms, and
+        // the difference matters to anyone editing this.
+        //
+        // The injected provider's `can_push_predicate` reads this rebinding
+        // DIRECTLY, so it is narrowed by construction. The row filter and the
+        // row-group selector were bound from the un-narrowed value above and are
+        // cleared imperatively by the block below — which cannot simply key on
+        // `!pushdown_is_safe`. Not because the clearing would be wrong (it is
+        // idempotent; they were already `None` from their binding) but because
+        // the block also RECORDS `pushdown_suppressed_by_repair`. Keying it on
+        // the narrowed value would fire that counter on every MERGE-gate refusal
+        // too, and the counter exists precisely to separate the two causes:
+        // `record_selector_suppressed` already speaks for the merge gate at its
+        // own binding. Pinned by
+        // `a_selector_the_gate_refuses_is_counted_not_silently_dropped`, which
+        // asserts the repair counter stays at zero for a merge-gate refusal —
+        // the only test in this file that fails under that mis-keying.
+        //
+        // The three verdicts agree; only one of them is structurally unable to be
+        // left behind. A fourth consumer added later should read the binding,
+        // not the block.
         //
         // The provider is the consumer that would otherwise be left behind, and
         // nothing would have said so: it arrived on a branch that forked BEFORE
@@ -1182,22 +1451,12 @@ impl HoodieFileGroupReader {
         // the branch, is what the provider request reads: it is the same
         // narrowing internal `reader/mod.rs` applies, expressed for this tree.
         let pushdown_is_safe = pushdown_is_safe && repair_conflict.is_empty();
-        if !repair_conflict.is_empty() {
-            let volume = self.storage.read_volume();
-            // Counted for every withdrawal; `row_group_selector_suppressed` can
-            // only speak for a selector the caller actually installed.
-            volume.record_pushdown_suppressed_by_repair();
-            if row_group_selector.is_some() {
-                volume.record_selector_suppressed();
-            }
-            log::debug!(
-                "base file '{path}' needs a value-reinterpreting logical-type repair \
-                 on {repair_conflict:?} — skipping parquet RowFilter pushdown and \
-                 row-group pruning (post-merge filter still runs)"
-            );
-            row_filter = None;
-            row_group_selector = None;
-        }
+        self.withdraw_pushdown_for_repair(
+            &path,
+            &repair_conflict,
+            &mut row_filter,
+            &mut row_group_selector,
+        );
 
         let base_read_schema: SchemaRef = if use_position {
             let mut fields: Vec<arrow_schema::FieldRef> =
@@ -1239,12 +1498,37 @@ impl HoodieFileGroupReader {
         // and before this request, which is the only ordering on which the
         // provider can see the same decision the in-process `RowFilter` got for
         // this file.
-        if !use_position && let Some(provider) = self.base_file_provider.clone() {
+        // A provider can only be served from inside a tokio runtime, because
+        // `served_batch_stream` hands the reader to `spawn_blocking`. Both
+        // `HoodieFileGroupReader` and `with_base_file_provider` are `pub`, so a
+        // downstream crate can inject a provider and then drive this future on a
+        // non-tokio executor — and `spawn_blocking` PANICS with no runtime, deep
+        // inside a stream the caller did not write (ISSUES OI-22).
+        //
+        // Decline the provider instead. Falling back to the object-store read is
+        // the same degradation an unimportable stream or a wrong schema gets and
+        // produces the right answer — but note it is NOT counted: this check
+        // short-circuits the whole provider block, so `record_provider_stats`
+        // never runs and every counter stays zero, which is indistinguishable
+        // from "no provider was injected". The `warn!` below is the only signal,
+        // and `off_a_tokio_runtime_the_provider_is_declined_rather_than_panicking`
+        // pins that (0, 0). Deliberate: a `storage_fallbacks` bump here would
+        // read as "the provider declined this file" when in fact the provider was
+        // never asked. Checked HERE rather than in
+        // `served_batch_stream` because by then the provider has already done the
+        // work of serving the file.
+        //
+        // Costs one `Handle::try_current()` per base file on the path that has a
+        // provider at all; the common read has none and never evaluates it.
+        if !use_position
+            && let Some(provider) = self.base_file_provider.clone()
+            && self.provider_is_usable_here(&path)
+        {
             let file_uri = join_url_segments(&self.storage.base_url, &[path.as_str()])
                 .map(|u| u.to_string())
                 .unwrap_or_else(|_| path.clone());
             let partition_fields = self.partition_fields();
-            let (outcome, stats) = provider
+            let (outcome, mut stats) = provider
                 .try_base_file(BaseFileDataRequest {
                     file_uri: &file_uri,
                     projected_schema: &intersection,
@@ -1254,6 +1538,57 @@ impl HoodieFileGroupReader {
                     data_schema: self.schema_handler.data_schema.as_ref(),
                 })
                 .await;
+
+            // A served stream is TRUSTED for values and CHECKED for shape.
+            //
+            // `project_batch_to_schema` resolves the served batch against
+            // `base_read_schema` BY NAME, and null-fills a name it does not find —
+            // which is right for a column genuinely absent from an older file, and
+            // is exactly what makes a wrong serve invisible. Every field in
+            // `intersection` was read out of THIS file's footer, so all of them
+            // are present; a provider that renames, reorders, retypes or drops one
+            // is not serving an evolved file, it is serving the wrong bytes, and
+            // without this check the read succeeds with a column of nulls where
+            // the data was.
+            //
+            // Declining is the safe degradation and matches the unimportable-stream
+            // path in `cpp/src/provider_abi.rs`: the attempt is reclassified from a
+            // serve to a storage fallback and the object-store read below produces
+            // the right answer. The cost of a false decline is one re-read; the
+            // cost of a false accept is silent data loss.
+            let outcome = match outcome {
+                Some(served) => {
+                    match served_schema_mismatch(served.schema().as_ref(), &intersection) {
+                        None => Some(served),
+                        Some(why) => {
+                            log::error!(
+                                "[HoodieFileGroupReader] base-file provider served \
+                                 '{path}' at the WRONG schema and is being declined: \
+                                 {why}. Falling back to the object-store read. A served \
+                                 stream must match `projected_schema` field for field, \
+                                 in order"
+                            );
+                            drop(served);
+                            // The SAME reclassification `cpp/src/provider_abi.rs`
+                            // performs when a served stream cannot be imported —
+                            // including the drain counters, which that path zeroes
+                            // and this one did not. The trait is public, so a
+                            // Rust-native provider that fills them against contract
+                            // would otherwise have them folded into the live slot
+                            // by `record_provider_stats` below, attributed to a
+                            // file nothing ever drained.
+                            stats.files_served = stats.files_served.saturating_sub(1);
+                            stats.storage_fallbacks += 1;
+                            stats.rows_served = 0;
+                            stats.bytes_materialized = 0;
+                            stats.batches_received = 0;
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
             // Seed the shared slot with the setup counters on BOTH outcomes: a
             // fallback still reports its discover/connect timings, and
             // `storage_fallbacks` is the counter that makes a silent
@@ -1336,6 +1671,117 @@ impl HoodieFileGroupReader {
             .unwrap_or_default()
     }
 
+    /// Can an injected provider actually be used on the executor polling us?
+    ///
+    /// `served_batch_stream` moves the served reader onto `spawn_blocking`, which
+    /// panics outside a tokio runtime. Rather than let that panic escape from
+    /// inside a stream, decline the provider and read from object storage — the
+    /// same degradation a wrong schema or an unimportable stream gets.
+    ///
+    /// Warns on EVERY declined file, deliberately. There is no once-guard: the
+    /// condition is a property of the caller's executor and cannot change within a
+    /// read, so one reader emits at most one of these — but a scan of N file
+    /// groups off-runtime emits N, which is the right volume for a misconfiguration
+    /// that silently costs the provider seam its entire benefit.
+    fn provider_is_usable_here(&self, path: &str) -> bool {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return true;
+        }
+        log::warn!(
+            "[HoodieFileGroupReader] a base-file provider is injected but this read is \
+             not being polled inside a tokio runtime, so a served stream could not be \
+             driven. Declining the provider and reading '{path}' from object storage. \
+             Poll the reader inside a tokio runtime to use the provider"
+        );
+        false
+    }
+
+    /// Is the #18132 repair gate capable of firing on this read at all?
+    ///
+    /// `repair_risk_columns` is decided ONCE per scan from the table schema and
+    /// the predicate's own referenced columns, and is empty unless the predicate
+    /// touches a tz-aware millis column — so the common scan answers `false` here
+    /// and never reaches a footer on the gate's account. `pushdown_is_safe` is the
+    /// merge gate: when it has already refused, there is no pushdown left to
+    /// withdraw.
+    ///
+    /// One home, because both base-read paths ask it and they used to ask it
+    /// differently — the unprojected one not at all (ISSUES OI-11).
+    fn repair_gate_is_armed(&self, pushdown_is_safe: bool) -> bool {
+        pushdown_is_safe && !self.reader_context.repair_risk_columns.is_empty()
+    }
+
+    /// The columns of THIS file whose declared type the apache/hudi#18132 repair
+    /// reinterprets on read — the per-file half of the gate.
+    ///
+    /// `table_side` is `None` when the read has no table schema AND nothing sound
+    /// to substitute. `required_schema` is only a legal substitute when it carries
+    /// every `repair_risk_column`: it is the PROJECTION, so a risk column pruned
+    /// out of it is absent from the table side while still being decoded and still
+    /// being misread, and `reinterpreted_columns` skips any candidate absent from
+    /// either schema — substituting it blindly answers "no conflict" for the one
+    /// shape the gate exists to catch. The caller does that coverage test; by the
+    /// time it reaches here, a `Some` is a table side sound for every column this
+    /// function will look up.
+    ///
+    /// With no table side the question cannot be answered, and the only safe
+    /// answer is "assume every candidate reinterprets": withdrawing pushdown
+    /// costs a full scan, keeping it costs rows that match and cannot be
+    /// recovered by the post-merge filter.
+    fn repair_conflict_from(
+        &self,
+        file_schema: &arrow_schema::Schema,
+        table_side: Option<&arrow_schema::Schema>,
+        pushdown_is_safe: bool,
+    ) -> Result<Vec<String>> {
+        if !self.repair_gate_is_armed(pushdown_is_safe) {
+            return Ok(Vec::new());
+        }
+        match table_side {
+            Some(table) => crate::schema::batch_evolution::reinterpreted_columns(
+                file_schema,
+                table,
+                &self.reader_context.repair_risk_columns,
+            ),
+            None => Ok(self.reader_context.repair_risk_columns.clone()),
+        }
+    }
+
+    /// Withdraw a base read's pushdown because this file needs the repair, and
+    /// say so in the counters. No-op when `repair_conflict` is empty.
+    ///
+    /// Deliberately keyed on the CONFLICT, never on the narrowed
+    /// `pushdown_is_safe`: the clearing itself would be idempotent either way,
+    /// but this also records `pushdown_suppressed_by_repair`, and keying that on
+    /// the narrowed value fires it on every MERGE-gate refusal too — the counter
+    /// exists precisely to separate the two causes. Pinned by
+    /// `a_selector_the_gate_refuses_is_counted_not_silently_dropped`.
+    fn withdraw_pushdown_for_repair(
+        &self,
+        path: &str,
+        repair_conflict: &[String],
+        row_filter: &mut Option<RowFilterBuilder>,
+        row_group_selector: &mut Option<RowGroupSelector>,
+    ) {
+        if repair_conflict.is_empty() {
+            return;
+        }
+        let volume = self.storage.read_volume();
+        // Counted for every withdrawal; `row_group_selector_suppressed` can
+        // only speak for a selector the caller actually installed.
+        volume.record_pushdown_suppressed_by_repair();
+        if row_group_selector.is_some() {
+            volume.record_selector_suppressed();
+        }
+        log::debug!(
+            "base file '{path}' needs a value-reinterpreting logical-type repair \
+             on {repair_conflict:?} — skipping parquet RowFilter pushdown and \
+             row-group pruning (post-merge filter still runs)"
+        );
+        *row_filter = None;
+        *row_group_selector = None;
+    }
+
     /// Fold one provider attempt's setup counters into the shared slot.
     ///
     /// The single writer, so "no counter is recorded twice" is a property of this
@@ -1368,8 +1814,16 @@ impl HoodieFileGroupReader {
     /// Copy the shared provider slot into [`Self::read_stats`].
     ///
     /// Called by [`Self::read`], where the stream is exhausted and the drain
-    /// counters are therefore final. `None` stays `None` when no provider ever
-    /// ran, so `base_file_provider: Some(all zeroes)` cannot be confused with
+    /// counters are therefore final. `None` stays `None` when no provider was
+    /// INJECTED — which is what the guard below actually tests, and is weaker
+    /// than "never ran": a provider injected on a position-merge split (skipped
+    /// at the seam) or a log-only file group (which returns before the seam) is
+    /// never offered a file, and this writes `Some(all zeroes)` for it. So
+    /// all-zeroes distinguishes "no provider injected" from "a provider was
+    /// injected", not from "a provider ran". A consumer that needs the stronger
+    /// distinction should read `files_served + storage_fallbacks`, which is the
+    /// count of files actually OFFERED. `base_file_provider: Some(all zeroes)`
+    /// cannot be confused with
     /// "no provider injected".
     fn snapshot_provider_stats(&mut self) {
         if self.base_file_provider.is_none() {
@@ -1705,6 +2159,20 @@ impl HoodieFileGroupReaderBuilder {
     /// object-store read; a provider that returns `None` falls through to that
     /// read. hudi-core ships no provider — a downstream crate supplies one. See
     /// [`BaseFileDataProvider`](super::base_file_provider::BaseFileDataProvider).
+    ///
+    /// # Runtime precondition
+    ///
+    /// A served stream is driven on `tokio::task::spawn_blocking`, so the reader
+    /// must be polled **inside a tokio runtime** for the provider to be used at
+    /// all. Polled on any other executor, the provider is DECLINED per base file
+    /// and every read goes to object storage — correct results, counted as
+    /// storage fallbacks, with one warning naming the cause. It does not panic,
+    /// and it is not silent, but the provider buys nothing.
+    ///
+    /// The stronger requirement is a MULTI-THREADED runtime: a provider whose
+    /// reader itself calls `block_on` (the C-ABI adapter's does) needs the
+    /// blocking pool to be a different thread from the runtime worker. See
+    /// `served_batch_stream` for that argument.
     pub fn with_base_file_provider(mut self, provider: BaseFileDataProviderRef) -> Self {
         self.base_file_provider = Some(provider);
         self
@@ -2395,6 +2863,81 @@ mod tests {
             "and the reason it never ran is on the record"
         );
         assert_eq!(volume.row_groups_read.load(Relaxed), 3);
+        // The two causes must stay separable. This is a MERGE-gate refusal, so
+        // the repair counter must not move — and it is what stops the withdrawal
+        // block in `base_file_source` from being keyed on the narrowed
+        // `pushdown_is_safe`, which would attribute every merge-gate refusal to
+        // the repair gate. Without this assertion that mis-keying passes the
+        // whole file.
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            0,
+            "a merge-gate refusal is not a repair withdrawal, and the counters \
+             exist to tell them apart"
+        );
+    }
+
+    /// A merge-gate refusal must not ALSO arm the repair gate.
+    ///
+    /// `repair_gate_is_armed` is `pushdown_is_safe && !repair_risk_columns
+    /// .is_empty()`. Dropping the first conjunct survived the whole suite,
+    /// because every fixture that refuses on the merge gate leaves
+    /// `repair_risk_columns` empty — so the second conjunct was doing all the
+    /// work and the first was pinned by nothing.
+    ///
+    /// This fixture arms BOTH: a merging split with a non-PK predicate (the merge
+    /// gate refuses) over a file that genuinely carries the #18132 mislabel (so
+    /// the repair gate would find a real conflict if it were armed). With the
+    /// conjunct the gate stays disarmed and `pushdown_suppressed_by_repair` stays
+    /// zero; without it the gate fires, finds the conflict, and attributes a
+    /// merge-gate refusal to the repair — which is exactly the mis-keying the
+    /// two counters exist to keep apart.
+    #[tokio::test]
+    async fn a_merge_gate_refusal_does_not_also_arm_the_repair_gate() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        // THE LIE: micros declared, millis stored.
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            straddling_table_schema(),
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        reader.schema_handler.table_schema = Some(straddling_table_schema());
+        // A log file on the split with a non-PK predicate: the MERGE gate refuses
+        // before the repair gate is ever consulted.
+        reader.input_split = InputSplit::new(
+            Some(base_name.to_string()),
+            Some("20240101120000000".to_string()),
+            vec![".f1-0_20240101130000000.log.1_0-1-1".to_string()],
+            String::new(),
+        );
+
+        let volume = reader.storage.read_volume();
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            invocations.load(Relaxed),
+            0,
+            "fixture check: the merge gate must have refused the pushdown, or this \
+             test is not exercising the conjunct at all"
+        );
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            0,
+            "a merge-gate refusal is not a repair withdrawal — the repair gate must \
+             not arm once pushdown is already gone"
+        );
     }
 
     /// The same merging slice with a primary-key-safe predicate: the gate opens,
@@ -3599,6 +4142,75 @@ mod tests {
         assert_eq!(out.num_rows(), 2);
     }
 
+    /// The two conditions the tests above hold apart, crossed: a MISLABELLED file,
+    /// a filter column pruned out of the projection, AND no table schema.
+    ///
+    /// `base_read_declines_pushdown_for_an_unprojected_predicate_column` supplies a
+    /// table schema, and `with_no_table_schema_the_unprojected_path_withdraws_pushdown_anyway`
+    /// drops the table schema but keeps `ts` inside the schema it passes as
+    /// `required`. Neither reaches the shape where the projected path has no table
+    /// side AND the risk column is outside the projection — which is exactly the
+    /// shape `cpp/` produces whenever `fgrc.data_schema` is absent or fails to
+    /// parse while `requested_schema` still does, since `repair_risk_columns` is
+    /// computed fail-closed from the predicate and arrives populated anyway.
+    ///
+    /// Falling back to `required_schema` for the table side answers "no conflict"
+    /// here — `reinterpreted_columns` skips `ts` because it is missing from that
+    /// side — so the `RowFilter` is pushed against micros-labelled millis, sees
+    /// 1970, and drops `k1`. The read returns 1 row and reports success.
+    #[tokio::test]
+    async fn an_out_of_projection_filter_column_withdraws_pushdown_with_no_table_schema() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        // THE LIE: micros declared, millis stored.
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        // Projection keeps only the key; `ts` is filtered on but never returned.
+        let required: SchemaRef =
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "_hoodie_record_key",
+                arrow_schema::DataType::Utf8,
+                true,
+            )]));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            required,
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        // The crossing condition: no table side at all on the PROJECTED path.
+        reader.schema_handler.table_schema = None;
+
+        let volume = reader.storage.read_volume();
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            1,
+            "with no table side the projected path must withdraw, not fall back to \
+             the projection and conclude there is nothing to repair"
+        );
+        assert_eq!(
+            invocations.load(Relaxed),
+            0,
+            "the filter must not have been pushed against a mislabelled column"
+        );
+        assert_eq!(
+            out.num_rows(),
+            2,
+            "both rows survive; pushing here would have dropped the ABOVE_MS row"
+        );
+    }
+
     /// A withdrawal takes the row-group selector with it, and is counted on both
     /// counters: `row_group_selector_suppressed` so the existing "installed but
     /// never passed down" question stays answerable, and
@@ -3642,6 +4254,177 @@ mod tests {
             volume.pushdown_suppressed_by_repair.load(Relaxed),
             1,
             "the cause must be separable from a merge-gate refusal"
+        );
+    }
+
+    /// THE UNPROJECTED PATH runs the repair gate too.
+    ///
+    /// `base_file_source` has an early return for `required_schema == None` that
+    /// read with the row filter and selector straight from the MERGE gate and
+    /// returned before the projected path's footer read — so the repair gate
+    /// never ran there, and a #18132-mislabelled file kept a pushdown that drops
+    /// rows which match, with the post-merge filter unable to restore them
+    /// (ISSUES OI-11).
+    ///
+    /// It was latent rather than live: no FFI caller reaches this path, because
+    /// the FFI always supplies a required schema. "Unreachable from the surface
+    /// that ships today" is a property of the callers, not of this function.
+    ///
+    /// The filter-builder invocation count is the load-bearing assertion — the
+    /// builder runs only if the filter was actually installed on the read, so
+    /// `0` means withdrawn rather than merely "a counter moved".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_unprojected_path_withdraws_pushdown_for_a_repair_conflict_too() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            straddling_table_schema(),
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        // The table's view has to be reachable, because on this path there is no
+        // `required_schema` to fall back to as the comparison side.
+        reader.schema_handler.table_schema = Some(straddling_table_schema());
+        // THE POINT OF THIS TEST: no projection schema, so `base_file_source`
+        // takes the early return.
+        reader.schema_handler.required_schema = None;
+        assert!(
+            reader.base_read_pushdown_is_safe(),
+            "fixture check: the merge gate must PASS, or the repair gate is not \
+             what withdrew anything"
+        );
+
+        let volume = reader.storage.read_volume();
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            out.num_rows(),
+            2,
+            "both rows survive — the mislabelled file is read unfiltered"
+        );
+        assert_eq!(
+            invocations.load(Relaxed),
+            0,
+            "the row filter must never have been built, i.e. never pushed: a \
+             predicate evaluated against this file's PHYSICAL values drops the \
+             row that matches, and the post-merge filter cannot bring it back"
+        );
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            1,
+            "and the withdrawal must be COUNTED on this path, with the same \
+             counter the projected path uses — one gate, one telemetry"
+        );
+    }
+
+    /// The control for the test above: on the same unprojected path, an HONESTLY
+    /// labelled file KEEPS its pushdown.
+    ///
+    /// Without it, an early return hard-wired to withdraw — or a gate that simply
+    /// refuses whenever `repair_risk_columns` is non-empty — passes every
+    /// assertion above while disabling pushdown for every unprojected read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_unprojected_path_keeps_pushdown_for_an_honest_file() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        // MILLIS declared and millis stored — the same fixture, telling the truth.
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Millisecond);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            straddling_table_schema(),
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        reader.schema_handler.table_schema = Some(straddling_table_schema());
+        reader.schema_handler.required_schema = None;
+
+        let volume = reader.storage.read_volume();
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            0,
+            "an honestly labelled file must not have its pushdown withdrawn"
+        );
+        assert!(
+            invocations.load(Relaxed) > 0,
+            "and the filter must actually have been pushed, or this control \
+             passes for a file that was never filtered either way"
+        );
+    }
+
+    /// With NO table schema to compare the footer against, the gate withdraws
+    /// anyway — the conservative branch, and the only reachable case where
+    /// pushdown is lost on an HONESTLY labelled file.
+    ///
+    /// Its pair is `the_unprojected_path_keeps_pushdown_for_an_honest_file`: same
+    /// honest file, same predicate, same path — and pushdown is KEPT there,
+    /// because a table schema is available. The only difference between the two is
+    /// whether the question can be answered, so together they pin the fallback to
+    /// "assume it reinterprets" rather than to "assume it is fine".
+    ///
+    /// That direction is the load-bearing one. Withdrawing when we cannot tell
+    /// costs a full scan; keeping costs rows that match, which the post-merge
+    /// filter cannot restore. A `None` branch returning `Vec::new()` looks
+    /// obviously right and is the unsafe answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_no_table_schema_the_unprojected_path_withdraws_pushdown_anyway() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        // HONEST: millis declared, millis stored. Nothing to repair.
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Millisecond);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            straddling_table_schema(),
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        // Neither side of the comparison is available.
+        reader.schema_handler.table_schema = None;
+        reader.schema_handler.required_schema = None;
+
+        let volume = reader.storage.read_volume();
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            1,
+            "with no table schema the question cannot be answered, and the safe \
+             answer is to withdraw"
+        );
+        assert_eq!(
+            invocations.load(Relaxed),
+            0,
+            "and the filter must not have been pushed"
         );
     }
 
@@ -3800,6 +4583,208 @@ mod tests {
         );
     }
 
+    /// THE MERGE-GATE HALF. A merging split that has made no primary-key-safety
+    /// claim must withdraw the provider's pushdown too, with no repair conflict
+    /// anywhere in sight.
+    ///
+    /// Note what the gate actually reads: `base_read_pushdown_is_safe()` is
+    /// `!has_log_files() || mor_pk_safe` and consults no predicate at all. So the
+    /// fixture installs none — what makes the gate refuse is a log file on the
+    /// split plus `mor_pk_safe == false`.
+    ///
+    /// `can_push_predicate` is a CONJUNCTION and each conjunct needs its own
+    /// mutation to kill it. Dropping the repair conjunct is caught by
+    /// [`repair_conflict_also_withdraws_provider_pushdown`]; dropping the MERGE
+    /// conjunct — `let pushdown_is_safe = repair_conflict.is_empty();` — is caught
+    /// only here, and would otherwise pass the whole file, because every other
+    /// provider fixture builds a split with no log files and so clears the merge
+    /// gate unconditionally. That mutation tells a provider it may push on exactly
+    /// the MOR split whose log records the predicate has not seen yet, which is
+    /// the same over-drop the repair narrowing exists to stop.
+    ///
+    /// Nothing here arms `repair_risk_columns`, so the repair conjunct is
+    /// vacuously true and the merge gate is the only thing that can produce the
+    /// `false`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merging_split_withdraws_provider_pushdown_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::not_serving();
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema, provider.clone()).await;
+        // A log file on the split and no PK-safety claim: the merge gate refuses.
+        reader.input_split = InputSplit::new(
+            Some(base_name.to_string()),
+            Some("20240101120000000".to_string()),
+            vec![".f1-0_20240101130000000.log.1_0-1-1".to_string()],
+            String::new(),
+        );
+        assert!(
+            !reader.base_read_pushdown_is_safe(),
+            "fixture check: the merge gate must REFUSE here, or this test pins \
+             nothing"
+        );
+        assert!(
+            reader.reader_context.repair_risk_columns.is_empty(),
+            "fixture check: the repair guard must be DISARMED here, or the \
+             withdrawal below could come from the wrong conjunct"
+        );
+
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        let seen = provider
+            .seen()
+            .expect("the provider must have been offered the file");
+        assert!(
+            !seen.can_push_predicate,
+            "a merging split with no primary-key-safety claim must withdraw \
+             PROVIDER pushdown, exactly as it withdraws the in-process row filter"
+        );
+    }
+
+    /// And the merge gate's OTHER branch: a merging split that DOES claim
+    /// primary-key safety must keep provider pushdown.
+    ///
+    /// Without this, `can_push_predicate: pushdown_is_safe && !has_log_files()`
+    /// — which silently drops the `mor_pk_safe` widening and costs every
+    /// PK-safe MOR split its provider-side pushdown — survives all three of the
+    /// tests above, because none of them has both a log file and `mor_pk_safe`.
+    /// Strictly narrower than the delivered verdict, so it cannot over-drop rows;
+    /// it is a performance regression rather than a correctness one, and this is
+    /// what keeps it from being silent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pk_safe_merging_split_keeps_provider_pushdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::not_serving();
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema, provider.clone()).await;
+        reader.input_split = InputSplit::new(
+            Some(base_name.to_string()),
+            Some("20240101120000000".to_string()),
+            vec![".f1-0_20240101130000000.log.1_0-1-1".to_string()],
+            String::new(),
+        );
+        {
+            let ctx = Arc::get_mut(&mut reader.reader_context).expect("sole owner in test");
+            ctx.mor_pk_safe = true;
+        }
+        assert!(
+            reader.input_split.has_log_files(),
+            "fixture check: the split must MERGE, or this is the same case as the \
+             no-log-files fixtures"
+        );
+        assert!(
+            reader.base_read_pushdown_is_safe(),
+            "fixture check: mor_pk_safe must open the gate, or the assertion below \
+             passes for the wrong reason"
+        );
+
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        let seen = provider
+            .seen()
+            .expect("the provider must have been offered the file");
+        assert!(
+            seen.can_push_predicate,
+            "a primary-key-safe predicate keeps pushdown on a merging split, and \
+             the provider must be told so"
+        );
+    }
+
+    /// THE VALUES CONTRACT. A provider serves the file's PHYSICAL values and
+    /// hudi-core applies the #18132 repair to them, exactly as it does to a file
+    /// read from object storage.
+    ///
+    /// The provider is handed `intersection`, which carries the FILE's schema —
+    /// so on a mislabelled file it is told micros while the stored i64s are
+    /// millis. It serves them unaltered; `served_batch_stream`'s
+    /// `project_batch_to_schema` then RELABELS the column to the table's millis
+    /// without touching the value.
+    ///
+    /// Without this test the values contract on `try_base_file` is documentation
+    /// with nothing behind it: deleting the projection from the served path is a
+    /// silent data-corruption change on the production FFI path, and every other
+    /// provider test uses an int32 column that the repair never touches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_served_batch_gets_the_same_logical_type_repair_as_a_read_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        // On disk: the #18132 shape. The provider will serve DIFFERENT values in
+        // the same mislabelled shape, so the assertion can only pass if the
+        // PROVIDER's batch is what reached the caller.
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        // What the provider serves: the file's own (lying) schema, stored millis.
+        let served_schema: SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("_hoodie_record_key", arrow_schema::DataType::Utf8, true),
+            ts_field("ts", arrow_schema::TimeUnit::Microsecond),
+        ]));
+        let served = RecordBatch::try_new(
+            served_schema,
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["p1", "p2"])),
+                Arc::new(
+                    arrow_array::TimestampMicrosecondArray::from(vec![ABOVE_MS + 7, BELOW_MS + 7])
+                        .with_timezone("UTC"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let provider = StubDataProvider::serving(vec![served]);
+        let mut reader =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, straddling_table_schema())
+                .await;
+        reader.base_file_provider = Some(provider.clone());
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        // THE REQUEST SIDE of the same contract, and the only place in this file
+        // that can pin it: every other provider fixture uses an `id: int32`
+        // column, where `intersection` and `required_schema` are equal and the
+        // two are indistinguishable.
+        //
+        // `projected_schema` must be the INTERSECTION — the file's own footer,
+        // lie included — not the table's `required_schema`. Handing over the
+        // table's schema tells a provider "millis" about a file whose footer says
+        // "micros"; a conforming provider casts on read, dividing by 1000, and
+        // `project_batch_to_schema` then sees millis→millis and applies NO repair.
+        // Corruption with the repair arm bypassed, on the exact #18132 path this
+        // milestone exists for — and it type-checks.
+        let seen = provider
+            .seen()
+            .expect("the provider must have been offered the file");
+        assert_eq!(
+            seen.projected_schema.field(1).data_type(),
+            &arrow_schema::DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some("UTC".into())
+            ),
+            "the provider is handed the FILE's schema, lie included — not the \
+             table's. Serving raw values is only correct if the request says what \
+             the file claims they are"
+        );
+
+        let ts = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+            .expect("the repair must RELABEL the served column to the table's millis");
+        assert_eq!(
+            (ts.value(0), ts.value(1)),
+            (ABOVE_MS + 7, BELOW_MS + 7),
+            "and must not rescale: the served i64s must arrive byte-for-byte, and \
+             they must be the PROVIDER's values, not the file's"
+        );
+    }
+
     /// The other half, and the reason the assertion above is not vacuous: the
     /// same fixture with an honestly labelled file must still hand the provider
     /// `true`.
@@ -3843,12 +4828,15 @@ mod tests {
 
     #[test]
     fn builder_routes_repair_risk_columns_into_reader_context() {
+        // NO `with_row_filter_builder` here, deliberately. `build()`'s decision to
+        // clone the context is a disjunction, and a sibling call would satisfy it
+        // independently — leaving the `repair_risk_columns` disjunct pinned by
+        // nothing, so deleting it from that condition would pass this test.
         let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
         let reader = HoodieFileGroupReader::builder()
             .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
             .with_storage(storage)
             .with_input_split(dummy_input_split())
-            .with_row_filter_builder(make_row_filter_builder())
             .with_repair_risk_columns(vec!["ts".to_string()])
             .build()
             .unwrap();
@@ -3894,6 +4882,20 @@ mod tests {
         /// error — a provider that reports SERVED and dies mid-stream, the shape
         /// the streaming contract makes query-visible.
         fail_after_serving: bool,
+        /// When set, the served reader yields `serve`'s batches and then PANICS,
+        /// which is what arrow-rs does on a malformed `ArrowArray`/`ArrowSchema`
+        /// — i.e. what a buggy C provider actually produces.
+        panic_after_serving: bool,
+        /// Which PAYLOAD the panic carries: a bare literal (`&'static str`) or an
+        /// interpolated message (`String`). `panic_message` has an arm for each
+        /// and only one of them used to be reachable from a test.
+        panic_is_literal: bool,
+        /// When set, the SERVED stats carry non-zero drain counters — a provider
+        /// filling them against contract, which is the only shape that can tell
+        /// whether the decline path zeroes them. Every other fixture leaves all
+        /// three at `Default::default()`, so an assertion that they are zero on a
+        /// decline is satisfied by the fixture rather than by the code.
+        serve_with_drain_counters: bool,
         /// The request fields of the last call.
         seen: StdMutex<Option<SeenRequest>>,
     }
@@ -3907,6 +4909,7 @@ mod tests {
         can_push_predicate: bool,
         partition_path: String,
         partition_fields: Vec<String>,
+        data_schema: Option<SchemaRef>,
     }
 
     impl StubDataProvider {
@@ -3914,6 +4917,9 @@ mod tests {
             Arc::new(Self {
                 serve: Some(batches),
                 fail_after_serving: false,
+                panic_after_serving: false,
+                panic_is_literal: false,
+                serve_with_drain_counters: false,
                 seen: StdMutex::new(None),
             })
         }
@@ -3923,6 +4929,51 @@ mod tests {
             Arc::new(Self {
                 serve: Some(batches),
                 fail_after_serving: true,
+                panic_after_serving: false,
+                panic_is_literal: false,
+                serve_with_drain_counters: false,
+                seen: StdMutex::new(None),
+            })
+        }
+
+        /// Serves `batches`, then PANICS with an interpolated message (a `String`
+        /// payload) instead of ending the stream cleanly.
+        fn serving_then_panicking(batches: Vec<RecordBatch>) -> Arc<Self> {
+            Arc::new(Self {
+                serve: Some(batches),
+                fail_after_serving: false,
+                panic_after_serving: true,
+                panic_is_literal: false,
+                serve_with_drain_counters: false,
+                seen: StdMutex::new(None),
+            })
+        }
+
+        /// As [`Self::serving_then_panicking`], but the panic is a bare LITERAL —
+        /// a `&'static str` payload, which is what `unwrap`, `expect`, `assert!`
+        /// and arrow-rs's FFI-import panics all produce.
+        fn serving_then_panicking_with_a_literal(batches: Vec<RecordBatch>) -> Arc<Self> {
+            Arc::new(Self {
+                serve: Some(batches),
+                fail_after_serving: false,
+                panic_after_serving: true,
+                panic_is_literal: true,
+                serve_with_drain_counters: false,
+                seen: StdMutex::new(None),
+            })
+        }
+
+        /// Serves `batches` AND reports drain counters, which a conforming
+        /// provider must not do — those are hudi-rs's to count as it drains.
+        /// Used to prove the decline path zeroes them rather than folding a
+        /// provider's numbers into the live slot for a file nothing drained.
+        fn serving_with_drain_counters(batches: Vec<RecordBatch>) -> Arc<Self> {
+            Arc::new(Self {
+                serve: Some(batches),
+                fail_after_serving: false,
+                panic_after_serving: false,
+                panic_is_literal: false,
+                serve_with_drain_counters: true,
                 seen: StdMutex::new(None),
             })
         }
@@ -3931,6 +4982,9 @@ mod tests {
             Arc::new(Self {
                 serve: None,
                 fail_after_serving: false,
+                panic_after_serving: false,
+                panic_is_literal: false,
+                serve_with_drain_counters: false,
                 seen: StdMutex::new(None),
             })
         }
@@ -3943,6 +4997,51 @@ mod tests {
     /// The error a `serving_then_failing` stub injects. Matched on by the
     /// mid-stream tests so they cannot pass on some unrelated failure.
     const STUB_MID_STREAM_ERROR: &str = "stub provider died mid-stream";
+
+    /// The panic message a `serving_then_panicking` stub raises. Matched on so
+    /// the test cannot pass on some unrelated panic.
+    const STUB_MID_STREAM_PANIC: &str = "stub provider panicked mid-stream";
+
+    /// The message the LITERAL-payload variant raises. A separate constant
+    /// because the point is the payload TYPE: this one is raised as
+    /// `panic!("<literal>")`, which yields `&'static str`, where
+    /// [`STUB_MID_STREAM_PANIC`] is interpolated and yields `String`. The two
+    /// take different arms of `panic_message`, and one arm was pinned by nothing.
+    const STUB_LITERAL_PANIC: &str = "stub provider panicked with a literal";
+
+    /// A `RecordBatchReader` that yields `items` and then panics.
+    ///
+    /// `RecordBatchIterator` cannot express this — its item type is a `Result`,
+    /// and a panic is neither variant. Which is the point: a panic is not a value
+    /// the stream contract can carry, and before the `catch_unwind` in
+    /// `served_batch_stream` it silently became end-of-stream (ISSUES OI-2).
+    struct PanickingReader {
+        items: std::vec::IntoIter<RecordBatch>,
+        schema: SchemaRef,
+        /// `true` raises a bare literal (`&'static str` payload), `false` an
+        /// interpolated message (`String`). The two exercise different arms of
+        /// `panic_message`.
+        literal: bool,
+    }
+
+    impl Iterator for PanickingReader {
+        type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+        fn next(&mut self) -> Option<Self::Item> {
+            match self.items.next() {
+                Some(b) => Some(Ok(b)),
+                // Deliberately NOT `panic!("{STUB_LITERAL_PANIC}")` — that would
+                // interpolate and yield a `String`, which is the other arm.
+                None if self.literal => panic!("stub provider panicked with a literal"),
+                None => panic!("{STUB_MID_STREAM_PANIC}"),
+            }
+        }
+    }
+
+    impl arrow_array::RecordBatchReader for PanickingReader {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+    }
 
     #[async_trait::async_trait]
     impl crate::file_group::reader_v2::base_file_provider::BaseFileDataProvider for StubDataProvider {
@@ -3959,6 +5058,7 @@ mod tests {
                 can_push_predicate: req.can_push_predicate,
                 partition_path: req.partition_path.to_string(),
                 partition_fields: req.partition_fields.to_vec(),
+                data_schema: req.data_schema.cloned(),
             });
             match &self.serve {
                 Some(batches) => {
@@ -3975,11 +5075,40 @@ mod tests {
                             std::io::Error::other(STUB_MID_STREAM_ERROR),
                         ))));
                     }
-                    let reader = arrow_array::RecordBatchIterator::new(items.into_iter(), schema);
+                    let reader: Box<dyn arrow_array::RecordBatchReader + Send + 'static> =
+                        if self.panic_after_serving {
+                            Box::new(PanickingReader {
+                                items: batches.clone().into_iter(),
+                                schema,
+                                literal: self.panic_is_literal,
+                            })
+                        } else {
+                            Box::new(arrow_array::RecordBatchIterator::new(
+                                items.into_iter(),
+                                schema,
+                            ))
+                        };
                     (
-                        Some(Box::new(reader)),
+                        Some(reader),
                         BaseFileProviderStats {
                             files_served: 1,
+                            // Distinct non-zero values so a single surviving
+                            // assignment is identifiable, not just "non-zero".
+                            rows_served: if self.serve_with_drain_counters {
+                                11
+                            } else {
+                                0
+                            },
+                            bytes_materialized: if self.serve_with_drain_counters {
+                                22
+                            } else {
+                                0
+                            },
+                            batches_received: if self.serve_with_drain_counters {
+                                33
+                            } else {
+                                0
+                            },
                             ..Default::default()
                         },
                     )
@@ -4009,6 +5138,55 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap();
         (schema, batch)
+    }
+
+    /// A TWO-column fixture, because a one-column one cannot express the cases
+    /// that matter most.
+    ///
+    /// `id_batch` is one `id: int32`, and every provider test was built on it.
+    /// That makes three shape deviations inexpressible: a DROPPED field (dropping
+    /// the only column leaves a zero-field batch), a MIS-ORDERED pair, and any
+    /// mismatch at an index past 0 — so the comparison loop's body was only ever
+    /// entered at `i == 0`. Review round 8 built mutation 25 out of exactly that
+    /// gap: narrowing `served.fields().len() != wanted.fields().len()` to `>`
+    /// accepts a provider that drops a column, which is then null-filled, and all
+    /// 62 engine tests stayed green.
+    fn id_amount_batch(ids: Vec<i32>, amounts: Vec<i32>) -> (SchemaRef, RecordBatch) {
+        use arrow_array::Int32Array;
+        let schema: SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int32, true),
+            arrow_schema::Field::new("amount", arrow_schema::DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(amounts)),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    /// Column `idx` of a batch, as i32s, with nulls surfaced as `None` — because
+    /// "the provider's values" and "null-filled" have to be distinguishable, and
+    /// that distinction IS the finding.
+    fn i32_col(batch: &RecordBatch, idx: usize) -> Vec<Option<i32>> {
+        use arrow_array::Int32Array;
+        let col = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        (0..col.len())
+            .map(|i| {
+                if col.is_null(i) {
+                    None
+                } else {
+                    Some(col.value(i))
+                }
+            })
+            .collect()
     }
 
     fn id_values(batch: &RecordBatch) -> Vec<i32> {
@@ -4067,6 +5245,23 @@ mod tests {
     /// fill the FFI-observable slot only as batches are pulled, not up front.
     /// That is the memory contract — the whole served file is never resident at
     /// serve time — and a counter populated early is the symptom of losing it.
+    ///
+    /// The pre-drain bound is `<= 2`, not `== 0`, and the difference is a real
+    /// flake this milestone had to fix rather than a weakening. `== 0` assumes
+    /// the producer has not been scheduled yet, which nothing guarantees: it runs
+    /// concurrently and, by the time this assertion reads the slot, can
+    /// legitimately have counted TWO — one batch occupying the depth-1 channel's
+    /// single permit and one parked in `blocking_send`. Nothing has been
+    /// DELIVERED at this point, because the receiver has not been polled; the
+    /// third batch in `a_served_reader_runs_two_batches_ahead_and_no_further`'s
+    /// bound is the one the merge has already taken, and that test pulls a batch
+    /// first. Two is also what `try_base_file`'s own contract says ("pulled up to
+    /// two batches ahead"). Under full-suite load the inherited `== 0` failed on
+    /// exactly this — intermittently, which is worse than failing.
+    ///
+    /// FIVE served batches rather than two, so the bound is meaningful: with two,
+    /// "at most two" is vacuous. What the test now says is the contract — the
+    /// source is not drained up front — instead of a timing accident.
     #[tokio::test(flavor = "multi_thread")]
     async fn base_file_provider_served_source_is_lazy_and_counts_on_drain() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4074,35 +5269,49 @@ mod tests {
         let base_name = "f1-0_0-1-1_001.parquet";
         write_parquet_file(tmp.path(), base_name, &on_disk);
 
-        // Two served batches so `batches_received` is meaningfully > 1.
-        let (_, b1) = id_batch(vec![7, 8]);
-        let (_, b2) = id_batch(vec![9]);
-        let provider = StubDataProvider::serving(vec![b1, b2]);
+        // Five served batches, so "at most three pulled before a drain" is a real
+        // bound rather than a restatement of the batch count.
+        let served: Vec<RecordBatch> = [vec![7, 8], vec![9], vec![10], vec![11], vec![12]]
+            .into_iter()
+            .map(|v| id_batch(v).1)
+            .collect();
+        let provider = StubDataProvider::serving(served);
         let mut reader =
             reader_with_provider(tmp.path(), base_name, schema.clone(), provider).await;
 
         let live = reader.base_file_provider_live_stats();
         let source = reader.base_file_source().await.unwrap();
 
-        // Setup counter seeded at serve time; drain counters still zero because
-        // the lazy source has not been pulled yet.
+        // Setup counter seeded at serve time; the drain counters may have moved,
+        // but only as far as the read-ahead allows.
         {
             let s = live.lock().unwrap();
             assert_eq!(s.files_served, 1, "setup counter seeded before drain");
-            assert_eq!(s.batches_received, 0, "no batches drained yet");
-            assert_eq!(s.rows_served, 0, "no rows drained yet");
+            assert!(
+                s.batches_received <= 2,
+                "the source must not be drained up front — the receiver has not \
+                 been polled, so at most one batch occupies the depth-1 channel \
+                 and one is blocked in send, saw {}",
+                s.batches_received
+            );
+            assert!(
+                s.rows_served <= 3,
+                "and the rows with them (the first two batches hold 2+1), saw {}",
+                s.rows_served
+            );
         }
 
         // Draining the lazy source fills the drain counters in place.
         let out = drain_base_source(source).await;
-        assert_eq!(id_values(&out), vec![7, 8, 9], "served data, streamed");
-        let s = live.lock().unwrap();
         assert_eq!(
-            s.batches_received, 2,
-            "both served batches counted on drain"
+            id_values(&out),
+            vec![7, 8, 9, 10, 11, 12],
+            "served data, streamed"
         );
-        assert_eq!(s.rows_served, 3, "all served rows counted on drain");
-        // Bound it rather than just `> 0`: three i32 values plus validity cannot
+        let s = live.lock().unwrap();
+        assert_eq!(s.batches_received, 5, "every served batch counted on drain");
+        assert_eq!(s.rows_served, 6, "all served rows counted on drain");
+        // Bound it rather than just `> 0`: six i32 values plus validity cannot
         // plausibly need a megabyte, and an unbounded assertion would pass on a
         // counter that had accumulated garbage.
         assert!(
@@ -4110,6 +5319,739 @@ mod tests {
             "materialized bytes counted on drain, within a sane range: {}",
             s.bytes_materialized
         );
+    }
+
+    /// A served stream whose schema is not the one the provider was asked for is
+    /// DECLINED, and the read falls back to object storage.
+    ///
+    /// This is the one provider mistake that is otherwise invisible.
+    /// `project_batch_to_schema` resolves by NAME and null-fills a name it cannot
+    /// find, because that is the correct behaviour for a column genuinely absent
+    /// from an older base file. A provider that renames, reorders, retypes or
+    /// drops a column therefore does not fail — it produces a successful read with
+    /// nulls where the data was, on the production FFI path, with no error and no
+    /// counter moving.
+    ///
+    /// Each case is driven end to end rather than against
+    /// `served_schema_mismatch` directly: a unit test of the comparator would
+    /// still pass with the call site deleted, which is the mutation that matters.
+    /// The parquet file holds 1, 2 and every stub serves 7, 8, so "fell back"
+    /// and "was served" are distinguishable in the OUTPUT, not just in a counter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_served_stream_at_the_wrong_schema_is_declined_not_null_filled() {
+        use arrow_array::{Int32Array, Int64Array};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let wrong: Vec<(&str, RecordBatch)> = vec![
+            (
+                "renamed column",
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new(
+                        "ident",
+                        DataType::Int32,
+                        true,
+                    )])),
+                    vec![Arc::new(Int32Array::from(vec![7, 8]))],
+                )
+                .unwrap(),
+            ),
+            (
+                "retyped column",
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+                    vec![Arc::new(Int64Array::from(vec![7i64, 8]))],
+                )
+                .unwrap(),
+            ),
+            (
+                "extra column",
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("id", DataType::Int32, true),
+                        Field::new("extra", DataType::Int32, true),
+                    ])),
+                    vec![
+                        Arc::new(Int32Array::from(vec![7, 8])),
+                        Arc::new(Int32Array::from(vec![70, 80])),
+                    ],
+                )
+                .unwrap(),
+            ),
+        ];
+
+        for (case, served) in wrong {
+            let tmp = tempfile::tempdir().unwrap();
+            let (schema, on_disk) = id_batch(vec![1, 2]);
+            let base_name = "f1-0_0-1-1_001.parquet";
+            write_parquet_file(tmp.path(), base_name, &on_disk);
+
+            // Reports drain counters it has no business reporting. A conforming
+            // provider leaves them at zero, which is exactly why the plain
+            // `serving` stub cannot test the zeroing on the decline path: with the
+            // fixture at `Default::default()`, deleting all three assignments
+            // leaves any "they are zero" assertion passing.
+            let provider = StubDataProvider::serving_with_drain_counters(vec![served]);
+            let mut reader =
+                reader_with_provider(tmp.path(), base_name, schema.clone(), provider.clone()).await;
+            let live = reader.base_file_provider_live_stats();
+
+            let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+            // Fixture check, not a backstop: if the provider were never offered
+            // the file, `storage_fallbacks == 1` below would fail first. It is here
+            // so THAT failure is diagnosable.
+            assert!(
+                provider.seen().is_some(),
+                "{case}: fixture check — the provider must have been offered the file"
+            );
+            assert_eq!(
+                id_values(&out),
+                vec![1, 2],
+                "{case}: the FILE's rows must reach the caller. Seeing [7, 8] means the \
+                 wrong-shaped serve was accepted; seeing nulls means it was accepted and \
+                 null-filled"
+            );
+            let s = live.lock().unwrap();
+            assert_eq!(
+                s.files_served, 0,
+                "{case}: a declined serve must not stay counted as a served file"
+            );
+            assert_eq!(
+                s.storage_fallbacks, 1,
+                "{case}: and must be counted as the storage fallback it became, or the \
+                 decline is silent to an operator"
+            );
+            assert_eq!(
+                (s.rows_served, s.bytes_materialized, s.batches_received),
+                (0, 0, 0),
+                "{case}: nothing was drained from the declined stream, so the \
+                 provider's own (11, 22, 33) must not survive into the live slot"
+            );
+        }
+    }
+
+    /// A served stream that DROPS a column, or REORDERS two, is declined — the
+    /// two cases the one-column fixture could not express.
+    ///
+    /// Separate from its sibling above because it needs a two-column file, and
+    /// that is the whole point. Review round 8 built mutation 25 here: narrowing
+    /// the field-count guard from `!=` to `>` is one token, reads as a deliberate
+    /// relaxation ("serving FEWER fields is the benign case null-fill was designed
+    /// for"), and reopens the identical silent-data-loss path row 22 closed —
+    /// invisibly, because dropping the only column of a one-column fixture leaves
+    /// a zero-field batch, so the `served < wanted` direction was not merely
+    /// untested but unrepresentable.
+    ///
+    /// The argument the mutation misses is at the CALL SITE, not at the
+    /// comparator: every field in `intersection` was read from THIS file's footer,
+    /// so none of them can be legitimately absent from a serve of this file. A
+    /// provider that omits one is not serving an evolved file; it is serving the
+    /// wrong bytes. The comparator's own doc now says so.
+    ///
+    /// The reorder case also drives the comparison loop past `i == 0` for the
+    /// first time — every earlier case is detected at field 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_served_stream_that_drops_or_reorders_a_column_is_declined() {
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let dropped = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)])),
+            vec![Arc::new(Int32Array::from(vec![7, 8]))],
+        )
+        .unwrap();
+        // Both names present, both types right, the COUNT right — only the order
+        // differs. Nothing but a positional comparison catches this one.
+        let reordered = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("amount", DataType::Int32, true),
+                Field::new("id", DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![700, 800])),
+                Arc::new(Int32Array::from(vec![7, 8])),
+            ],
+        )
+        .unwrap();
+
+        for (case, served) in [("dropped column", dropped), ("reordered pair", reordered)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (schema, on_disk) = id_amount_batch(vec![1, 2], vec![100, 200]);
+            let base_name = "f1-0_0-1-1_001.parquet";
+            write_parquet_file(tmp.path(), base_name, &on_disk);
+
+            // Reports drain counters it has no business reporting. A conforming
+            // provider leaves them at zero, which is exactly why the plain
+            // `serving` stub cannot test the zeroing on the decline path: with the
+            // fixture at `Default::default()`, deleting all three assignments
+            // leaves any "they are zero" assertion passing.
+            let provider = StubDataProvider::serving_with_drain_counters(vec![served]);
+            let mut reader =
+                reader_with_provider(tmp.path(), base_name, schema.clone(), provider.clone()).await;
+            let live = reader.base_file_provider_live_stats();
+
+            let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+            assert!(
+                provider.seen().is_some(),
+                "{case}: fixture check — the provider must have been offered the file"
+            );
+            assert_eq!(
+                i32_col(&out, 0),
+                vec![Some(1), Some(2)],
+                "{case}: the FILE's `id` must reach the caller, not the provider's [7, 8]"
+            );
+            // The column the provider omitted is the one that goes silently to
+            // nulls when the count guard is relaxed. Assert its VALUES, not just
+            // that a column exists.
+            assert_eq!(
+                i32_col(&out, 1),
+                vec![Some(100), Some(200)],
+                "{case}: the FILE's `amount` must reach the caller. [None, None] means the \
+                 wrong-shaped serve was accepted and the missing column null-filled — the \
+                 silent data loss this whole check exists to prevent"
+            );
+            let s = live.lock().unwrap();
+            assert_eq!(
+                (s.files_served, s.storage_fallbacks),
+                (0, 1),
+                "{case}: a declined serve is reclassified as the storage fallback it became"
+            );
+            assert_eq!(
+                (s.rows_served, s.bytes_materialized, s.batches_received),
+                (0, 0, 0),
+                "{case}: and the provider's own (11, 22, 33) must not survive the \
+                 decline — nothing was drained from that stream"
+            );
+        }
+    }
+
+    /// A provider whose reader PANICS mid-stream fails the read — it does not
+    /// truncate it into a short success.
+    ///
+    /// `served_batch_stream` runs a detached `spawn_blocking` and drops the
+    /// `JoinHandle`, so without the `catch_unwind` tokio's task harness swallows
+    /// the panic, `tx` drops, and the consumer sees a clean end-of-stream: the
+    /// query returns FEWER ROWS and reports success. That is the worst failure
+    /// mode this seam has, and it directly contradicted the doc four lines above
+    /// the loop, which promised errors are "forwarded, never swallowed into
+    /// end-of-stream" (ISSUES OI-2).
+    ///
+    /// Not hypothetical: arrow-rs panics on importing a malformed
+    /// `ArrowArray`/`ArrowSchema`, which is exactly what a buggy C provider hands
+    /// across the ABI.
+    ///
+    /// The assertion is on BOTH halves — the batches that did arrive are kept
+    /// (a panic must not discard work already sent) AND the stream ends in an
+    /// `Err` naming the panic, not in `None`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_provider_stream_fails_the_read_rather_than_truncating_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::serving_then_panicking(vec![id_batch(vec![7, 8]).1]);
+        let mut reader = reader_with_provider(tmp.path(), base_name, schema, provider).await;
+
+        let BaseSource { batches, .. } = reader.base_file_source().await.unwrap();
+        let items: Vec<Result<RecordBatch>> = batches.collect().await;
+
+        // The panic hook prints to stderr during this test. That is expected and
+        // is not a failure; the assertion is on what the CONSUMER observes.
+        let (ok, err): (Vec<_>, Vec<_>) = items.iter().partition(|r| r.is_ok());
+        assert_eq!(
+            ok.len(),
+            1,
+            "the batch the provider did serve before panicking must still arrive"
+        );
+        assert_eq!(
+            err.len(),
+            1,
+            "the panic must reach the consumer as an Err — a stream that simply \
+             ENDS here is a short result reporting success, which is the bug"
+        );
+        let msg = format!("{}", err[0].as_ref().unwrap_err());
+        assert!(
+            msg.contains(STUB_MID_STREAM_PANIC),
+            "the error must name the panic it came from, so it is diagnosable \
+             rather than merely present: {msg}"
+        );
+        assert!(
+            msg.contains("PANICKED"),
+            "and must be distinguishable from a mid-stream Err, which is a \
+             different provider defect: {msg}"
+        );
+    }
+
+    /// The panic reaches a SLOW consumer — one that is a batch behind when the
+    /// panic fires.
+    ///
+    /// The sibling test above consumes with `collect()`, the fastest consumer
+    /// possible, so the depth-1 channel is always empty by the time the producer
+    /// reports its panic. That makes the DELIVERY of the report untested: review
+    /// round 9 changed `blocking_send` to `try_send` — one token, and the obvious
+    /// edit for anyone who dislikes parking a blocking-pool thread on the way out
+    /// of a panic — and the whole suite stayed green. With the buffer full,
+    /// `try_send` returns `Full`, the error is dropped, the channel closes, and
+    /// the consumer sees a clean end-of-stream: OI-2 reinstated verbatim, on
+    /// every read whose consumer is a batch behind.
+    ///
+    /// So this consumer deliberately does not poll until the producer has had
+    /// time to fill the buffer, and then drains slowly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_consumer_still_receives_the_panic() {
+        use futures::StreamExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        // Several batches, so the producer is well ahead of this consumer.
+        let served: Vec<RecordBatch> = [vec![7], vec![8], vec![9]]
+            .into_iter()
+            .map(|v| id_batch(v).1)
+            .collect();
+        let provider = StubDataProvider::serving_then_panicking(served);
+        let mut reader = reader_with_provider(tmp.path(), base_name, schema, provider).await;
+
+        let BaseSource { mut batches, .. } = reader.base_file_source().await.unwrap();
+
+        // Do not poll yet: let the producer fill the depth-1 channel, block on
+        // the next send, run out of batches and panic with the buffer FULL.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let mut items: Vec<Result<RecordBatch>> = Vec::new();
+        while let Some(item) = batches.next().await {
+            items.push(item);
+            // Stay behind the producer for the whole drain.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let errs: Vec<&CoreError> = items.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert_eq!(
+            errs.len(),
+            1,
+            "the panic must reach even a consumer that is a batch behind — a \
+             stream that simply ENDS here is a short result reporting success, \
+             and the consumer has no way to know it lost rows"
+        );
+        assert!(
+            format!("{}", errs[0]).contains(STUB_MID_STREAM_PANIC),
+            "and must still name the panic: {}",
+            errs[0]
+        );
+    }
+
+    /// A panic carrying a LITERAL payload is rendered, not swallowed into
+    /// `<non-string panic payload>`.
+    ///
+    /// `panic_message` has two arms. `panic!("{x}")` yields a `String`; a bare
+    /// `panic!("literal")` yields a `&'static str` — and so do `unwrap()`,
+    /// `expect(..)`, `assert!(..)` and arrow-rs's own panics on importing a
+    /// malformed `ArrowArray`, which is the case this whole seam exists for.
+    ///
+    /// Only the `String` arm was reachable from a test, because the one stub
+    /// interpolated its message. Review round 9 deleted the `&'static str` arm as
+    /// redundant and the suite stayed green — every literal panic would have
+    /// arrived caught but unreadable, which is half the fix.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_literal_panic_payload_is_still_rendered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider =
+            StubDataProvider::serving_then_panicking_with_a_literal(vec![id_batch(vec![7]).1]);
+        let mut reader = reader_with_provider(tmp.path(), base_name, schema, provider).await;
+
+        let BaseSource { batches, .. } = reader.base_file_source().await.unwrap();
+        let items: Vec<Result<RecordBatch>> = batches.collect().await;
+
+        let errs: Vec<&CoreError> = items.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert_eq!(errs.len(), 1, "the literal panic must still fail the read");
+        let msg = format!("{}", errs[0]);
+        assert!(
+            msg.contains(STUB_LITERAL_PANIC),
+            "a `&'static str` payload must be RENDERED, not reported as an \
+             unrecognised payload — a caught panic nobody can read is half a \
+             fix: {msg}"
+        );
+    }
+
+    /// The control: the same fixture WITHOUT the panic ends cleanly, with no
+    /// spurious `Err`.
+    ///
+    /// Without it, a `served_batch_stream` that appended an error to every stream
+    /// would pass the test above.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_well_behaved_provider_stream_ends_without_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::serving(vec![id_batch(vec![7, 8]).1]);
+        let mut reader = reader_with_provider(tmp.path(), base_name, schema, provider).await;
+
+        let BaseSource { batches, .. } = reader.base_file_source().await.unwrap();
+        let items: Vec<Result<RecordBatch>> = batches.collect().await;
+
+        assert_eq!(items.len(), 1, "one batch, and nothing after it");
+        assert!(
+            items[0].is_ok(),
+            "a clean stream must not acquire an error on the way out"
+        );
+    }
+
+    /// Off a tokio runtime, the provider is DECLINED rather than allowed to
+    /// panic inside `spawn_blocking`.
+    ///
+    /// `HoodieFileGroupReader` and `with_base_file_provider` are both `pub`, so a
+    /// downstream crate can inject a provider and drive the read on any executor.
+    /// `served_batch_stream` hands the served reader to `spawn_blocking`, which
+    /// panics with no runtime — a panic from deep inside a stream the caller did
+    /// not write, on a path nothing documented (ISSUES OI-22).
+    ///
+    /// Declining is the same degradation a wrong schema or an unimportable stream
+    /// gets: correct results from object storage, counted as a fallback.
+    ///
+    /// Driven with `futures::executor::block_on`, which is NOT a tokio runtime —
+    /// the whole point. Note this test is deliberately not `#[tokio::test]`.
+    #[test]
+    fn off_a_tokio_runtime_the_provider_is_declined_rather_than_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        // The stub WOULD serve [7, 8]; seeing [1, 2] proves it was declined.
+        let provider = StubDataProvider::serving(vec![id_batch(vec![7, 8]).1]);
+
+        let out = futures::executor::block_on(async {
+            let mut reader =
+                reader_with_provider(tmp.path(), base_name, schema, provider.clone()).await;
+            let live = reader.base_file_provider_live_stats();
+            let source = reader.base_file_source().await.unwrap();
+            let batch = drain_base_source(source).await;
+            let s = live.lock().unwrap();
+            (batch, s.files_served, s.storage_fallbacks)
+        });
+        let (batch, files_served, storage_fallbacks) = out;
+
+        assert_eq!(
+            id_values(&batch),
+            vec![1, 2],
+            "the FILE's rows, from object storage — [7, 8] would mean the provider \
+             was used on an executor that cannot drive its stream"
+        );
+        assert!(
+            provider.seen().is_none(),
+            "and the provider must not even be OFFERED the file: by the time it \
+             has served one, the work is already done and the panic unavoidable"
+        );
+        assert_eq!(
+            (files_served, storage_fallbacks),
+            (0, 0),
+            "nothing was served and nothing was attempted, so neither counter moves \
+             — a provider that was never asked did not 'fall back'"
+        );
+    }
+
+    /// The control: the SAME fixture on a tokio runtime IS served.
+    ///
+    /// Without it, `provider_is_usable_here` hard-wired to `false` — which
+    /// disables the provider seam entirely — passes every assertion above.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_a_tokio_runtime_the_same_fixture_is_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::serving(vec![id_batch(vec![7, 8]).1]);
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema, provider.clone()).await;
+        let live = reader.base_file_provider_live_stats();
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(id_values(&out), vec![7, 8], "served on a tokio runtime");
+        assert!(
+            provider.seen().is_some(),
+            "and the provider was offered the file"
+        );
+        assert_eq!(live.lock().unwrap().files_served, 1);
+    }
+
+    /// The three dimensions `served_schema_mismatch` DOCUMENTS and no fixture
+    /// could express: nullability and metadata are ignored, types are exact.
+    ///
+    /// Every served-shape fixture is built with `nullable: true`, no field or
+    /// schema metadata, and no dictionary types — so all three of the
+    /// comparator's stated contract claims were pinned by nothing. Review round
+    /// 10 built two mutations out of that and both survived the WHOLE workspace
+    /// suite:
+    ///
+    /// - adding `if got.is_nullable() != want.is_nullable() { … }`, which
+    ///   contradicts the doc and declines a provider that widens a non-null
+    ///   column — costing a full re-read of every such file for nothing;
+    /// - comparing a dictionary's VALUE type instead of the type exactly, which
+    ///   accepts `Dictionary(Int32, Utf8)` where `Utf8` was asked for. That one is
+    ///   in the wrong-results class: the doc calls it "a different physical
+    ///   layout", and it is the buffers `project_batch_to_schema` then
+    ///   reinterprets.
+    ///
+    /// This is row 25's lesson at one more remove, and round 9's again: the defect
+    /// is in what the fixture does not VARY, which is invisible in the assertion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_shape_check_ignores_nullability_and_metadata_but_not_dictionary_encoding() {
+        use arrow_array::{Int32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        // On disk: `id` is NOT NULL and `tag` is plain Utf8, so the footer — and
+        // therefore `intersection`, which the provider is handed — says so.
+        let on_disk_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("tag", DataType::Utf8, true),
+        ]));
+        let on_disk = RecordBatch::try_new(
+            on_disk_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        // ACCEPTED: `id` widened to nullable, and `tag` carrying field metadata
+        // the read never asked for. Both are explicitly ignored, so the provider's
+        // rows must reach the caller.
+        let mut with_meta = Field::new("tag", DataType::Utf8, true);
+        with_meta.set_metadata(
+            [("provider".to_string(), "irrelevant".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let widened = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                with_meta,
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7, 8])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .unwrap();
+
+        // DECLINED: `tag` dictionary-encoded where plain `Utf8` was asked for.
+        let dict: arrow_array::DictionaryArray<arrow_array::types::Int32Type> =
+            vec!["x", "y"].into_iter().collect();
+        let dictionary_encoded = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new(
+                    "tag",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    true,
+                ),
+            ])),
+            vec![Arc::new(Int32Array::from(vec![7, 8])), Arc::new(dict)],
+        )
+        .unwrap();
+
+        // ACCEPTED: metadata on the SCHEMA itself rather than on a field. The doc
+        // says "schema/field metadata", but every fixture here varied only the
+        // FIELD half — so bolting a `served.metadata() != wanted.metadata()` check
+        // onto the comparator passed this test, and the whole workspace with it.
+        let schema_level_metadata = RecordBatch::try_new(
+            Arc::new(
+                Schema::new(vec![
+                    Field::new("id", DataType::Int32, false),
+                    Field::new("tag", DataType::Utf8, true),
+                ])
+                .with_metadata(
+                    [("provider".to_string(), "irrelevant".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            ),
+            vec![
+                Arc::new(Int32Array::from(vec![7, 8])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .unwrap();
+
+        for (case, served, expect_served) in [
+            ("widened nullability + extra metadata", widened, true),
+            (
+                "metadata on the schema itself, not on a field",
+                schema_level_metadata,
+                true,
+            ),
+            (
+                "dictionary-encoded where plain was asked for",
+                dictionary_encoded,
+                false,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let base_name = "f1-0_0-1-1_001.parquet";
+            write_parquet_file(tmp.path(), base_name, &on_disk);
+
+            let provider = StubDataProvider::serving(vec![served]);
+            let mut reader = reader_with_provider(
+                tmp.path(),
+                base_name,
+                on_disk_schema.clone(),
+                provider.clone(),
+            )
+            .await;
+            let live = reader.base_file_provider_live_stats();
+
+            let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+            let ids = i32_col(&out, 0);
+            let s = live.lock().unwrap();
+
+            if expect_served {
+                assert_eq!(
+                    ids,
+                    vec![Some(7), Some(8)],
+                    "{case}: must be SERVED — the comparator documents both as \
+                     ignored, and declining costs a full re-read of every such \
+                     file for nothing"
+                );
+                assert_eq!((s.files_served, s.storage_fallbacks), (1, 0), "{case}");
+            } else {
+                assert_eq!(
+                    ids,
+                    vec![Some(1), Some(2)],
+                    "{case}: must be DECLINED — a dictionary is a different \
+                     PHYSICAL layout from the one the read asked for, and it is \
+                     the buffers that get reinterpreted"
+                );
+                assert_eq!((s.files_served, s.storage_fallbacks), (0, 1), "{case}");
+            }
+        }
+    }
+
+    /// The nullability exemption is TOP-LEVEL ONLY — pinned, not fixed.
+    ///
+    /// `served_schema_mismatch` compares `got.data_type() != want.data_type()`.
+    /// On a flat column that cannot see `nullable` at all, which is what makes the
+    /// documented exemption true. On a nested one it delegates to `DataType`'s
+    /// `PartialEq`, which compares the child `Field`s — and `Field::eq` includes
+    /// `nullable` and `metadata`. So the exact difference the test above proves is
+    /// IGNORED on `id` is ENFORCED one level down inside a `Struct`.
+    ///
+    /// No fixture in this file used a nested column, so nothing expressed that
+    /// asymmetry and the doc read as though the exemption were uniform. This pins
+    /// the behaviour the code actually has; the doc now says the same thing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_shape_checks_nullability_exemption_is_top_level_only() {
+        use arrow_array::{ArrayRef, Int32Array, StructArray};
+        use arrow_schema::{DataType, Field, Fields, Schema};
+
+        let child_non_null = Arc::new(Field::new("inner", DataType::Int32, false));
+        let child_nullable = Arc::new(Field::new("inner", DataType::Int32, true));
+
+        let on_disk_fields = Fields::from(vec![child_non_null.clone()]);
+        let on_disk_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(on_disk_fields.clone()),
+            true,
+        )]));
+        let on_disk = RecordBatch::try_new(
+            on_disk_schema.clone(),
+            vec![Arc::new(StructArray::new(
+                on_disk_fields,
+                vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+                None,
+            ))],
+        )
+        .unwrap();
+
+        // The CHILD widened to nullable — the same widening the flat `id` column
+        // is served for two tests above.
+        let served_fields = Fields::from(vec![child_nullable.clone()]);
+        let served = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                DataType::Struct(served_fields.clone()),
+                true,
+            )])),
+            vec![Arc::new(StructArray::new(
+                served_fields,
+                vec![Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef],
+                None,
+            ))],
+        )
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::serving(vec![served]);
+        let mut reader = reader_with_provider(
+            tmp.path(),
+            base_name,
+            on_disk_schema.clone(),
+            provider.clone(),
+        )
+        .await;
+        let live = reader.base_file_provider_live_stats();
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert!(
+            provider.seen().is_some(),
+            "fixture check — the provider must have been offered the file"
+        );
+        assert_eq!(
+            out.num_rows(),
+            2,
+            "the file's two rows must reach the caller either way"
+        );
+        let s = live.lock().unwrap();
+        assert_eq!(
+            (s.files_served, s.storage_fallbacks),
+            (0, 1),
+            "a child-only nullability widening IS declined: the exemption the doc              promises is top-level only, because `Field::eq` inside a nested              `DataType` compares `nullable`"
+        );
+    }
+
+    /// The control for the test above: the SAME fixture, with the schema the
+    /// provider was actually asked for, is served.
+    ///
+    /// Without it, `served_schema_mismatch` returning `Some` unconditionally — or
+    /// the call site declining every serve — passes every assertion above while
+    /// disabling the provider path entirely.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_served_stream_at_the_right_schema_is_still_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::serving(vec![id_batch(vec![7, 8]).1]);
+        let mut reader = reader_with_provider(tmp.path(), base_name, schema, provider).await;
+        let live = reader.base_file_provider_live_stats();
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            id_values(&out),
+            vec![7, 8],
+            "a matching schema is served — the PROVIDER's rows reach the caller"
+        );
+        let s = live.lock().unwrap();
+        assert_eq!(s.files_served, 1);
+        assert_eq!(s.storage_fallbacks, 0);
     }
 
     /// `read()` snapshots the shared slot into `read_stats` once the merge has
@@ -4305,6 +6247,13 @@ mod tests {
             reader_with_provider(tmp.path(), base_name, schema.clone(), provider.clone()).await;
         // Partition fields are read off the table config, so set one and prove it
         // is parsed rather than passed through verbatim (note the stray space).
+        //
+        // The partition PATH is set non-empty on purpose. It used to be `""`, and
+        // the assertion below then read `partition_path == ""` — which
+        // `partition_path: ""` hard-wired at the seam satisfies exactly as well.
+        // The path is the only input a provider has for reconstructing partition
+        // columns, so a provider handed an empty one emits null partition values
+        // into batches presented at the projected schema.
         {
             let ctx = Arc::get_mut(&mut reader.reader_context).expect("sole owner in test");
             ctx.table_config.insert(
@@ -4312,14 +6261,32 @@ mod tests {
                 "city, ts".to_string(),
             );
         }
+        reader.input_split = InputSplit::new(
+            Some(base_name.to_string()),
+            None,
+            Vec::new(),
+            "city=sf/ts=2024".to_string(),
+        );
+        // A data schema DISTINCT from the projected one, so the assertion below
+        // cannot pass by both being `None` — which is how the fixture stood when
+        // the assertion was first written, making it vacuous.
+        let data_schema: SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int32, true),
+            arrow_schema::Field::new("city", arrow_schema::DataType::Utf8, true),
+        ]));
+        reader.schema_handler.data_schema = Some(data_schema.clone());
         let expected_gate = reader.base_read_pushdown_is_safe();
+        let expected_uri = join_url_segments(&reader.storage.base_url, &[base_name])
+            .map(|u| u.to_string())
+            .expect("the fixture's base url joins");
         let _ = reader.base_file_source().await.unwrap();
 
         let seen = provider.seen().expect("provider called");
-        assert!(
-            seen.file_uri.ends_with(base_name),
-            "request must carry the base file's own URI, got {}",
-            seen.file_uri
+        assert_eq!(
+            seen.file_uri, expected_uri,
+            "request must carry the base file's ABSOLUTE URI. `ends_with(base_name)` \
+             was the old assertion and a table-RELATIVE path satisfies it just as \
+             well — but a provider keys the file by this string"
         );
         assert_eq!(
             seen.projected_schema, schema,
@@ -4339,8 +6306,17 @@ mod tests {
             "partition fields must be split and trimmed"
         );
         assert_eq!(
-            seen.partition_path, "",
-            "the split's partition path is passed through as-is"
+            seen.partition_path, "city=sf/ts=2024",
+            "the split's partition path is passed through as-is — it is the only \
+             input a provider has for reconstructing partition columns"
+        );
+        assert_eq!(
+            seen.data_schema.as_ref(),
+            Some(&data_schema),
+            "and the table's data schema, which is how a provider resolves those \
+             partition columns' TYPES. Asserted against the fixture's own schema, \
+             not against the reader's field — comparing the reader to itself would \
+             pass under `data_schema: None` at the seam"
         );
     }
 
@@ -4688,9 +6664,14 @@ mod tests {
     ///
     /// This pins the property that makes that safe — the served stream's own task
     /// holds a strong reference — by dropping EVERY other reference and checking
-    /// the provider is still alive. Deleting `let _provider_kept_alive = provider;`
-    /// from `served_batch_stream` fails it, which is the point: that binding looks
-    /// like dead code and is not.
+    /// the provider is still alive. Removing the `_provider` field from
+    /// `ServedReader` fails it, and so does capturing `served.reader` instead of
+    /// `served` — which is how it actually broke once, and is the shape the RED
+    /// proof reproduces. The field looks like dead code and is not.
+    ///
+    /// What this test does NOT pin is the ORDER the two drop in;
+    /// [`a_served_readers_release_runs_before_the_providers_destroy`] owns that,
+    /// and without it swapping `ServedReader`'s two fields passes every test here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped() {
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -4772,6 +6753,236 @@ mod tests {
             dropped.load(Relaxed),
             "and it must be released once the stream is exhausted, or the \
              reference is a leak rather than a lifetime extension"
+        );
+    }
+
+    /// **The producer STOPS when the consumer drops the stream.**
+    ///
+    /// `served_batch_stream`'s doc rests on this in three places — "dropping the
+    /// returned stream drops the receiver, the next `blocking_send` fails, and
+    /// the producer returns", the bound on how far ahead it may run, and the
+    /// claim that a cancelled read costs at most two wasted batches. Nothing
+    /// pinned it: `a_served_reader_runs_two_batches_ahead_and_no_further` drops
+    /// the stream and then asserts nothing about what happens next.
+    ///
+    /// So `if tx.blocking_send(projected).is_err() || was_err` → `&& was_err`
+    /// compiled, tripped no lint, and passed every test — while turning a
+    /// cancelled query into a hot loop that pulls the provider to exhaustion
+    /// (the whole base file, for a read nobody is reading) and re-polls a reader
+    /// that has already returned an error, which for an FFI `ArrowArrayStream` is
+    /// use-after-error on a C object.
+    ///
+    /// The probe serves far more batches than the read-ahead, so "it stopped" and
+    /// "it ran out" are distinguishable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dropped_stream_stops_the_producer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let threads = Arc::new(StdMutex::new(Vec::new()));
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), base_name, schema).await;
+        reader.base_file_provider = Some(Arc::new(ProbeProvider {
+            batches: 500,
+            threads: threads.clone(),
+            block_on_each_next: false,
+        }));
+
+        let mut batches = reader.base_file_source().await.unwrap().batches;
+        let _first = batches.next().await.expect("a first batch").expect("ok");
+        drop(batches);
+
+        // Let the producer notice. It is parked in `blocking_send`, so the drop
+        // of the receiver is what wakes it.
+        // THREE consecutive stable samples, not one. The producer calls `next()`
+        // before `blocking_send`, so a blocking-pool thread starved for a single
+        // 10ms window would look settled and then legitimately pull once more —
+        // a false FAILURE under load. (Not a false pass: the `< 500` assertion
+        // below is what excludes "it finished".)
+        let pulled = || threads.lock().unwrap().len();
+        let mut settled = pulled();
+        let mut stable = 0;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let now = pulled();
+            if now == settled {
+                stable += 1;
+                if stable >= 3 {
+                    break;
+                }
+            } else {
+                stable = 0;
+                settled = now;
+            }
+        }
+        let after_settling = pulled();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        assert_eq!(
+            pulled(),
+            after_settling,
+            "the producer must STOP once the consumer drops the stream — it is \
+             still pulling, so a cancelled read is draining the whole served file"
+        );
+        assert!(
+            after_settling < 500,
+            "and it must stop EARLY, not merely finish: {after_settling} of 500 \
+             batches pulled for a read that took one"
+        );
+    }
+
+    /// **The served reader is released BEFORE the provider's `destroy(ctx)`.**
+    ///
+    /// `a_served_stream_keeps_its_provider_alive_after_the_reader_is_dropped`
+    /// pins that the provider outlives the stream. It does NOT pin the order the
+    /// two are released in, and the order is the half that matters to the C ABI:
+    /// the served `ArrowArrayStream`'s `release` callback points into the
+    /// provider's `ctx`, so releasing the provider first is the same
+    /// use-after-free `OI-1` was raised to close — just reached from the other
+    /// end.
+    ///
+    /// That order is supplied by `ServedReader`'s FIELD DECLARATION ORDER, and
+    /// swapping two fields is an entirely plausible tidy-up that compiles and
+    /// (without this test) passes everything: the liveness test still sees the
+    /// provider alive during the drain and released after it. Three separate doc
+    /// comments assert the order is "structural"; this is what makes that true
+    /// rather than asserted.
+    ///
+    /// The probe is the reader itself: its `Drop` reads the provider's flag and
+    /// records whether the provider had already gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_served_readers_release_runs_before_the_providers_destroy() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+        /// Set when the provider is dropped — i.e. when `destroy(ctx)` would run.
+        ///
+        /// `SeqCst` throughout, not `Relaxed`: the assertion below reads one flag
+        /// having polled on another, and under the mutation this test exists to
+        /// kill the two stores happen in the opposite order. With `Relaxed` the
+        /// read can land between them and report GREEN on the mutation.
+        #[derive(Clone)]
+        struct ProviderGone(Arc<AtomicBool>);
+        impl Drop for ProviderGone {
+            fn drop(&mut self) {
+                self.0.store(true, SeqCst);
+            }
+        }
+
+        /// Reads `ProviderGone` in its own `Drop`, which is exactly what a C
+        /// stream's `release` callback does when it touches `ctx`.
+        struct ReleaseProbe {
+            schema: SchemaRef,
+            remaining: usize,
+            provider_gone: Arc<AtomicBool>,
+            saw_provider_gone: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl Drop for ReleaseProbe {
+            fn drop(&mut self) {
+                // Record the observation BEFORE announcing that we ran, so a
+                // waiter that sees `dropped` is guaranteed to see the value too.
+                self.saw_provider_gone
+                    .store(self.provider_gone.load(SeqCst), SeqCst);
+                self.dropped.store(true, SeqCst);
+            }
+        }
+        impl Iterator for ReleaseProbe {
+            type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.remaining == 0 {
+                    return None;
+                }
+                self.remaining -= 1;
+                Some(Ok(RecordBatch::new_empty(self.schema.clone())))
+            }
+        }
+        impl arrow_array::RecordBatchReader for ReleaseProbe {
+            fn schema(&self) -> SchemaRef {
+                self.schema.clone()
+            }
+        }
+
+        struct ReleaseOrderProvider {
+            gone: ProviderGone,
+            saw_provider_gone: Arc<AtomicBool>,
+            probe_dropped: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl crate::file_group::reader_v2::base_file_provider::BaseFileDataProvider
+            for ReleaseOrderProvider
+        {
+            async fn try_base_file(
+                &self,
+                req: BaseFileDataRequest<'_>,
+            ) -> (
+                Option<Box<dyn arrow_array::RecordBatchReader + Send + 'static>>,
+                BaseFileProviderStats,
+            ) {
+                (
+                    Some(Box::new(ReleaseProbe {
+                        schema: req.projected_schema.clone(),
+                        remaining: 2,
+                        provider_gone: self.gone.0.clone(),
+                        saw_provider_gone: self.saw_provider_gone.clone(),
+                        dropped: self.probe_dropped.clone(),
+                    })),
+                    BaseFileProviderStats {
+                        files_served: 1,
+                        ..Default::default()
+                    },
+                )
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider_gone = Arc::new(AtomicBool::new(false));
+        let saw_provider_gone = Arc::new(AtomicBool::new(false));
+        let probe_dropped = Arc::new(AtomicBool::new(false));
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), base_name, schema).await;
+        reader.base_file_provider = Some(Arc::new(ReleaseOrderProvider {
+            gone: ProviderGone(provider_gone.clone()),
+            saw_provider_gone: saw_provider_gone.clone(),
+            probe_dropped: probe_dropped.clone(),
+        }));
+
+        let source = reader.base_file_source().await.unwrap();
+        drop(reader);
+        let out = drain_base_source(source).await;
+        assert_eq!(out.num_rows(), 0, "the probe serves empty batches");
+
+        // Poll on the PROBE's flag, not the provider's. Under the mutation this
+        // test exists to kill, the provider is released FIRST, so waiting on
+        // `provider_gone` would let the assertion run before the probe had made
+        // its observation — and read a default `false`, i.e. report GREEN on the
+        // mutation. The probe's flag is set after its observation, so seeing it
+        // guarantees the value is there.
+        for _ in 0..200 {
+            if probe_dropped.load(SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            probe_dropped.load(SeqCst),
+            "fixture check: the served reader must have been released by now, or \
+             the assertion below has not been exercised at all"
+        );
+        assert!(
+            provider_gone.load(SeqCst),
+            "fixture check: and the provider too, or the ordering below is not \
+             the one this test is about"
+        );
+        assert!(
+            !saw_provider_gone.load(SeqCst),
+            "the served reader was released AFTER the provider — a C stream's \
+             release callback would be reading a ctx that destroy() already \
+             freed. ServedReader's field order is what prevents this; check that \
+             `reader` is still declared before `_provider`"
         );
     }
 

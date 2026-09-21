@@ -67,7 +67,7 @@ use std::sync::Arc;
 ///   complete picture. A provider that fills them anyway would be double-counted
 ///   on the eager path, so leaving them zero is part of the contract (the C-ABI
 ///   adapter enforces it for C providers by zeroing them on the served path).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BaseFileProviderStats {
     /// Base files served by the provider.
     pub files_served: u64,
@@ -105,6 +105,16 @@ pub struct BaseFileProviderStats {
 }
 
 impl BaseFileProviderStats {
+    /// `files_served == local_served + remote_served` holds for a provider that
+    /// fills all three, but **NOT across a reclassified attempt**. Two paths walk
+    /// `files_served` back and increment `storage_fallbacks` when a provider says
+    /// SERVED and the stream turns out to be unusable — an unimportable C stream
+    /// (`cpp/src/provider_abi.rs`) or one whose schema is not the one that was
+    /// asked for (`base_file_source`) — and neither can know which of
+    /// `local_served`/`remote_served` to walk back with it. After either, the
+    /// identity is off by one. Do not reconcile against it; read
+    /// `files_served + storage_fallbacks` for attempts, which is exact.
+    ///
     /// Accumulate another set of counters into this one (per-base-file → per-read).
     pub fn merge(&mut self, other: &BaseFileProviderStats) {
         self.files_served += other.files_served;
@@ -129,7 +139,30 @@ pub struct BaseFileDataRequest<'a> {
     /// Absolute storage URI of the base file — the same URL the object-store read
     /// resolves to, and the identity a provider is expected to key the file by.
     pub file_uri: &'a str,
-    /// The projected ("intersection") schema the read wants back.
+    /// The projected ("intersection") schema the read wants back — one field per
+    /// column of the read's required schema that is actually PRESENT in this
+    /// file's footer, in the file's own order and carrying the file's own types
+    /// (see the Values contract on [`BaseFileDataProvider::try_base_file`] for why
+    /// the type may be a lie, and why you must serve it anyway).
+    ///
+    /// **This is CHECKED.** The served stream's declared schema is compared
+    /// against it — the field COUNT, and each field's NAME and DATA TYPE,
+    /// positionally — and a stream that differs is DECLINED: the base file is read
+    /// from object storage instead and the attempt is reclassified from a serve to
+    /// a storage fallback. Nullability and field/schema metadata are deliberately
+    /// NOT compared, so widening a non-null column to nullable, or carrying extra
+    /// metadata, is accepted.
+    ///
+    /// Serving FEWER fields is the dangerous direction, not the lenient one.
+    /// Batches are resolved against the read schema BY NAME and a name that is not
+    /// found is null-filled — correct for a column genuinely absent from an older
+    /// base file, and precisely how a dropped column becomes a column of nulls in
+    /// a read that reports success. Every field here came out of THIS file's
+    /// footer, so none of them can be legitimately absent from a serve of it.
+    ///
+    /// Mirrored in `cpp/src/provider_abi.rs`'s `HudiBaseFileDataRequest` and in
+    /// `cpp/include/hudi_base_file_data_provider.h`. Three mirrors of one
+    /// contract; round 8 found the C one saying the opposite of the code.
     pub projected_schema: &'a SchemaRef,
     /// Whether it is safe to apply a pushed predicate **to this file**. A provider
     /// that pushes a predicate must honor it: when `false`, serve unfiltered so a
@@ -160,6 +193,20 @@ pub struct BaseFileDataRequest<'a> {
     pub partition_fields: &'a [String],
     /// The table's data schema, used to resolve partition-column types.
     pub data_schema: Option<&'a SchemaRef>,
+    // NOTE — the KEY PREDICATE is deliberately not part of this request.
+    //
+    // The object-store read threads `reader_context.key_predicate` through
+    // `base_read_options`, so a format that can seek narrows which blocks it
+    // reads. A served file gets no such hint and returns every row, which is
+    // correct but not identical work — the one qualification on "a served file
+    // and a read file are indistinguishable downstream" elsewhere in this file.
+    // Inert today, but NOT because the predicate is never set: it is `None` at
+    // every site that can inject a provider (the C++ bridge), while
+    // `crates/jvm-ffi/src/file_group_v2.rs` builds one from `req.lookup_keys` and
+    // `crates/core/src/metadata/table/v2_reader.rs` sets one for metadata-table
+    // lookups — neither of which injects a provider. So widening this seam is
+    // REQUIRED before either of those paths ever does, and is a deliberate
+    // decision for whoever needs it rather than an oversight.
 }
 
 /// A pluggable source that may serve a base file instead of the object-store
@@ -183,6 +230,31 @@ pub trait BaseFileDataProvider: Send + Sync {
     /// the client-side setup counters for this attempt (a fallback still reports
     /// its timings; see [`BaseFileProviderStats`] for which counters the provider
     /// fills versus which hudi-core fills during drain).
+    ///
+    /// ## Values contract — serve the file's PHYSICAL values, unaltered
+    ///
+    /// `projected_schema` is the intersection of the read's required schema with
+    /// **the base file's own footer**, so on a file carrying the apache/hudi#18132
+    /// mislabel it carries the LIE: a column the file labels tz-aware micros whose
+    /// stored i64s are millis is presented here as micros. Serve the stored i64s
+    /// anyway. hudi-core applies the logical-type repair to every served batch on
+    /// the way out — the same `project_batch_to_schema` the object-store read
+    /// applies — which RELABELS that column to the table's unit and leaves the
+    /// value untouched.
+    ///
+    /// So a provider that "helpfully" rescales the stored millis up into the
+    /// declared micros unit hands back a value 1000x too large, which the relabel
+    /// then reinterprets AS millis — every such timestamp lands roughly three
+    /// orders of magnitude in the future, silently. hudi-core contributes no
+    /// arithmetic on this pairing: the repair arm rebuilds the array's `ArrayData`
+    /// with a new `DataType` and never touches a value
+    /// (`schema::batch_evolution`). The one arm that does divide is the NTZ
+    /// (local-timestamp) pairing, which the #18132 repair deliberately does not
+    /// reach.
+    ///
+    /// The rule is the same one [`BaseFileDataRequest::can_push_predicate`] rests
+    /// on: a served file and a read file must be indistinguishable downstream, and
+    /// the object-store read hands over the raw i64.
     ///
     /// ## Streaming / threading contract
     /// The returned reader is consumed lazily rather than drained here, so the
