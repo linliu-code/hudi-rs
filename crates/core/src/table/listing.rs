@@ -136,10 +136,12 @@ impl FileLister {
                             .push(log_file);
                     }
                     Err(e) => {
-                        // We don't support cdc log files yet, hence skipping error when parsing
-                        // fails. However, once we support all data files, we should return error
-                        // here because we expect all files to be either base files or log files,
-                        // after excluding the unintended files.
+                        // Skipping rather than failing, because a partition may hold names
+                        // this parser does not model. `.cdc` log files are NOT among them
+                        // any more — m22 gave the marker its own field, so they parse like
+                        // any other log file. Once every data file is modelled we should
+                        // return an error here instead, because we expect all files to be
+                        // either base files or log files after excluding the unintended ones.
                         log::warn!("Failed to create a log file: {e}");
                         continue;
                     }

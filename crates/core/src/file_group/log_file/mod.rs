@@ -44,22 +44,31 @@ pub mod scanner;
 ///   If `None`, the commit is still pending and the file should not be included in queries.
 ///
 /// Ordering ([Ord]) is by `timestamp` (the deltaCommitTime / request instant) → `version`
-/// → `write_token`, mirroring the first three keys of Java's
+/// → `write_token` → `suffix`, mirroring all four keys of Java's
 /// `HoodieLogFile.getLogFileComparator`. Completion time is NOT used for ordering — only
 /// for slice association and committed-file filtering.
 ///
-/// Two further keys, `extension` then `file_id`, follow. They are **not** gold keys (Java's
-/// 4th key is the `.cdc` `suffix`, a field hudi-rs does not parse yet, and Java never
-/// compares `fileId` at all). They exist so that **no two files with distinct `file_name()`
-/// fields compare `Equal`** — the key set now covers every field `file_name()` interpolates,
-/// so a `BTreeSet<LogFile>` cannot silently drop one of them. Neither can reorder anything
-/// the gold orders: they only separate files the first three keys tie.
+/// That 4th key, `suffix`, is Java's `getSuffix()` — the optional `.cdc` marker — so the ordering
+/// matches `getLogFileComparator` on all four of its keys.
+///
+/// Two further keys, `extension` then `file_id`, follow those. They are **not** gold keys
+/// (Java compares neither). They exist so that **no two files with distinct `file_name()`
+/// fields compare `Equal`** — the key set covers every field `file_name()` interpolates, so a
+/// `BTreeSet<LogFile>` cannot silently drop one of them. Neither can reorder anything the gold
+/// orders: they only separate files all four gold keys tie.
 ///
 /// The converse of that guarantee does NOT hold, and is not this type's to fix: [PartialEq]
 /// compares the *formatted* `file_name()`, which is lossy across the `_` separators, so two
 /// different field-sets can render one name and compare `Equal` while `cmp` says otherwise
 /// (`{file_id: "a", timestamp: "b_c"}` and `{file_id: "a_b", timestamp: "c"}`). Unreachable
 /// through `parse_file_name`, which splits on the first `_`, but the fields are `pub`.
+///
+/// ⚠️ **Adding a field here is a breaking change for downstream struct-literal
+/// construction.** Every field is `pub` and the type is deliberately NOT
+/// `#[non_exhaustive]` — making it so now would forbid literal construction
+/// outright, which is a larger break than the one it prevents. `suffix` was added
+/// this way in m22; if you add another, say so in its commit message, because
+/// nothing in the type system will.
 #[derive(Clone, Debug)]
 pub struct LogFile {
     pub file_id: String,
@@ -75,10 +84,22 @@ pub struct LogFile {
     /// (e.g., reaches size limit) within the same delta commit by the same writer.
     pub version: u32,
     pub write_token: String,
+    /// Java's `getSuffix()` — `FSUtils.LOG_FILE_PATTERN` group 10, the optional
+    /// `.cdc` marker on a change-data-capture log file.
+    ///
+    /// `""` when the file name carries no marker, mirroring Java's
+    /// `matcher.group(10) == null ? "" : matcher.group(10)`. Stored WITH its
+    /// leading dot, as Java stores it, so it appends to the write token without a
+    /// separator in [`Self::file_name`].
+    pub suffix: String,
     pub file_metadata: Option<FileMetadata>,
 }
 
 const LOG_FILE_PREFIX: char = '.';
+
+/// Java's `HoodieCDCUtils.CDC_LOGFILE_SUFFIX`. The only value `suffix` can take
+/// other than `""`: `LOG_FILE_PATTERN`'s group 10 is the literal `(\.cdc)?`.
+const CDC_LOGFILE_SUFFIX: &str = ".cdc";
 
 impl LogFile {
     /// Whether a file name is a log file's rather than a base file's.
@@ -97,10 +118,15 @@ impl LogFile {
     /// File name format:
     ///
     /// ```text
-    /// .[File Id]_[Base commit or deltacommit's timestamp].[Log File Extension].[Log File Version]_[File Write Token]
+    /// .[File Id]_[Base commit or deltacommit's timestamp].[Log File Extension].[Log File Version]_[File Write Token][.cdc]
     /// ```
-    /// TODO support `.cdc` suffix
-    fn parse_file_name(file_name: &str) -> Result<(String, String, String, u32, String)> {
+    ///
+    /// The trailing `.cdc` is optional and is Java's `LOG_FILE_PATTERN` group 10,
+    /// returned here as the last tuple element. It is stripped off the write
+    /// token rather than left glued to it: Java's group 6 is the write token
+    /// ALONE, and its comparator orders on the two separately — write token
+    /// third, suffix fourth.
+    fn parse_file_name(file_name: &str) -> Result<(String, String, String, u32, String, String)> {
         let err_msg = format!("Failed to parse file name '{file_name}' for log file.");
 
         if !file_name.starts_with(LOG_FILE_PREFIX) {
@@ -116,6 +142,13 @@ impl LogFile {
         let (middle, file_write_token) = rest
             .rsplit_once('_')
             .ok_or_else(|| CoreError::FileGroup(err_msg.clone()))?;
+
+        // Group 10: the `.cdc` marker rides on the END of the name, after the
+        // write token, so it has to come off before the token is validated.
+        let (file_write_token, suffix) = match file_write_token.strip_suffix(CDC_LOGFILE_SUFFIX) {
+            Some(token) => (token, CDC_LOGFILE_SUFFIX),
+            None => (file_write_token, ""),
+        };
 
         let parts: Vec<&str> = middle.split('.').collect();
         if parts.len() != 3 {
@@ -145,19 +178,21 @@ impl LogFile {
             log_file_extension.to_string(),
             log_file_version,
             file_write_token.to_string(),
+            suffix.to_string(),
         ))
     }
 
     #[inline]
     pub fn file_name(&self) -> String {
         format!(
-            "{prefix}{file_id}_{timestamp}.{extension}.{version}_{write_token}",
+            "{prefix}{file_id}_{timestamp}.{extension}.{version}_{write_token}{suffix}",
             prefix = LOG_FILE_PREFIX,
             file_id = self.file_id,
             timestamp = self.timestamp,
             extension = self.extension,
             version = self.version,
-            write_token = self.write_token
+            write_token = self.write_token,
+            suffix = self.suffix
         )
     }
 
@@ -190,7 +225,7 @@ impl FromStr for LogFile {
     /// it should remain `None` (v6 does not track completion times). For v8+ tables,
     /// the caller should set it from the timeline.
     fn from_str(file_name: &str) -> Result<Self, Self::Err> {
-        let (file_id, timestamp, extension, version, write_token) =
+        let (file_id, timestamp, extension, version, write_token, suffix) =
             Self::parse_file_name(file_name)?;
         Ok(LogFile {
             file_id,
@@ -199,6 +234,7 @@ impl FromStr for LogFile {
             extension,
             version,
             write_token,
+            suffix,
             file_metadata: None,
         })
     }
@@ -209,7 +245,7 @@ impl TryFrom<FileMetadata> for LogFile {
 
     fn try_from(metadata: FileMetadata) -> Result<Self> {
         let file_name = metadata.name.as_str();
-        let (file_id, timestamp, extension, version, write_token) =
+        let (file_id, timestamp, extension, version, write_token, suffix) =
             Self::parse_file_name(file_name)?;
         Ok(LogFile {
             file_id,
@@ -218,6 +254,7 @@ impl TryFrom<FileMetadata> for LogFile {
             extension,
             version,
             write_token,
+            suffix,
             file_metadata: Some(metadata),
         })
     }
@@ -257,23 +294,34 @@ impl Ord for LogFile {
         // wrong sequence whenever writers complete out of request order, which silently
         // picks a different merge winner than the Java reader for the same table.
         //
-        // Java's 4th key is `getSuffix()` — `FSUtils.LOG_FILE_PATTERN` group 10, i.e. the
-        // `.cdc` marker — and NOT the file extension. hudi-rs has no `.cdc` parsing yet
-        // (see `parse_file_name`'s TODO), so there is no field to mirror it with; when
-        // that lands it needs its OWN field and that field becomes key 4.
+        // GOLD KEY 4 — `getSuffix()`, `FSUtils.LOG_FILE_PATTERN` group 10, i.e. the `.cdc`
+        // marker, and NOT the file extension. `parse_file_name` now pulls it into its own
+        // field, so this is the gold's key and sits where the gold puts it: after the write
+        // token, before anything of hudi-rs's own.
+        //
+        // ⚠️ It has to land in the SAME change as the parsing, and that is not a style
+        // preference. Before the parse, `.cdc` was glued onto `write_token`, so a CDC file
+        // and its non-CDC sibling differed in key 3 and a `BTreeSet<LogFile>` kept both.
+        // Extracting the suffix makes them tie on keys 1-3, on `extension` and on
+        // `file_id` — so without this key they compare `Equal`, are `!=` under `Eq`, and
+        // the set silently drops one. No fixture could express that case before the parse
+        // existed, which is why it would have landed green.
+        // `cdc_and_non_cdc_siblings_do_not_collapse_in_a_btreeset` is that fixture.
         //
         // EQ-CONSISTENCY KEYS, which are hudi-rs's and not the gold's. `Ord` must agree
         // with `Eq`, and `Eq` compares the whole `file_name()` — file_id, timestamp,
-        // extension, version, write_token. A `BTreeSet<LogFile>` dedups on `Ord` returning
-        // `Equal`, so any `file_name()` field missing from the key set lets two distinct
-        // files collapse and one be silently dropped. `extension` and `file_id` are the
-        // two the gold keys do not cover. Neither can reorder anything the gold orders:
-        // they are only consulted when the first three keys tie, and a `FileSlice` holds
-        // one file group, so `file_id` is constant wherever the gold's ordering applies.
+        // extension, version, write_token, suffix. A `BTreeSet<LogFile>` dedups on `Ord`
+        // returning `Equal`, so any `file_name()` field missing from the key set lets two
+        // distinct files collapse and one be silently dropped. `extension` and `file_id`
+        // are the two the gold's four keys do not cover — Java compares neither. Neither
+        // can reorder anything the gold orders: they are only consulted when all FOUR gold
+        // keys tie, and a `FileSlice` holds one file group, so `file_id` is constant
+        // wherever the gold's ordering applies.
         self.timestamp
             .cmp(&other.timestamp)
             .then(self.version.cmp(&other.version))
             .then(self.write_token.cmp(&other.write_token))
+            .then(self.suffix.cmp(&other.suffix))
             .then(self.extension.cmp(&other.extension))
             .then(self.file_id.cmp(&other.file_id))
     }
@@ -377,6 +425,7 @@ mod tests {
             extension: "log".to_string(),
             version: 1,
             write_token: "0-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
 
@@ -387,6 +436,7 @@ mod tests {
             extension: "log".to_string(),
             version: 2,
             write_token: "0-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
 
@@ -398,6 +448,7 @@ mod tests {
             extension: "log".to_string(),
             version: 1,
             write_token: "0-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
 
@@ -409,6 +460,7 @@ mod tests {
             extension: "log".to_string(),
             version: 1,
             write_token: "1-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
 
@@ -431,6 +483,7 @@ mod tests {
             extension: "log".to_string(),
             version: 2,
             write_token: "0-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
 
@@ -441,6 +494,7 @@ mod tests {
             extension: "log".to_string(),
             version: 10,
             write_token: "0-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
 
@@ -466,6 +520,7 @@ mod tests {
             extension: "log".to_string(),
             version: 1,
             write_token: "0-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
 
@@ -477,6 +532,7 @@ mod tests {
             extension: "log".to_string(),
             version: 1,
             write_token: "0-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
 
@@ -492,6 +548,7 @@ mod tests {
             extension: "log".to_string(),
             version: 1,
             write_token: "0-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
 
@@ -527,6 +584,7 @@ mod tests {
             extension: "log".to_string(),
             version: 1,
             write_token: "0-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
 
@@ -538,6 +596,7 @@ mod tests {
             extension: "log".to_string(),
             version: 1,
             write_token: "0-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
 
@@ -568,6 +627,7 @@ mod tests {
         let later_version_earlier_token = LogFile {
             version: 2,
             write_token: "0-188-000".to_string(),
+            suffix: String::new(),
             ..earlier_request.clone()
         };
         assert_eq!(
@@ -595,6 +655,7 @@ mod tests {
             extension: "cdc".to_string(),
             version: 1,
             write_token: "0-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
         // Identical to `base` in every ordering key except extension ("cdc" < "log").
@@ -690,6 +751,7 @@ mod tests {
             extension: "log".to_string(),
             version: 1,
             write_token: "0-188-387".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         };
         let active = LogFile {
@@ -705,6 +767,213 @@ mod tests {
         let mut logs = vec![active.clone(), archived.clone()];
         logs.sort();
         assert_eq!(logs, vec![archived, active]);
+    }
+
+    /// RED-1 (m22, the `.cdc` item): the `.cdc` marker must be its own field, not
+    /// glued onto the write token. Java parses it as `LOG_FILE_PATTERN` group 10
+    /// and `getWriteToken()` as group 6; today hudi-rs's `rsplit_once('_')` hands
+    /// the whole `1-1-1.cdc` back as the write token.
+    #[test]
+    fn cdc_suffix_is_parsed_into_its_own_field() {
+        let cdc = LogFile::from_str(".file1_2.log.1_1-1-1.cdc").unwrap();
+        assert_eq!(cdc.write_token, "1-1-1", "group 6 is the write token alone");
+        assert_eq!(cdc.suffix, ".cdc", "group 10 is the suffix");
+
+        let plain = LogFile::from_str(".file1_2.log.1_1-1-1").unwrap();
+        assert_eq!(plain.write_token, "1-1-1");
+        assert_eq!(
+            plain.suffix, "",
+            "Java's getSuffix() is \"\" when group 10 is null"
+        );
+    }
+
+    /// Round-trip: `file_name()` must reproduce the name it was parsed from, with
+    /// and without the marker. `PartialEq` compares the formatted name, so a
+    /// suffix that parsed but did not render would make a CDC file `==` its
+    /// non-CDC sibling while `cmp` said otherwise.
+    #[test]
+    fn cdc_suffix_round_trips_through_file_name() {
+        for name in [
+            ".file1_2.log.1_1-1-1.cdc",
+            ".file1_2.log.1_1-1-1",
+            ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.1_0-51-115.cdc",
+        ] {
+            assert_eq!(LogFile::from_str(name).unwrap().file_name(), name);
+        }
+    }
+
+    /// A write token that merely CONTAINS "cdc" is not a suffix. Only a trailing
+    /// `.cdc` is group 10; `strip_suffix` must not fire on anything else.
+    #[test]
+    fn cdc_suffix_is_only_stripped_when_it_is_the_whole_trailing_marker() {
+        let not_a_suffix = LogFile::from_str(".file1_2.log.1_1-cdc-1").unwrap();
+        assert_eq!(not_a_suffix.write_token, "1-cdc-1");
+        assert_eq!(not_a_suffix.suffix, "");
+
+        // A name that is ONLY the marker where the write token should be leaves an
+        // empty token, which the existing emptiness check must still reject.
+        assert!(LogFile::from_str(".file1_2.log.1_.cdc").is_err());
+
+        // ⚠️ A DOUBLE marker is accepted here and rejected by Java, whose group 10 is a
+        // single `(\.cdc)?`. Only one `.cdc` comes off, so the rest stays on the token.
+        // This is a consequence of hudi-rs never validating the write token against
+        // `\d+-\d+-\d+` — which predates the suffix and is unchanged by it — rather
+        // than of the stripping. Pinned so the gap is a recorded decision and not a
+        // surprise: tightening it means validating the token's shape, which would also
+        // reject names this reader accepts today.
+        let double = LogFile::from_str(".file1_2.log.1_1-1-1.cdc.cdc").unwrap();
+        assert_eq!(double.write_token, "1-1-1.cdc");
+        assert_eq!(double.suffix, ".cdc");
+        assert_eq!(
+            double.file_name(),
+            ".file1_2.log.1_1-1-1.cdc.cdc",
+            "still round-trips"
+        );
+    }
+
+    /// **Gold parity.** Java's own `TestFSUtils.testLogFilesComparisonWithCDCFile`,
+    /// re-expressed: the same five names, the same `TreeSet`/`BTreeSet` insertion,
+    /// the same expected order.
+    ///
+    /// Gold captured at `hudi-internal origin/master-1x`
+    /// `4fbf94d3cfd4c08b82cd48a901594fec764fe413`; the comparator and
+    /// `FSUtils.LOG_FILE_PATTERN` are quoted in this effort's archived artifact
+    /// `.../09110013-09110300-.../evidence/raw/ac4-gold-master1x.txt`.
+    #[test]
+    fn log_file_ordering_matches_java_testlogfilescomparisonwithcdcfile() {
+        // makeLogFileName(fileId, ".log", deltaCommitTime, version, writeToken)
+        let log1 = LogFile::from_str(".file1_1.log.0_0-0-1").unwrap();
+        let log2 = LogFile::from_str(".file1_2.log.0_0-0-1").unwrap();
+        let log3 = LogFile::from_str(".file1_2.log.1_0-0-1").unwrap();
+        let log4 = LogFile::from_str(".file1_2.log.1_1-1-1").unwrap();
+        let log5 = LogFile::from_str(".file1_2.log.1_1-1-1.cdc").unwrap();
+
+        let mut set = std::collections::BTreeSet::new();
+        for lf in [&log4, &log2, &log5, &log1, &log3] {
+            set.insert(lf.clone());
+        }
+        assert_eq!(set.len(), 5, "no two of the gold's five names may collapse");
+        assert_eq!(
+            set.into_iter().map(|lf| lf.file_name()).collect::<Vec<_>>(),
+            vec![
+                log1.file_name(),
+                log2.file_name(),
+                log3.file_name(),
+                log4.file_name(),
+                log5.file_name(),
+            ],
+            "must match Java's TestFSUtils.testLogFilesComparisonWithCDCFile"
+        );
+    }
+
+    /// **The fixture `I-23` said could not exist before `.cdc` parsing landed, and
+    /// the reason the parse and the comparator key had to land together.**
+    ///
+    /// A CDC log file and its non-CDC sibling differ in exactly one thing: the
+    /// marker. Once the marker is its own field they tie on `timestamp`,
+    /// `version`, `write_token`, `extension` AND `file_id` — so with the gold's
+    /// 4th key absent they compare `Equal`, while `Eq` (which compares
+    /// `file_name()`) says they are different files. A `BTreeSet<LogFile>` — which
+    /// is what `FileSlice::log_files` is — then silently drops one, and the read
+    /// loses a whole log file with nothing failing.
+    ///
+    /// Before the parse this case was unreachable: `.cdc` rode on `write_token`,
+    /// so the two differed in key 3. That is why no existing fixture covers it and
+    /// why this one is the point of the change rather than an extra.
+    #[test]
+    fn cdc_and_non_cdc_siblings_do_not_collapse_in_a_btreeset() {
+        let plain = LogFile::from_str(".file-0_20250113230302428.log.1_0-188-387").unwrap();
+        let cdc = LogFile::from_str(".file-0_20250113230302428.log.1_0-188-387.cdc").unwrap();
+
+        // They tie on all three of the gold's first keys, and on both of hudi-rs's own.
+        assert_eq!(plain.timestamp, cdc.timestamp);
+        assert_eq!(plain.version, cdc.version);
+        assert_eq!(plain.write_token, cdc.write_token);
+        assert_eq!(plain.extension, cdc.extension);
+        assert_eq!(plain.file_id, cdc.file_id);
+        // ...and are different files.
+        assert_ne!(plain, cdc);
+
+        assert_eq!(
+            plain.cmp(&cdc),
+            Ordering::Less,
+            "the gold's 4th key must separate them: \"\" < \".cdc\""
+        );
+
+        let mut set = std::collections::BTreeSet::new();
+        set.insert(cdc.clone());
+        set.insert(plain.clone());
+        assert_eq!(
+            set.len(),
+            2,
+            "a CDC log file and its non-CDC sibling must both survive a BTreeSet"
+        );
+        assert_eq!(
+            set.into_iter().collect::<Vec<_>>(),
+            vec![plain, cdc],
+            "the non-CDC file sorts first, as in Java"
+        );
+    }
+
+    /// KEY ORDER: the gold's `suffix` outranks both of hudi-rs's own keys. The two
+    /// must DISAGREE in each pair or the assertion is vacuous.
+    #[test]
+    fn log_file_ordering_suffix_outranks_extension_and_file_id() {
+        let base = LogFile {
+            file_id: "file-0".to_string(),
+            timestamp: "20250113230302428".to_string(),
+            completion_timestamp: None,
+            extension: "log".to_string(),
+            version: 1,
+            write_token: "0-188-387".to_string(),
+            suffix: String::new(),
+            file_metadata: None,
+        };
+
+        // suffix vs extension: suffix-first says Less ("" < ".cdc"); extension-first
+        // says Greater ("log" > "cdc").
+        let cdc_suffix_earlier_extension = LogFile {
+            suffix: ".cdc".to_string(),
+            extension: "cdc".to_string(),
+            ..base.clone()
+        };
+        assert_eq!(
+            base.cmp(&cdc_suffix_earlier_extension),
+            Ordering::Less,
+            "suffix must take precedence over extension"
+        );
+
+        // suffix vs file_id: suffix-first says Less; file_id-first says Greater.
+        let cdc_suffix_earlier_file_id = LogFile {
+            suffix: ".cdc".to_string(),
+            file_id: "file-".to_string(),
+            ..base.clone()
+        };
+        assert_eq!(
+            base.cmp(&cdc_suffix_earlier_file_id),
+            Ordering::Less,
+            "suffix must take precedence over file_id"
+        );
+
+        // ...and the write token still outranks the suffix, as in Java, which
+        // compares the token before it ever looks at the suffix. The two keys must
+        // CONFLICT or the assertion is vacuous, so the pair below gives the EARLIER
+        // token the LATER suffix: token-first says Less ("0-188-387" < "0-188-999"),
+        // suffix-first says Greater (".cdc" > "").
+        let later_token_earlier_suffix = LogFile {
+            write_token: "0-188-999".to_string(),
+            suffix: String::new(),
+            ..base.clone()
+        };
+        let earlier_token_later_suffix = LogFile {
+            suffix: ".cdc".to_string(),
+            ..base.clone()
+        };
+        assert_eq!(
+            earlier_token_later_suffix.cmp(&later_token_earlier_suffix),
+            Ordering::Less,
+            "logWriteToken must take precedence over suffix, as in Java's LogFileComparator"
+        );
     }
 }
 

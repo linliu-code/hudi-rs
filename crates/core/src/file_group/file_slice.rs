@@ -420,6 +420,7 @@ mod tests {
             extension: "log".to_string(),
             version: 1,
             write_token: "0-1-1".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         });
         // Later request instant (20...310000), COMPLETES earlier (20...315000).
@@ -430,6 +431,7 @@ mod tests {
             extension: "log".to_string(),
             version: 1,
             write_token: "0-1-1".to_string(),
+            suffix: String::new(),
             file_metadata: None,
         });
 
