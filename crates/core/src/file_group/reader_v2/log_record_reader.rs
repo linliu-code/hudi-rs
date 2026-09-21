@@ -165,8 +165,14 @@ pub fn forward_scan_pass1(
     let mut total_log_blocks: u64 = 0;
     let mut total_corrupt_blocks: u64 = 0;
     let mut total_rollbacks: u64 = 0;
+    // Per-gate skip counts, reported once in the Pass 1 summary below. The
+    // per-block skip lines are `trace!`, so these are what keeps "why rows
+    // disappeared" visible at `debug!` without one line per skipped block.
+    let mut skipped_future: u64 = 0;
+    let mut skipped_uncommitted: u64 = 0;
+    let mut skipped_out_of_range: u64 = 0;
 
-    log::debug!(
+    log::trace!(
         "[Pass1] forward_scan: {} total blocks, latest_instant_time={}, has_instant_range={}",
         all_blocks.len(),
         latest_instant_time,
@@ -255,9 +261,10 @@ pub fn forward_scan_pass1(
 
         // Gate 2: Future blocks → skip (instant > latestInstantTime)
         if block.block_type != BlockType::Command && instant_time.as_str() > latest_instant_time {
-            log::debug!(
+            log::trace!(
                 "[Pass1] Gate2: future block #{total_log_blocks} instant={instant_time} > {latest_instant_time}, skipped"
             );
+            skipped_future += 1;
             continue;
         }
 
@@ -272,9 +279,10 @@ pub fn forward_scan_pass1(
             && let Some(gate) = completion_gate
             && !gate.admits(&instant_time)
         {
-            log::debug!(
+            log::trace!(
                 "[Pass1] Gate3: block #{total_log_blocks} instant={instant_time} uncommitted/inflight, skipped"
             );
+            skipped_uncommitted += 1;
             continue;
         }
 
@@ -283,13 +291,14 @@ pub fn forward_scan_pass1(
             && let Some(range) = instant_range
             && range.not_in_range(&instant_time, timezone)?
         {
-            log::debug!(
+            log::trace!(
                 "[Pass1] Gate4: block #{total_log_blocks} instant={instant_time} out of range, skipped"
             );
+            skipped_out_of_range += 1;
             continue;
         }
 
-        log::debug!(
+        log::trace!(
             "[Pass1] block #{total_log_blocks} passed all gates: type={:?} instant={instant_time}",
             block.block_type,
         );
@@ -354,7 +363,7 @@ pub fn forward_scan_pass1(
                         ))
                     })?
                     .to_string();
-                log::debug!("[Pass1] ROLLBACK: removing instant={target}");
+                log::trace!("[Pass1] ROLLBACK: removing instant={target}");
                 target_rollback_instants.insert(target.clone());
                 ordered_instants_list.retain(|t| t != &target);
                 instant_to_blocks_map.remove(&target);
@@ -400,20 +409,33 @@ pub fn forward_scan_pass1(
         }
     }
 
+    // Level rule for the log scan in this file: a line emitted once per log
+    // block, per log file or per instant is `trace!`, since a file group can
+    // carry thousands of blocks and a gate skip is as frequent as an accept, and
+    // so is a line that repeats a summary already at `debug!`. A few lines emitted
+    // once per scan -- this Pass 1 summary, the Pass 2 summary, Pass 3's window
+    // plan -- are `debug!`, and carry the counts and the rolled-back instants the
+    // per-block lines would otherwise be needed for. A corrupt block keeps its
+    // `warn!` at Gate 1: it is an exception, not per-block volume.
     log::debug!(
         "[Pass1] complete: ordered_instants={ordered_instants_list:?} \
          total_blocks={total_log_blocks} corrupt={total_corrupt_blocks} \
-         rollbacks={total_rollbacks}",
+         rollbacks={total_rollbacks} rolled_back={target_rollback_instants:?} \
+         skipped_future={skipped_future} skipped_uncommitted={skipped_uncommitted} \
+         skipped_out_of_range={skipped_out_of_range}",
     );
-    for (instant, blocks) in &instant_to_blocks_map {
-        log::debug!(
-            "[Pass1]   instant={instant}: {} block(s) [{:?}]",
-            blocks.len(),
-            blocks
-                .iter()
-                .map(|b| format!("{:?}", b.block_type))
-                .collect::<Vec<_>>(),
-        );
+    // Guarded so the loop itself is skipped unless `trace!` is enabled.
+    if log::log_enabled!(log::Level::Trace) {
+        for (instant, blocks) in &instant_to_blocks_map {
+            log::trace!(
+                "[Pass1]   instant={instant}: {} block(s) [{:?}]",
+                blocks.len(),
+                blocks
+                    .iter()
+                    .map(|b| format!("{:?}", b.block_type))
+                    .collect::<Vec<_>>(),
+            );
+        }
     }
 
     Ok(Pass1Result {
@@ -478,7 +500,7 @@ pub struct Pass2Result {
 /// removed from Pass 1, so it is made loud here rather than left to a
 /// `debug_assert!` that vanishes in the release build the JNI library ships.
 pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Result<Pass2Result> {
-    log::debug!(
+    log::trace!(
         "[Pass2] reverse_scan: {} instants to process (newest→oldest)",
         pass1.ordered_instants_list.len(),
     );
@@ -757,7 +779,7 @@ impl BaseHoodieLogRecordReader {
 
         self.valid_block_instants = pass2.valid_block_instants;
 
-        log::debug!(
+        log::trace!(
             "Pass 1+2 complete: {} blocks queued, {} valid instants",
             pass2.current_instant_log_blocks.len(),
             self.valid_block_instants.len()
@@ -766,7 +788,7 @@ impl BaseHoodieLogRecordReader {
         // Pass 3: Process queued blocks (oldest → newest via pop_back).
         // Mirrors Java: if (!currentInstantLogBlocks.isEmpty() && !skipProcessingBlocks) { ... }
         if !pass2.current_instant_log_blocks.is_empty() && !skip_processing_blocks {
-            log::debug!("Merging the final data blocks");
+            log::trace!("Merging the final data blocks");
             // Oldest first, matching the pop_back the deque was built for. Taking
             // the order up front is what lets the content be fetched a window at a
             // time: the fetch happens in async code and the merge under it is
@@ -1110,7 +1132,7 @@ impl BaseHoodieLogRecordReader {
             let block = &mut ordered[idx];
             *block_num += 1;
             let instant_time = block.instant_time().unwrap_or("unknown").to_string();
-            log::debug!(
+            log::trace!(
                 "[Pass3] block #{block_num}: type={:?} instant={instant_time}",
                 block.block_type,
             );
@@ -1157,7 +1179,7 @@ impl BaseHoodieLogRecordReader {
                         self.merge_upsert_us,
                         self.record_buffer.process_data_block(block)
                     )?;
-                    log::debug!(
+                    log::trace!(
                         "[Pass3] after processing data block #{block_num}: buffer size={}",
                         self.record_buffer.size(),
                     );

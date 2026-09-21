@@ -166,6 +166,8 @@ impl HoodieMergedLogRecordReader {
         self.total_time_taken_to_read_and_merge_blocks_us = start.elapsed().as_micros() as u64;
         self.num_merged_records_in_log = self.base.record_buffer.size() as u64;
 
+        // Per-scan summaries, so `debug!`: they are this reader's only log lines,
+        // and the cheapest signal of how many records a file group's log merge made.
         log::debug!(
             "Number of log files scanned => {}",
             self.base.log_file_paths.len()
