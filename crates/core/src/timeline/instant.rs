@@ -685,6 +685,36 @@ mod tests {
             format!("{err}").contains("20241332000000"),
             "the error must name the offending value, got: {err}"
         );
+        // The POSITIVE control. Without it a change that makes EVERY 14-char
+        // timestamp fail to parse satisfies the negative case above and this test
+        // goes on passing.
+        assert!(
+            Instant::parse_datetime("20260710235017", "UTC").is_ok(),
+            "a well-formed 14-char instant must still parse"
+        );
+    }
+
+    /// A short or empty timestamp must be an ERROR, not a panic. `parse_naive_datetime`
+    /// slices `timestamp[..14]`, and across the FFI boundary a panic aborts the
+    /// process rather than unwinding — so this is a crash guard, not a niceties test.
+    /// Callers reach here with values read from data (a `_hoodie_commit_time` cell),
+    /// not only with instants parsed from well-formed file names.
+    ///
+    /// `test_validate_timestamp_errors` looks adjacent but is not this: it drives
+    /// `Instant::from_str`, a different entry point with its own length validation.
+    #[test]
+    fn test_parse_datetime_short_timestamp_errors_not_panics() {
+        for bad in ["", "2026", "2026071023501"] {
+            let res = Instant::parse_datetime(bad, "UTC");
+            assert!(
+                res.is_err(),
+                "short timestamp {bad:?} must error, not panic"
+            );
+        }
+        // The positive control for this guard lives with the malformed-14-char case in
+        // `test_parse_datetime_malformed_14_char_still_errors`, where a blanket 14-char
+        // rejection is the regression it exists to catch. Repeating it here would be a
+        // second copy of one assertion.
     }
 
     #[test]

@@ -2008,6 +2008,44 @@ mod tests {
     /// primary-key-safe. Pruning would drop base rows before the merge could
     /// update them into a match, so the gate refuses it -- and counts the
     /// refusal, because a suppressed selector otherwise reads as "no caller ever
+    /// The third state of `row_group_selector_calls`: never installed.
+    ///
+    /// The counter exists to separate "ran and pruned nothing" from "never ran",
+    /// and a gate-refused selector is a third case that also reads zero — which
+    /// is why `row_group_selector_suppressed` was added beside it. Both of those
+    /// are asserted below. This pins the BASELINE they are read against: with no
+    /// selector at all, calls AND suppressions are both zero. Without it, a
+    /// regression that incremented `calls` unconditionally would still satisfy
+    /// every other selector test, and the counter would stop answering the
+    /// question it was added for.
+    #[tokio::test]
+    async fn no_selector_installed_counts_neither_a_call_nor_a_suppression() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (tmp, base_name, schema) = three_row_groups();
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), &base_name, schema).await;
+        let volume = reader.storage.read_volume();
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(out.num_rows(), 3);
+        assert_eq!(
+            volume.row_group_selector_calls.load(Relaxed),
+            0,
+            "no selector was installed, so nothing can have called one"
+        );
+        assert_eq!(
+            volume.row_group_selector_suppressed.load(Relaxed),
+            0,
+            "and nothing was suppressed — there was nothing to suppress"
+        );
+        assert_eq!(
+            volume.row_groups_read.load(Relaxed),
+            3,
+            "every row group is read when no selector prunes"
+        );
+    }
+
     /// installed one": both are zero calls.
     #[tokio::test]
     async fn a_selector_the_gate_refuses_is_counted_not_silently_dropped() {
@@ -3066,6 +3104,18 @@ mod tests {
             1,
             "the pushed predicate keeps only the row above the threshold"
         );
+        // The row count alone does not say WHICH row survived. A predicate pushed
+        // against a rescaled column keeps exactly one row too -- the wrong one.
+        let ts = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+            .expect("an honest file keeps its declared millisecond unit");
+        assert_eq!(
+            ts.value(0),
+            ABOVE_MS,
+            "and the survivor must be the row above the threshold, by value"
+        );
     }
 
     /// The narrowing. A file mislabels `ts`, but the predicate reads `other`, so
@@ -3152,12 +3202,36 @@ mod tests {
             &[], // gate 1 disarmed
         )
         .await;
-        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
 
         assert_eq!(
             invocations.load(Relaxed),
             1,
             "an empty repair_risk_columns must skip the per-file check entirely"
+        );
+        // ...and the filter it installed must actually RUN. Counting the build alone
+        // passes for a filter that was constructed and then never applied.
+        //
+        // The count is 0 rather than internal's 1 because the fixtures differ, and
+        // deliberately: this file DECLARES micros while holding millisecond counts,
+        // and with gate 1 disarmed nothing relabels it, so the filter normalises both
+        // values from the declared unit and neither clears the threshold. The
+        // honest-file case, where the survivor is the one row above it, is the
+        // neighbouring `base_read_keeps_pushdown_when_the_file_is_honestly_labelled`.
+        //
+        // 0 is not this counter's uninformative initial value. The fixture holds two
+        // rows, and the neighbouring
+        // `base_read_declines_pushdown_when_the_file_needs_a_reinterpreting_repair`
+        // asserts that both of them reach the output when this same file is read with
+        // the repair ARMED (gate 1 on, so no filter is pushed). That test is not this
+        // read minus the filter -- it passes `&["ts"]` where this passes `&[]`, so the
+        // repair fires and relabels micros to millis -- but it does establish the row
+        // count of the fixture. So a filter that is built and then never applied
+        // returns 2 here and fails this assertion.
+        assert_eq!(
+            out.num_rows(),
+            0,
+            "the installed filter must be applied during the scan, not merely built"
         );
     }
 
@@ -3265,7 +3339,7 @@ mod tests {
         write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations);
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
 
         let mut reader = test_file_group_reader_with_row_filter(
             tmp.path(),
@@ -3284,7 +3358,14 @@ mod tests {
             0,
             "no selector was installed, so that counter cannot speak for this case"
         );
-        assert_eq!(volume.pushdown_suppressed_by_repair.load(Relaxed), 1);
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            1,
+            "the withdrawal must be counted for the row-filter side too"
+        );
+        // The counter alone cannot tell "a file was withdrawn" from "the scan ran":
+        // the consequence of the withdrawal is that the filter is never even BUILT.
+        assert_eq!(invocations.load(Relaxed), 0);
     }
 
     /// And it must stay at zero when pushdown survives, or the counter cannot
@@ -3299,7 +3380,7 @@ mod tests {
         write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Millisecond);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations);
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
 
         let mut reader = test_file_group_reader_with_row_filter(
             tmp.path(),
@@ -3313,7 +3394,20 @@ mod tests {
         let volume = reader.storage.read_volume();
         let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
 
-        assert_eq!(volume.pushdown_suppressed_by_repair.load(Relaxed), 0);
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            0,
+            "nothing was withdrawn on an honest file"
+        );
+        // `pushdown_suppressed_by_repair == 0` is that counter's INITIAL value, so it
+        // holds whenever the repair path did not fire -- including when the row filter
+        // was never built at all. Without this second assertion the test is named after
+        // pushdown surviving and pins nothing about it.
+        assert_eq!(
+            invocations.load(Relaxed),
+            1,
+            "and the row filter was actually installed"
+        );
     }
 
     #[test]

@@ -2148,6 +2148,48 @@ mod tests {
         assert_eq!(back.ordering_value, Some(OrderingValue::Long(3)));
     }
 
+    /// A spilled tombstone must come back carrying its OWN record key, not the
+    /// key it was filed under.
+    ///
+    /// `record_from_entry` reads the key from `DiskLoc::Delete { record_key }`
+    /// rather than from the map key, and the in-tree comment says why: this map
+    /// "may be keyed by base-file position (position-based merge), so
+    /// reconstructing a delete's key from the map key would silently drop the
+    /// delete after key-based fallback." That is a real and silent data-loss
+    /// path — a delete that loses its key stops matching the base row it was
+    /// meant to remove, so the deleted row comes back.
+    ///
+    /// `spilled_delete_tombstone_round_trips` above cannot see any of it: it
+    /// files the record under its own key ("del"/"del"), so the map key and the
+    /// record key are the same string and reading the wrong one is
+    /// indistinguishable. The only fixture that discriminates is one where they
+    /// DIFFER — i.e. a position-keyed map, which is exactly the case the comment
+    /// is about. (m1 ISSUES I-14 item 4's territory; see DECISIONS D-6 for why
+    /// the byte-level half of that item is NOT ported.)
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
+    #[test]
+    fn spilled_delete_tombstone_keeps_its_own_key_not_the_map_key() {
+        let mut map = SpillableRecordMap::with_config(tiny_budget_config(0));
+        // Position-based merge: the MAP key is a base-file row position, while
+        // the record carries the real Hudi record key.
+        map.insert(
+            "7".to_string(),
+            BufferedRecord::new_delete("user-42".to_string(), Some(OrderingValue::Long(3))),
+        )
+        .unwrap();
+        assert!(map.spill_fired(), "budget 0 must force the disk tier");
+
+        let back = map.get("7").unwrap().unwrap();
+        assert!(back.is_delete(), "spilled tombstone reloads as a delete");
+        assert_eq!(
+            back.record_key, "user-42",
+            "the tombstone must carry the PERSISTED record key; reconstructing it \
+             from the map key ('7') silently drops the delete after key-based fallback"
+        );
+        assert_eq!(back.ordering_value, Some(OrderingValue::Long(3)));
+    }
+
     // ── Iteration order: memory first, then disk ──────────────────────────
 
     // Exercises the on-disk spill tier, which only exists with the backend.

@@ -359,4 +359,33 @@ mod tests {
         slice.log_files = logs;
         assert_eq!(slice.total_size_bytes(), 0);
     }
+
+    /// A log-only slice reports no base file, through both accessors.
+    ///
+    /// `new_log_only` is a production constructor with no test of its own. The
+    /// field and the accessor are asserted separately because they answer
+    /// through different paths — a direct `Option` check vs building a relative
+    /// path — and the reader consults the latter to decide whether there is a
+    /// base file to read at all.
+    #[test]
+    fn a_log_only_slice_has_no_base_file() {
+        let slice = FileSlice::new_log_only(
+            "20260101000000000".to_string(),
+            "p1".to_string(),
+            "f1".to_string(),
+        );
+        assert!(
+            slice.base_file.is_none(),
+            "a log-only slice carries no base file"
+        );
+        assert_eq!(
+            slice.base_file_relative_path().unwrap(),
+            None,
+            "and no relative path to read one from"
+        );
+        assert!(
+            !slice.has_log_file(),
+            "and none attached yet — log files are added after construction"
+        );
+    }
 }

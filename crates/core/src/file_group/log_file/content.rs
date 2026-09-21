@@ -173,6 +173,18 @@ impl Decoder {
         self
     }
 
+    /// Whether a row filter is installed on this decoder.
+    ///
+    /// Test-only, and it exists because the DECISION to install one is made a
+    /// layer up (`BaseHoodieLogRecordReader::block_decoder`, gated on
+    /// `mor_pk_safe`) while the effect is only observable here. Without it the
+    /// gate can only be checked through a full log read, which is exactly the
+    /// kind of coverage that goes missing when the gate moves.
+    #[cfg(test)]
+    pub(crate) fn has_row_filter(&self) -> bool {
+        self.row_filter.is_some()
+    }
+
     /// Resolve Avro blocks up to this schema as they are read.
     ///
     /// A block records the schema it was written with, which may predate a
@@ -867,6 +879,9 @@ mod tests {
             .decode_avro_record_content(buf.as_slice(), &header)
             .expect("a producer-named writer schema must decode against a table-named reader");
 
+        // The row COUNT first: inspecting column(0).value(0) alone passes for a
+        // decode that also emits a spurious extra row.
+        assert_eq!(batches.num_data_rows(), 1);
         let col = batches.data_batches[0]
             .column(0)
             .as_any()
@@ -905,6 +920,7 @@ mod tests {
             .decode_avro_record_content(buf.as_slice(), &header)
             .expect("an unqualified producer record name must decode too");
 
+        assert_eq!(batches.num_data_rows(), 1);
         let col = batches.data_batches[0]
             .column(0)
             .as_any()
@@ -1308,6 +1324,64 @@ mod tests {
         assert_eq!(batches.num_data_batches(), 1);
         assert_eq!(batches.num_data_rows(), 3);
 
+        Ok(())
+    }
+
+    /// A partial-update PARQUET log block must stay narrow through decode.
+    ///
+    /// Ported from internal `778a7f8`
+    /// (`test_decode_parquet_partial_update_block_keeps_narrow_schema`), rewritten
+    /// against 145's `decode_parquet_record_content`, which takes a reader and
+    /// does not consult the block header (a parquet block carries its own
+    /// schema). 145 already has the AVRO twin
+    /// (`test_decode_avro_partial_update_block_keeps_narrow_schema`); this is the
+    /// parquet side of the same property, and it was the missing one.
+    ///
+    /// What it guards: the decoder must not widen or null-pad a partial block up
+    /// to the table schema. Widening here would turn "this block updates `id`"
+    /// into "this block sets `id` and nulls everything else", which the merge
+    /// would then apply as a destructive overwrite of columns the writer never
+    /// touched.
+    #[test]
+    fn test_decode_parquet_partial_update_block_keeps_narrow_schema() -> Result<()> {
+        // The table has id + name; this block carries only id.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![7])) as ArrayRef],
+        )?;
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, None)?;
+            writer.write(&batch)?;
+            writer.close()?;
+        }
+
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
+        let bytes = Bytes::from(buf);
+        let mut reader = BufReader::with_capacity(bytes.len(), Cursor::new(bytes));
+        let batches = decoder.decode_parquet_record_content(&mut reader)?;
+
+        assert_eq!(batches.num_data_rows(), 1);
+        let out = &batches.data_batches[0];
+        assert_eq!(out.num_columns(), 1, "stays narrow");
+        assert_eq!(out.schema().field(0).name(), "id");
+        Ok(())
+    }
+
+    /// An empty delete list decodes to NO delete batches, not to one empty batch.
+    ///
+    /// Ported from internal `778a7f8` (`test_decode_delete_block_empty_list`),
+    /// rewritten against 145's `decode_delete_block` helper. This pins the
+    /// decoder's early return: a block that names no keys must contribute
+    /// nothing to the merge. An empty-but-present batch would be a delete batch
+    /// with zero rows, which downstream counters and the merge iterator would
+    /// have to special-case.
+    #[test]
+    fn test_decode_delete_block_empty_list() -> Result<()> {
+        let batches = decode_delete_block(vec![])?;
+        assert_eq!(batches.num_delete_batches(), 0);
         Ok(())
     }
 
@@ -1900,5 +1974,459 @@ mod tests {
             .expect("f is fixed");
         assert_eq!(f.value(0), [1, 2, 3, 4]);
         Ok(())
+    }
+
+    // Ported from internal main by the test-differential pass (INT-MAIN 778a7f8),
+    // adapted to this branch's `Decoder::new(HudiConfigs)` + builder API. These
+    // cover log-block DECODE behaviours nothing else on the branch pins.
+    /// Zigzag-encode an Avro int/long (both share the varint form) into its body bytes.
+    fn enc_int(v: i64) -> Vec<u8> {
+        let mut n = ((v << 1) ^ (v >> 63)) as u64;
+        let mut out = Vec::new();
+        loop {
+            if n & !0x7f == 0 {
+                out.push(n as u8);
+                break;
+            } else {
+                out.push(((n & 0x7f) | 0x80) as u8);
+                n >>= 7;
+            }
+        }
+        out
+    }
+
+    /// Concatenate per-field encoded avro bytes into one record body.
+    fn avro_record_body(fields: &[Vec<u8>]) -> Vec<u8> {
+        fields.iter().flatten().copied().collect()
+    }
+
+    /// Frame avro record bodies into Hudi block content:
+    /// [4B version=3][4B record count][per record: 4B length + body].
+    fn build_avro_block_content(records: &[Vec<u8>]) -> Bytes {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&(records.len() as u32).to_be_bytes());
+        for body in records {
+            buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            buf.extend_from_slice(body);
+        }
+        Bytes::from(buf)
+    }
+
+    /// Frame a set of delete-record Avro values into delete-block content:
+    /// [4B version=3][4B dataLength][avro-binary HoodieDeleteRecordList].
+    fn build_delete_block_content(records: Vec<apache_avro::types::Value>) -> Bytes {
+        use apache_avro::types::Value;
+        let list_schema = crate::schema::delete::avro_schema_for_delete_record_list().unwrap();
+        let list_value = Value::Record(vec![(
+            "deleteRecordList".to_string(),
+            Value::Array(records),
+        )]);
+        let data = to_avro_datum(list_schema, list_value).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes()); // version
+        buf.extend_from_slice(&(data.len() as u32).to_be_bytes()); // dataLength
+        buf.extend_from_slice(&data);
+        Bytes::from(buf)
+    }
+
+    fn delete_header(instant: &str) -> HashMap<BlockMetadataKey, String> {
+        HashMap::from([(BlockMetadataKey::InstantTime, instant.to_string())])
+    }
+
+    /// Build one HoodieDeleteRecord Avro value with the given key/partition and
+    /// an optional IntWrapper ordering value (union index 2 in the orderingVal
+    /// union; `None` selects the null branch — index 0).
+    fn delete_record_value(
+        key: &str,
+        partition: &str,
+        ordering_int: Option<i32>,
+    ) -> apache_avro::types::Value {
+        use apache_avro::types::Value;
+        let ordering = match ordering_int {
+            Some(v) => Value::Union(
+                2, // IntWrapper position in the orderingVal union
+                Box::new(Value::Record(vec![("value".to_string(), Value::Int(v))])),
+            ),
+            None => Value::Union(0, Box::new(Value::Null)),
+        };
+        Value::Record(vec![
+            (
+                "recordKey".to_string(),
+                Value::Union(1, Box::new(Value::String(key.to_string()))),
+            ),
+            (
+                "partitionPath".to_string(),
+                Value::Union(1, Box::new(Value::String(partition.to_string()))),
+            ),
+            ("orderingVal".to_string(), ordering),
+        ])
+    }
+
+    /// s1 block {id:int} read with required {id:int, tag:string?}: add-column →
+    /// extended branch (gold reader-has-more-fields) → writer-only decode + projector null-fill.
+    #[test]
+    fn test_decode_avro_block_extended_add_column() {
+        let writer_json = r#"{"type":"record","name":"r","fields":[{"name":"id","type":"int"}]}"#;
+        let required_json = r#"{"type":"record","name":"r","fields":[
+            {"name":"id","type":"int"},
+            {"name":"tag","type":["null","string"],"default":null}]}"#;
+
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(required_json.to_string()));
+        let content = build_avro_block_content(&[avro_record_body(&[enc_int(7)])]);
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+
+        let batches = decoder
+            .decode_avro_record_content(content.as_ref(), &header)
+            .unwrap();
+        let batch = &batches.data_batches[0];
+        assert_eq!(batch.num_columns(), 2);
+        assert!(
+            batch.column(1).is_null(0),
+            "added column must be null-filled"
+        );
+        let id = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+        assert_eq!(id.value(0), 7);
+    }
+
+    /// writer {v: float} / required {v: double} routes through the REWRITE branch
+    /// (gold detector: reader DOUBLE with writer FLOAT → rewrite) and the
+    /// string-mediated cast must be value-exact: 0.1f32 → 0.1f64.
+    #[test]
+    fn test_decode_avro_block_extended_float_to_double_value_exact() {
+        let writer_json = r#"{"type":"record","name":"r","fields":[{"name":"v","type":"float"}]}"#;
+        let required_json =
+            r#"{"type":"record","name":"r","fields":[{"name":"v","type":"double"}]}"#;
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(required_json.to_string()));
+        // avro float = 4-byte IEEE-754 little-endian: 0.1f32 = [0xCD, 0xCC, 0xCC, 0x3D]
+        let content =
+            build_avro_block_content(&[avro_record_body(&[vec![0xCD, 0xCC, 0xCC, 0x3D]])]);
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+        let batches = decoder
+            .decode_avro_record_content(content.as_ref(), &header)
+            .unwrap();
+        let batch = &batches.data_batches[0];
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &arrow_schema::DataType::Float64
+        );
+        let v = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        assert_eq!(
+            v.value(0),
+            0.1f64,
+            "float→double must be value-exact (string-mediated)"
+        );
+    }
+
+    /// s1 block {id:int, price:int} read with required {id:long, price:double}:
+    /// spec promotions → arrow-avro resolution branch; batch comes out required-shaped.
+    #[test]
+    fn test_decode_avro_block_with_reader_schema_promotion() {
+        let writer_json = r#"{"type":"record","name":"r","fields":[
+            {"name":"id","type":"int"},{"name":"price","type":"int"}]}"#;
+        let required_json = r#"{"type":"record","name":"r","fields":[
+            {"name":"id","type":"long"},{"name":"price","type":"double"}]}"#;
+
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(required_json.to_string()));
+        let content = build_avro_block_content(&[avro_record_body(&[enc_int(7), enc_int(3)])]);
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+
+        let batches = decoder
+            .decode_avro_record_content(content.as_ref(), &header)
+            .unwrap();
+        let batch = &batches.data_batches[0];
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int64);
+        assert_eq!(batch.schema().field(1).data_type(), &DataType::Float64);
+        let id = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id.value(0), 7);
+        let price = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        assert_eq!(price.value(0), 3.0);
+    }
+
+    /// S4 — a NTZ (`local-timestamp`) micros→millis column read through the LOG decode
+    /// path must DIVIDE by 1000 (Java `DateTimeUtils.microsToMillis`), NOT reinterpret.
+    /// Java does not repair the NTZ classes (`AvroSchemaRepair.java:133-134`), so the
+    /// value flows through `rewriteRecordWithNewSchema` → arithmetic ÷1000. hudi-rs
+    /// routes NTZ through the same rewrite→project path, whose (Micros,None)→(Millis,None)
+    /// arm divides by 1000 after the S4 fix.
+    #[test]
+    fn test_log_decode_ntz_micros_to_millis_divides_like_java() {
+        use arrow_array::TimestampMillisecondArray;
+        use arrow_schema::TimeUnit;
+
+        const MICROS: i64 = 1_700_000_000_000_123;
+        let writer_json = r#"{"type":"record","name":"r","fields":[
+            {"name":"ts","type":{"type":"long","logicalType":"local-timestamp-micros"}}]}"#;
+        let required_json = r#"{"type":"record","name":"r","fields":[
+            {"name":"ts","type":{"type":"long","logicalType":"local-timestamp-millis"}}]}"#;
+
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(required_json.to_string()));
+        let content = build_avro_block_content(&[avro_record_body(&[enc_int(MICROS)])]);
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+
+        let batches = decoder
+            .decode_avro_record_content(content.as_ref(), &header)
+            .unwrap();
+        let batch = &batches.data_batches[0];
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, None),
+            "NTZ target must be tz-less (None) millis"
+        );
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(
+            col.value(0),
+            MICROS.div_euclid(1000),
+            "NTZ log path must divide by 1000 (Java microsToMillis), not reinterpret"
+        );
+        assert_ne!(
+            col.value(0),
+            MICROS,
+            "must NOT keep the raw micros i64 (that is the tz-aware reinterpret path)"
+        );
+    }
+
+    /// S3 — a mislabeled tz-AWARE `timestamp-millis` column (physically stored as
+    /// `timestamp-micros`, apache/hudi#18132) read through the LOG decode path must
+    /// REINTERPRET the i64 (keep the value, relabel the unit) — identical to the base
+    /// file path (batch_evolution reinterpret arm) and to the Java reader.
+    ///
+    /// FINDING: the log path does NOT take the arrow-avro `resolution` branch for this
+    /// pair. `record_needs_rewrite_for_extended_promotion(timestamp-micros, timestamp-millis)`
+    /// returns TRUE (the reader's logical type differs), so the block is decoded
+    /// writer-only (as `Timestamp(Micros, Some(tz))`) and then projected to the required
+    /// schema (`Timestamp(Millis, Some(tz))`), where the tz-aware reinterpret arm keeps
+    /// the i64. Java reaches the same value by repairing the writer schema first
+    /// (`HoodieAvroDataBlock.java:194-195` → `AvroSchemaRepair`) and reading via Avro
+    /// resolution. Same result, so base == log == JVM.
+    #[test]
+    fn test_log_decode_reinterprets_mislabeled_tz_aware_timestamp_matches_base() {
+        use arrow_array::{TimestampMicrosecondArray, TimestampMillisecondArray};
+        use arrow_schema::TimeUnit;
+
+        // An i64 that is ALREADY milliseconds, but the writer schema mislabels the
+        // column as timestamp-micros (#18132). 1_700_000_000_000 is 2023-11-14 as ms.
+        const STORED_MS: i64 = 1_700_000_000_000;
+        let writer_json = r#"{"type":"record","name":"r","fields":[
+            {"name":"ts","type":{"type":"long","logicalType":"timestamp-micros"}}]}"#;
+        let required_json = r#"{"type":"record","name":"r","fields":[
+            {"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}"#;
+
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(required_json.to_string()));
+        let content = build_avro_block_content(&[avro_record_body(&[enc_int(STORED_MS)])]);
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+
+        let batches = decoder
+            .decode_avro_record_content(content.as_ref(), &header)
+            .unwrap();
+        let batch = &batches.data_batches[0];
+        assert!(
+            matches!(
+                batch.schema().field(0).data_type(),
+                DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+            ),
+            "log-decoded column must carry the tz-aware millis target type"
+        );
+        let log_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("reinterpreted column must be TimestampMillisecondArray");
+        assert_eq!(
+            log_col.value(0),
+            STORED_MS,
+            "log path must reinterpret (keep the i64), not divide by 1000"
+        );
+
+        // Base path: an equivalent Timestamp(Micros, Some) batch projected to the SAME
+        // required schema must yield the IDENTICAL i64 — proving base == log.
+        let required_arrow =
+            crate::schema::resolver::avro_json_to_arrow_schema(required_json).unwrap();
+        let base_src = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            )])),
+            vec![Arc::new(
+                TimestampMicrosecondArray::from(vec![STORED_MS]).with_timezone("UTC"),
+            )],
+        )
+        .unwrap();
+        let base_out = crate::schema::batch_evolution::project_batch_to_schema(
+            &base_src,
+            &Arc::new(required_arrow),
+        )
+        .unwrap();
+        let base_col = base_out
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(
+            base_col.value(0),
+            log_col.value(0),
+            "base and log paths must agree on the reinterpreted i64 (== JVM)"
+        );
+    }
+
+    /// Two delete records with distinct string keys (the soft+hard delete keys
+    /// a delete block names). The boundary must emit a single delete batch whose
+    /// column 0 (recordKey) is a StringArray carrying both keys in order — that
+    /// column 0 is the only thing the downstream consumer reads.
+    ///
+    /// Note: GAP-22 is now closed — null orderingVal decodes fine via the full-union
+    /// writer-only path. The payload here uses IntWrapper ordering values (non-null) to
+    /// also exercise the non-null wrapper branch.
+    #[test]
+    fn test_decode_delete_block_decodes_multiple_record_keys_in_order() {
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
+        let content = build_delete_block_content(vec![
+            delete_record_value("k1", "p1", Some(1)),
+            delete_record_value("k2", "p1", Some(2)),
+        ]);
+        let batches = decoder
+            .decode_delete_record_content(
+                std::io::Cursor::new(content.to_vec()),
+                &delete_header("20240101000000"),
+            )
+            .unwrap();
+        assert_eq!(batches.num_delete_batches(), 1);
+        let (batch, instant) = &batches.delete_batches[0];
+        assert_eq!(instant, "20240101000000");
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("delete batch column 0 must be a StringArray");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.value(0), "k1");
+        assert_eq!(keys.value(1), "k2");
+    }
+
+    /// A three-row parquet block, and the decoder that reads it.
+    ///
+    /// The row filter is the caller's to install: the gate that decides whether
+    /// installing one is sound lives in `BaseHoodieLogRecordReader::block_decoder`,
+    /// one layer up (this used to be read off the `ReaderContext` here). What is
+    /// pinned below is the half that stayed: given a filter, the decoder applies
+    /// it; given none, it reads every row.
+    fn parquet_log_block(row_filter: Option<RowFilterBuilder>) -> (Decoder, Bytes) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty())).with_row_filter(row_filter);
+        (decoder, Bytes::from(buf))
+    }
+
+    /// Keeps rows where `id > 1`, so a filter that was installed is visible in
+    /// the row count rather than only in whether a closure ran.
+    struct GtOnePredicate {
+        projection: parquet::arrow::ProjectionMask,
+    }
+
+    impl parquet::arrow::arrow_reader::ArrowPredicate for GtOnePredicate {
+        fn projection(&self) -> &parquet::arrow::ProjectionMask {
+            &self.projection
+        }
+        fn evaluate(
+            &mut self,
+            batch: RecordBatch,
+        ) -> std::result::Result<arrow_array::BooleanArray, arrow_schema::ArrowError> {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            Ok((0..ids.len()).map(|i| Some(ids.value(i) > 1)).collect())
+        }
+    }
+
+    /// No filter installed: every row comes through, and the decode path that
+    /// would have resolved one is simply not taken.
+    #[test]
+    fn parquet_log_block_reads_every_row_when_no_row_filter_is_installed() {
+        let (decoder, content) = parquet_log_block(None);
+        let batches = decoder
+            .decode_parquet_record_content(content.as_ref())
+            .unwrap();
+        assert_eq!(batches.num_data_rows(), 3);
+    }
+
+    /// A filter the caller installed is resolved against the BLOCK's own parquet
+    /// schema and applied. Both halves matter: the builder must be invoked (it
+    /// cannot be resolved earlier — the block's footer does not exist until
+    /// here), and the rows it rejects must actually be gone.
+    #[test]
+    fn parquet_log_block_applies_the_installed_row_filter() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_clone = invoked.clone();
+        let builder: RowFilterBuilder = Arc::new(move |parquet_schema, _projected| {
+            invoked_clone.store(true, Ordering::SeqCst);
+            Some(parquet::arrow::arrow_reader::RowFilter::new(vec![
+                Box::new(GtOnePredicate {
+                    projection: parquet::arrow::ProjectionMask::roots(
+                        parquet_schema,
+                        vec![0_usize],
+                    ),
+                }),
+            ]))
+        });
+
+        let (decoder, content) = parquet_log_block(Some(builder));
+        let batches = decoder
+            .decode_parquet_record_content(content.as_ref())
+            .unwrap();
+
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "the builder must be resolved against the block's own footer schema"
+        );
+        assert_eq!(
+            batches.num_data_rows(),
+            2,
+            "the installed filter must drop the id=1 row"
+        );
     }
 }

@@ -229,6 +229,10 @@ mod tests {
             view.get_completion_time("20240101120000000"),
             Some("20240101120005000")
         );
+        // Membership is a separate question from the completion map, and the
+        // view's OWN as-of instant is the one a map assertion cannot speak for.
+        assert!(view.is_committed("20240101120000000"));
+        assert!(view.is_committed("20240101130000000"));
     }
 
     #[test]
@@ -250,8 +254,10 @@ mod tests {
         assert_eq!(view.as_of_timestamp(), "20240101130000000");
         // Layout v1 tracks no completion times...
         assert!(view.get_completion_time("20240101120000000").is_none());
-        // ...but must still know the commit completed.
+        // ...but must still know the commit completed — including the view's own
+        // as-of instant, which is the one the caller reads the view for.
         assert!(view.is_committed("20240101120000000"));
+        assert!(view.is_committed("20240101130000000"));
     }
 
     #[test]
@@ -379,6 +385,61 @@ mod tests {
 
         assert!(view.is_committed("20240101120000000"));
         assert!(!view.is_committed("20231231000000000"));
+    }
+
+    /// The boundary instant is the one the archived test compares against, and it
+    /// is not always a completed commit: `Timeline::earliest_active_instant` is the
+    /// oldest instant on the active timeline in ANY state, so on a table with a
+    /// long-running write it is the PENDING one. Archival never moves an instant
+    /// past the oldest pending one, so a commit at exactly that boundary has not
+    /// been archived and, absent from the completed set, is not committed.
+    ///
+    /// The comparison must therefore be strictly `<`, and the only fixture that
+    /// can tell `<` from `<=` is one whose boundary is itself pending. Both other
+    /// `is_committed` tests use a boundary that is also a completed commit, so
+    /// membership answers them before the comparison is reached and a `<` → `<=`
+    /// regression escapes the suite (m1 ISSUES I-14 item 3).
+    #[test]
+    fn test_is_committed_is_strict_at_a_pending_boundary() {
+        // t2 and t4 completed. The boundary is t1 — an inflight write instant
+        // OLDER than the earliest completed commit, and deliberately NOT in the
+        // completed set.
+        let instants = vec![
+            create_instant("20240101120000000", Some("20240101120005000")), // t2
+            create_instant("20240101140000000", Some("20240101140005000")), // t4
+        ];
+        let pending_boundary = "20240101110000000"; // t1, inflight
+
+        for configs in [create_layout_v1_configs(), create_layout_v2_configs()] {
+            let view = TimelineView::new_with_archival_boundary(
+                "20240101140000000".to_string(),
+                None,
+                &instants,
+                HashSet::new(),
+                &configs,
+                Some(pending_boundary.to_string()),
+            );
+
+            // THE assertion: the boundary instant itself. It is not in the
+            // completed set and it is not strictly below itself, so it must read
+            // as uncommitted. Under `<=` it would read as archived-and-committed,
+            // and an in-flight write's files would become readable.
+            assert!(
+                !view.is_committed(pending_boundary),
+                "the boundary instant is itself pending, so it is not archived \
+                 and not committed; a `<` to `<=` regression would admit it"
+            );
+            // Strictly below the boundary is genuinely archived.
+            assert!(
+                view.is_committed("20240101100000000"),
+                "below a pending boundary is still archived"
+            );
+            // And the completed commits are unaffected by the pending boundary.
+            assert!(view.is_committed("20240101120000000"));
+            assert!(view.is_committed("20240101140000000"));
+            // A pending instant ABOVE the boundary stays out.
+            assert!(!view.is_committed("20240101130000000"));
+        }
     }
 
     #[test]

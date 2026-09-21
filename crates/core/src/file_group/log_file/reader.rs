@@ -1029,6 +1029,21 @@ mod tests {
             LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
         let mut blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
 
+        // How many blocks the sweep found, before touching one: a truncation
+        // detector that also loses a block would still produce the error asserted
+        // below, and this test would still pass.
+        assert_eq!(blocks.len(), 1, "the fixture holds exactly one block");
+
+        // And that the fixture decodes AT ALL before it is damaged — otherwise the
+        // error below could be surfacing for some entirely unrelated reason.
+        let mut good = blocks[0].clone();
+        good.load_content(&Decoder::new(hudi_configs.clone()))
+            .await?;
+        assert!(
+            good.record_batches().is_some(),
+            "the undamaged block must decode, or the error below proves nothing"
+        );
+
         let block = blocks.last_mut().expect("the fixture has a block to walk");
         assert!(
             block.resident_content.is_none(),
@@ -1223,6 +1238,80 @@ mod tests {
         Ok(())
     }
 
+    /// The two end-of-file branches of the recovery scan that no fixture reaches
+    /// by walking a file, pinned directly.
+    ///
+    /// `scan_for_next_block_offset` starts `MAGIC.len()` bytes past `from_pos`,
+    /// so a corrupt block discovered near the end of a file produces a start
+    /// position at or past EOF and the scan must answer "end of file" without
+    /// reading. There are two such branches, reached by different arithmetic:
+    ///
+    /// * `from_pos + MAGIC.len() >  file_len` — the `checked_sub` underflows;
+    /// * `from_pos + MAGIC.len() == file_len` — the subtraction succeeds and the
+    ///   window is exactly 0.
+    ///
+    /// Both must return `file_len`. Returning `pos` instead hands the caller an
+    /// offset PAST the end of the file, and `create_corrupted_block` feeds that
+    /// straight into `seek_to`. Neither is reachable from a walk-the-file
+    /// fixture — `test_scan_for_next_block_offset_stays_within_file_bounds` and
+    /// the corrupt-recovery family all run on files with a later marker or a
+    /// short final window (the third branch) — so these were the remaining
+    /// untested `Ok(stream_len)` returns the original audit's item 10 named.
+    ///
+    /// The `window == 0` branch needs one assertion the other two do not. There
+    /// `pos == stream_len` by construction, so returning `pos` is
+    /// indistinguishable from returning `stream_len`, and DELETING the guard
+    /// outright still yields `stream_len` via the short-window branch below it.
+    /// The value alone therefore pins the contract but not the branch. What the
+    /// branch uniquely promises is that it answers WITHOUT READING, so the
+    /// reader's position is asserted unchanged across the call — the
+    /// fall-through would move it via `seek_to(pos)`.
+    /// m1's R-4 established there is no product-code delta against internal main
+    /// here (three such branches on both sides), so this closes coverage and
+    /// ports nothing.
+    #[tokio::test]
+    async fn test_recovery_scan_answers_eof_when_the_scan_start_is_at_or_past_it() -> Result<()> {
+        let (dir, file_name) = get_valid_log_avro_data();
+        let mut reader = create_log_file_reader(&dir, &file_name).await?;
+        let len = reader.reader.file_len();
+        let magic = MAGIC.len() as u64;
+        assert!(len > magic, "fixture must be longer than one magic marker");
+
+        // Branch 1: the scan start runs PAST the end (checked_sub underflows).
+        // from_pos = len - 1  =>  pos = len - 1 + magic > len.
+        assert_eq!(
+            reader.scan_for_next_block_offset(len - 1).await?,
+            len,
+            "a scan starting past the end must answer end-of-file, not an offset past it"
+        );
+
+        // Branch 2: the scan start lands EXACTLY on the end (window == 0).
+        // from_pos = len - magic  =>  pos = len, remaining = 0.
+        // Pin the branch, not just its value: it must answer without reading, so
+        // the reader's position may not move. Deleting the guard makes the
+        // short-window branch answer instead, but only after `seek_to(pos)`.
+        let before = reader.reader.position();
+        assert_eq!(
+            reader.scan_for_next_block_offset(len - magic).await?,
+            len,
+            "a scan starting exactly at the end must answer end-of-file"
+        );
+        assert_eq!(
+            reader.reader.position(),
+            before,
+            "the window==0 branch must answer without seeking or reading"
+        );
+
+        // A third, adjacent case worth pinning while the arithmetic is in view:
+        // from_pos AT the end underflows the same way as branch 1.
+        assert_eq!(
+            reader.scan_for_next_block_offset(len).await?,
+            len,
+            "a scan starting at end-of-file must answer end-of-file"
+        );
+        Ok(())
+    }
+
     /// Options carrying a base path, and a streaming window when one is asked
     /// for. `Storage::new_with_base_url` builds its own configs, so the window
     /// knob has to be set on the storage the reader is opened from.
@@ -1368,6 +1457,97 @@ mod tests {
         for window in [None, Some(scan / 2), Some(scan + 1024), Some(64 * 1024 + 7)] {
             assert_corrupt_recovery_finds_a_straddling_magic(window).await?;
         }
+        Ok(())
+    }
+
+    /// Recovery from a corrupt block that sits at a NONZERO offset.
+    ///
+    /// `scan_for_next_block_offset(from_pos)` starts its scan at
+    /// `from_pos + MAGIC.len()`, and `from_pos` enters the arithmetic in that one
+    /// place. **No pre-existing test could observe it.** Two call sites pass 0 —
+    /// `test_scan_for_next_block_offset_stays_within_file_bounds`, and the four
+    /// window variants of `test_corrupt_recovery_scan_finds_a_magic_split_across_windows`,
+    /// whose `corrupt_then_good_file` puts the damage at byte 0 — and with
+    /// `from_pos == 0` the resume term is indistinguishable from a bug that drops it
+    /// (`MAGIC.len()` either way). The other three pass `len - 1`, `len - magic` and
+    /// `len` (`test_recovery_scan_answers_eof_when_the_scan_start_is_at_or_past_it`).
+    /// Note what is and is not true of those: `len - 1` and `len - magic` are in-range
+    /// nonzero ARGUMENTS — what lands at or past the end is the derived scan start,
+    /// `from_pos + MAGIC.len()`. That is the point of them: they pin the two
+    /// early-return branches (`checked_sub` underflow, and `window == 0`), both of
+    /// which answer `stream_len` before `pos` is ever used to read, so they come out
+    /// the same whether or not the resume term is there.
+    ///
+    /// So no nonzero offset at which the resume arithmetic is actually EXERCISED
+    /// appears anywhere — which is what this test adds. Two earlier versions of this
+    /// comment got it wrong in opposite directions: the first said "every other test
+    /// passes 0" (three do not — round 4), the second said those three are "at or past
+    /// end-of-file" and that "no in-range nonzero offset" was exercised, which the
+    /// grep in the entry's own fact chain refutes (round 6 caught it in the document,
+    /// round 7 found it still standing here).
+    /// Production only ever calls it from `create_corrupted_block(magic_pos)`, where a
+    /// nonzero in-range `magic_pos` is the ordinary case: damage anywhere but the very
+    /// start of the file.
+    ///
+    /// Getting the resume wrong skips or re-reads a block span after damage, which
+    /// is silent — the walk still returns blocks, just not the right ones.
+    #[tokio::test]
+    async fn test_corrupt_recovery_resumes_from_a_nonzero_offset() -> Result<()> {
+        // good | corrupt (MAGIC + a length no file can hold + garbage) | good
+        let first = a_valid_command_block("20250101000000000");
+        let corrupt_at = first.len() as u64;
+        let mut bytes = first;
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&9_999_999u64.to_be_bytes());
+        bytes.extend_from_slice(&[9, 9, 9, 9]);
+        let good_at = bytes.len() as u64;
+        bytes.extend_from_slice(&a_valid_command_block("20250102000000000"));
+
+        // A fixture guard, not a behavioural assertion: it cannot fail while
+        // `a_valid_command_block` emits a non-empty block. It is here so that an
+        // edit which shrinks the fixture to nothing cannot silently turn this
+        // test back into a duplicate of the from_pos == 0 cases.
+        assert!(
+            corrupt_at > 0,
+            "the damage must NOT be at offset 0, or this repeats the existing tests"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file_name = "corrupt-middle.log.1_0-0-0".to_string();
+        std::fs::write(tmp.path().join(&file_name), &bytes).unwrap();
+
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+
+        // The scan itself, asked to resume from the corrupt block's own offset.
+        // It must not hand that same magic back, and must land exactly on the good
+        // block's magic rather than on EOF.
+        let mut scanner =
+            LogFileReader::new_streaming(hudi_configs.clone(), storage.clone(), &file_name).await?;
+        assert_eq!(
+            scanner.scan_for_next_block_offset(corrupt_at).await?,
+            good_at,
+            "recovery from a nonzero offset must land on the following block's magic"
+        );
+
+        // ...and the whole walk therefore reports good, corrupt, good — with the
+        // block AFTER the damage still carrying its own instant time, which is what
+        // proves the reader resumed at the right byte rather than at a plausible one.
+        let mut reader = LogFileReader::new_streaming(hudi_configs, storage, &file_name).await?;
+        let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|b| b.block_type.clone())
+                .collect::<Vec<_>>(),
+            vec![BlockType::Command, BlockType::Corrupted, BlockType::Command],
+        );
+        assert_eq!(blocks[0].instant_time()?, "20250101000000000");
+        assert_eq!(
+            blocks[2].instant_time()?,
+            "20250102000000000",
+            "the block recovered from a nonzero-offset corruption must be the right one"
+        );
         Ok(())
     }
 
@@ -1560,6 +1740,45 @@ mod tests {
         Ok(())
     }
 
+    /// The metadata-only sweep must parse a rollback command block's HEADERS, not
+    /// merely notice that a Command block is there.
+    ///
+    /// The eager path already pins all of this (`test_read_log_file_with_rollback_block`),
+    /// and the branch ships a `test_lazy_sweep_matches_eager_for_*` family claiming the
+    /// two paths agree — for DATA blocks. For command-block headers that claim was
+    /// unpinned. Two sweep-path statements about a command block existed, and neither
+    /// touches its headers: `blocks.iter().any(|b| b.block_type == BlockType::Command)`
+    /// inside `test_load_content_is_idempotent_for_every_block_type`, where it is a
+    /// precondition for a different subject, and the block-TYPE sequence
+    /// `vec![BlockType::Command, BlockType::Corrupted]` inside
+    /// `a_corrupt_tail_with_no_following_magic_spans_to_eof`, which is about the
+    /// corrupt tail. (An earlier version of this comment said "the only" — review
+    /// round 4 found the second, printed by this entry's own `grep`.)
+    ///
+    /// A sweep that misreads a rollback merges rolled-back records back in.
+    #[tokio::test]
+    async fn test_metadata_only_sweep_parses_rollback_command_block_headers() -> Result<()> {
+        let (dir, file_name) = get_valid_log_rollback();
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(&dir)?)?;
+        let mut reader = LogFileReader::new_streaming(hudi_configs, storage, &file_name).await?;
+
+        let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
+        assert_eq!(blocks.len(), 1, "expected one rollback command block");
+
+        let block = &blocks[0];
+        assert_eq!(block.block_type, BlockType::Command);
+        assert!(block.is_rollback_block());
+        // The header values the eager path asserts, and the ones a mis-parsed sweep
+        // gets wrong: which instant this block belongs to, WHICH instant is being
+        // rolled back, and that the command really is a rollback rather than some
+        // other command ordinal.
+        assert_eq!(block.instant_time()?, "20250126040936578");
+        assert_eq!(block.target_instant_time()?, "20250126040826878");
+        assert_eq!(block.command_block_type()?, CommandBlock::Rollback);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_skip_out_of_range_block_fast_path() -> Result<()> {
         // use a file with a single data block
@@ -1600,37 +1819,28 @@ mod tests {
     /// happen to be valid UTF-8.
     #[tokio::test]
     async fn test_block_metadata_value_length_is_bounded_by_the_block() -> Result<()> {
-        const LOG_FORMAT_VERSION: u32 = 1;
-        const BLOCK_TYPE_AVRO_DATA: u32 = 3;
-        const HEADER_KEY_INSTANT_TIME: u32 = 0;
-
         // One header entry whose declared value length is far larger than the
-        // block that contains it, while the real value is 3 bytes.
+        // block that contains it, while the real value is 3 bytes. The layout
+        // itself comes from the shared `a_v1_block` encoder (m1 ISSUES I-12);
+        // only the LIE is this test's own.
         let bogus_value_len: u32 = 5_000;
-        let mut header = Vec::new();
-        header.extend_from_slice(&1u32.to_be_bytes()); // one entry
-        header.extend_from_slice(&HEADER_KEY_INSTANT_TIME.to_be_bytes());
-        header.extend_from_slice(&bogus_value_len.to_be_bytes());
-        header.extend_from_slice(b"abc");
+        let mut out = a_v1_block(
+            V1_BLOCK_TYPE_AVRO_DATA,
+            &[V1Header::lying_entry(
+                V1_HEADER_KEY_INSTANT_TIME,
+                b"abc",
+                bogus_value_len,
+            )],
+            &[],
+        );
 
-        let mut body = Vec::new();
-        body.extend_from_slice(&LOG_FORMAT_VERSION.to_be_bytes());
-        body.extend_from_slice(&BLOCK_TYPE_AVRO_DATA.to_be_bytes());
-        body.extend_from_slice(&header);
-        body.extend_from_slice(&0u64.to_be_bytes()); // empty content
-        body.extend_from_slice(&0u32.to_be_bytes()); // empty footer
-
-        // The recorded length spans everything after it, the trailing pointer
-        // included; the trailing value counts the magic on top of that. Getting
-        // these right is what keeps `is_block_corrupted` from short-circuiting
-        // the walk before the header is ever parsed.
-        let block_length = (body.len() + 8) as u64;
-        let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&block_length.to_be_bytes());
-        out.extend_from_slice(&body);
-        out.extend_from_slice(&(block_length + MAGIC.len() as u64).to_be_bytes());
-
+        // `block_length` as the encoder recorded it: the bytes after the length
+        // field, the trailing pointer included.
+        let block_length = u64::from_be_bytes(
+            out[MAGIC.len()..MAGIC.len() + 8]
+                .try_into()
+                .expect("the encoder writes an 8-byte block length"),
+        );
         assert!(
             block_length < bogus_value_len as u64,
             "the test is only meaningful while the declared value overruns its block"
@@ -1643,23 +1853,11 @@ mod tests {
         // cannot be the thing that rejects the overrun above — leaving the
         // block-length check as the only candidate.
         let filler = vec![b'x'; 8_000];
-        let mut header2 = Vec::new();
-        header2.extend_from_slice(&1u32.to_be_bytes());
-        header2.extend_from_slice(&HEADER_KEY_INSTANT_TIME.to_be_bytes());
-        header2.extend_from_slice(&(filler.len() as u32).to_be_bytes());
-        header2.extend_from_slice(&filler);
-
-        let mut body2 = Vec::new();
-        body2.extend_from_slice(&LOG_FORMAT_VERSION.to_be_bytes());
-        body2.extend_from_slice(&BLOCK_TYPE_AVRO_DATA.to_be_bytes());
-        body2.extend_from_slice(&header2);
-        body2.extend_from_slice(&0u64.to_be_bytes());
-        body2.extend_from_slice(&0u32.to_be_bytes());
-        let block_length2 = (body2.len() + 8) as u64;
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&block_length2.to_be_bytes());
-        out.extend_from_slice(&body2);
-        out.extend_from_slice(&(block_length2 + MAGIC.len() as u64).to_be_bytes());
+        out.extend_from_slice(&a_v1_block(
+            V1_BLOCK_TYPE_AVRO_DATA,
+            &[V1Header::entry(V1_HEADER_KEY_INSTANT_TIME, &filler)],
+            &[],
+        ));
 
         let tmp = tempfile::tempdir().unwrap();
         let file_name = "corrupt.log.1_0-0-0".to_string();
@@ -1677,10 +1875,252 @@ mod tests {
             .read_all_blocks(&InstantRange::up_to("99991231235959999", "utc"))
             .await
             .expect_err("a metadata value overrunning its block must be refused");
+        // The VARIANT, because that is what callers match on: a refactor that
+        // returns a different error with similar wording keeps the message
+        // assertion below green. Kept alongside it rather than instead of it —
+        // naming the bound that rejected the read is a separate claim.
+        assert!(
+            matches!(err, CoreError::LogFormatError(_)),
+            "expected LogFormatError, got {err:?}"
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("exceeds block length"),
             "the error must name the block bound that rejected it, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// Block-type ordinals as they appear on disk, for [`a_v1_block`].
+    const V1_BLOCK_TYPE_COMMAND: u32 = 0;
+    const V1_BLOCK_TYPE_AVRO_DATA: u32 = 3;
+    /// Header-key ordinal for `BlockMetadataKey::InstantTime`.
+    const V1_HEADER_KEY_INSTANT_TIME: u32 = 0;
+
+    /// One V1 header entry: the key ordinal, the value bytes, and the length to
+    /// DECLARE for that value.
+    ///
+    /// `declared_len` exists for exactly one caller. Honest blocks declare
+    /// `value.len()` (use [`V1Header::entry`]); the block-metadata bound test
+    /// needs a block that LIES about its value length, which is the whole point
+    /// of the guard it exercises — so the lie is a parameter of the encoder
+    /// rather than a second encoder.
+    struct V1Header<'a> {
+        key: u32,
+        value: &'a [u8],
+        declared_len: u32,
+    }
+
+    impl<'a> V1Header<'a> {
+        /// An honest entry: declared length == actual length.
+        fn entry(key: u32, value: &'a [u8]) -> Self {
+            Self {
+                key,
+                value,
+                declared_len: value.len() as u32,
+            }
+        }
+
+        /// An entry that declares a length it does not have.
+        fn lying_entry(key: u32, value: &'a [u8], declared_len: u32) -> Self {
+            Self {
+                key,
+                value,
+                declared_len,
+            }
+        }
+    }
+
+    /// Encode ONE V1 on-disk log block, the whole layout in one place:
+    /// `MAGIC | block_length | format version | block type | header | content
+    /// length | content | footer count | trailing reverse pointer`.
+    ///
+    /// This is the single encoder for the V1 layout in this module. There were
+    /// two — this one and an inline copy in
+    /// `test_block_metadata_value_length_is_bounded_by_the_block` — written
+    /// months apart for different bugs. Both were correct, which is what made it
+    /// a drift hazard rather than a defect: the next change to the on-disk layout
+    /// has to land in both and nothing made the second one visible (m1 ISSUES
+    /// I-12).
+    ///
+    /// Two invariants a caller must not have to rediscover, and which the two
+    /// old copies each re-derived by hand:
+    ///
+    /// * `block_length` counts everything AFTER itself, the trailing pointer
+    ///   included — but not the magic and not its own 8 bytes;
+    /// * the trailing reverse pointer counts `block_length` PLUS the magic.
+    ///
+    /// Getting either wrong makes `is_block_corrupted` short-circuit the walk
+    /// before the header is ever parsed, so a test meaning to exercise header
+    /// parsing would silently exercise corruption detection instead.
+    ///
+    /// NOTE: `content` is `&[]` at every current call site, so no test
+    /// distinguishes the content write from omitting it. The parameter exists so
+    /// the layout is stated whole rather than half — do not read it as pinned.
+    fn a_v1_block(block_type: u32, header: &[V1Header<'_>], content: &[u8]) -> Vec<u8> {
+        let mut header_bytes = Vec::new();
+        header_bytes.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        for entry in header {
+            header_bytes.extend_from_slice(&entry.key.to_be_bytes());
+            header_bytes.extend_from_slice(&entry.declared_len.to_be_bytes());
+            header_bytes.extend_from_slice(entry.value);
+        }
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_be_bytes()); // format version V1
+        body.extend_from_slice(&block_type.to_be_bytes());
+        body.extend_from_slice(&header_bytes);
+        body.extend_from_slice(&(content.len() as u64).to_be_bytes());
+        body.extend_from_slice(content);
+        body.extend_from_slice(&0u32.to_be_bytes()); // empty footer
+
+        // +8 for the trailing reverse pointer that block_length must span.
+        let block_length = (body.len() + 8) as u64;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&block_length.to_be_bytes());
+        buf.extend_from_slice(&body);
+        buf.extend_from_slice(&(block_length + MAGIC.len() as u64).to_be_bytes());
+        buf
+    }
+
+    /// A minimal, self-consistent V1 COMMAND block carrying one InstantTime
+    /// header entry.
+    ///
+    /// Handwritten rather than taken from a fixture because the corrupt-tail
+    /// cases below need a KNOWN-good block to precede the damage: a fixture's
+    /// block would also have to be located before the tail could be appended.
+    fn a_valid_command_block(instant: &str) -> Vec<u8> {
+        a_v1_block(
+            V1_BLOCK_TYPE_COMMAND,
+            &[V1Header::entry(
+                V1_HEADER_KEY_INSTANT_TIME,
+                instant.as_bytes(),
+            )],
+            &[],
+        )
+    }
+
+    /// One good block, then a corrupt tail: a MAGIC, a length no file could
+    /// hold, and a few bytes of garbage with NO further MAGIC anywhere.
+    fn good_block_then_corrupt_tail() -> (tempfile::TempDir, String, u64) {
+        let mut bytes = a_valid_command_block("20250101000000000");
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&1_000_000u64.to_be_bytes());
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+        let total_len = bytes.len() as u64;
+        let tmp = tempfile::tempdir().unwrap();
+        let file_name = "corrupt-tail.log.1_0-0-0".to_string();
+        std::fs::write(tmp.path().join(&file_name), &bytes).unwrap();
+        (tmp, file_name, total_len)
+    }
+
+    /// A corrupt tail with nothing after it must end the walk cleanly: one
+    /// Corrupted block spanning to end-of-file, then EOF — not an error, and not
+    /// a read that runs past the file.
+    ///
+    /// Recovery from a corrupt block scans forward for the next MAGIC; the case
+    /// where there ISN'T one is the branch of that scan nothing else pins.
+    /// `test_scan_for_next_block_offset_stays_within_file_bounds` runs on a
+    /// valid multi-block fixture and so always finds a marker — it asserts the
+    /// offset stays in bounds, never what the walk does when the answer is EOF.
+    /// Getting that branch wrong is silent: the reader either errors on a file
+    /// a truncated write is expected to produce, or seeks past the end.
+    #[tokio::test]
+    async fn a_corrupt_tail_with_no_following_magic_spans_to_eof() -> Result<()> {
+        let (tmp, file_name, total_len) = good_block_then_corrupt_tail();
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+        let mut reader = LogFileReader::new_streaming(hudi_configs, storage, &file_name).await?;
+
+        let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
+        let types: Vec<BlockType> = blocks.iter().map(|b| b.block_type.clone()).collect();
+        assert_eq!(
+            types,
+            vec![BlockType::Command, BlockType::Corrupted],
+            "the good block must be walked, and the tail must surface as one \
+             corrupt span rather than as an error"
+        );
+        assert_eq!(
+            reader.reader.position(),
+            total_len,
+            "the corrupt span must end exactly at EOF: a recovery scan that \
+             answers past the end leaves the walk seeked outside the file"
+        );
+        Ok(())
+    }
+
+    /// The eager walk takes a different function to the same decision, so it is
+    /// asserted separately: a tail the metadata sweep survives must not fail the
+    /// eager read.
+    #[tokio::test]
+    async fn the_eager_walk_ends_on_the_same_corrupt_tail() -> Result<()> {
+        let (tmp, file_name, total_len) = good_block_then_corrupt_tail();
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+        let mut reader = LogFileReader::new(hudi_configs, storage, &file_name).await?;
+        let range = InstantRange::up_to("99991231235959999", "utc");
+
+        let first = reader.read_next_block(&range).await?.expect("good block");
+        assert_eq!(first.block_type, BlockType::Command);
+        let second = reader
+            .read_next_block(&range)
+            .await?
+            .expect("corrupt tail as a block");
+        assert_eq!(second.block_type, BlockType::Corrupted);
+        assert!(
+            reader.read_next_block(&range).await?.is_none(),
+            "the eager walk must reach EOF cleanly too"
+        );
+        assert_eq!(
+            reader.reader.position(),
+            total_len,
+            "and must land exactly on EOF, like the metadata sweep"
+        );
+        Ok(())
+    }
+
+    /// A file whose SOLE block is a truncated write: a magic, a length running
+    /// past the end, and nothing else. One `Corrupted` block spanning to EOF,
+    /// then a clean end — no error, no read past the file.
+    ///
+    /// Distinct from `a_corrupt_tail_with_no_following_magic_spans_to_eof`, which
+    /// has a good block in front: there the walk reaches the damage having
+    /// already parsed something, and `scan_for_next_block_offset` starts from a
+    /// nonzero position. Here the very first block is the bad one, which is what
+    /// a writer killed mid-first-append actually leaves behind.
+    /// `test_corrupt_block_detected_when_length_runs_past_eof` calls the
+    /// predicate directly on an intact fixture and never walks a file at all.
+    #[tokio::test]
+    async fn a_file_whose_only_block_is_truncated_walks_to_eof_without_erroring() -> Result<()> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&500_000u64.to_be_bytes()); // claims 500 kB; the file is tiny
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]); // a few real-looking bytes
+        let total_len = bytes.len() as u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file_name = "truncated-only.log.1_0-0-0".to_string();
+        std::fs::write(tmp.path().join(&file_name), &bytes).unwrap();
+
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+        let mut reader = LogFileReader::new(hudi_configs, storage, &file_name).await?;
+        let range = InstantRange::up_to("99991231235959999", "utc");
+
+        let only = reader
+            .read_next_block(&range)
+            .await?
+            .expect("the truncated block must surface as a block, not as an error");
+        assert_eq!(only.block_type, BlockType::Corrupted);
+        assert!(
+            reader.read_next_block(&range).await?.is_none(),
+            "and the walk must then report EOF"
+        );
+        assert_eq!(
+            reader.reader.position(),
+            total_len,
+            "the corrupt span must end exactly at EOF"
         );
         Ok(())
     }

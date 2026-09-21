@@ -106,7 +106,12 @@ impl FromStr for BlockType {
             ":command" => Ok(BlockType::Command),
             ":delete" => Ok(BlockType::Delete),
             ":corrupted" => Ok(BlockType::Corrupted),
-            "avro_data" => Ok(BlockType::AvroData),
+            // Both spellings: `as_ref` answers "avro", so accepting only the
+            // legacy "avro_data" made `from_str(as_ref(x))` fail for this one
+            // variant while round-tripping for every other. Ported from internal
+            // main by the test-differential pass; the round-trip is now asserted
+            // over every variant below rather than variant by variant.
+            "avro" | "avro_data" => Ok(BlockType::AvroData),
             "hfile" => Ok(BlockType::HfileData),
             "parquet" => Ok(BlockType::ParquetData),
             "cdc" => Ok(BlockType::CdcData),
@@ -1066,5 +1071,53 @@ mod tests {
             HashMap::new(),
         );
         assert!(!block.is_rollback_block());
+    }
+
+    /// `from_str(as_ref(x)) == x` for every variant.
+    ///
+    /// Asserted over the whole enum rather than one token at a time, because the
+    /// failure mode is a single variant drifting: `AvroData` spelled itself
+    /// "avro" through `as_ref` while `from_str` took only "avro_data", so the
+    /// round trip held for five variants and silently broke for the sixth.
+    /// A per-token test cannot notice the one that was never listed.
+    #[test]
+    fn test_block_type_from_str_as_ref_round_trip() {
+        let all = [
+            BlockType::Command,
+            BlockType::Delete,
+            BlockType::Corrupted,
+            BlockType::AvroData,
+            BlockType::HfileData,
+            BlockType::ParquetData,
+            BlockType::CdcData,
+        ];
+        // An eighth variant must not slip past this loop silently — "a variant
+        // nobody listed" is the exact bug the test exists for, and a hard-coded
+        // array reproduces it one level up. The match is exhaustive, so adding a
+        // variant fails to compile here until it is added to `all` too.
+        for bt in &all {
+            match bt {
+                BlockType::Command
+                | BlockType::Delete
+                | BlockType::Corrupted
+                | BlockType::AvroData
+                | BlockType::HfileData
+                | BlockType::ParquetData
+                | BlockType::CdcData => {}
+            }
+        }
+        for bt in all {
+            let token = bt.as_ref();
+            assert_eq!(
+                BlockType::from_str(token).unwrap(),
+                bt,
+                "round-trip failed for token {token:?}"
+            );
+        }
+        // The legacy spelling stays accepted: it is what log files on disk carry.
+        assert_eq!(
+            BlockType::from_str("avro_data").unwrap(),
+            BlockType::AvroData
+        );
     }
 }

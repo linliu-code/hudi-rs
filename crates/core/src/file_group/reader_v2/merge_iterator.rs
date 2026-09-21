@@ -1097,6 +1097,56 @@ mod tests {
         );
     }
 
+    /// The same property on the EAGER (no-merge) arm — CoW, or a file group with
+    /// no log files. A read that truncates silently on an I/O error presents a
+    /// short result as a complete one, which is the worst failure this path can
+    /// produce, and the eager arm is the one most reads take.
+    ///
+    /// No eager test fed an `Err` before this one. Three of the four build their
+    /// stream with `new_eager_from_vec`, whose body is
+    /// `stream::iter(batches.map(Ok))` — it maps every item to `Ok`, so they
+    /// structurally cannot; the fourth, `eager_accepts_an_arbitrary_base_stream`,
+    /// already uses `new_eager` + `base_of` and simply passes `Ok` items.
+    ///
+    /// So the gap was the `Err` input, not the construction — an earlier version of
+    /// this comment said every eager test went through the `Vec` wrapper and offered
+    /// `new_eager` + `base_of` as the novelty, which `eager_accepts_an_arbitrary_base_stream`
+    /// refutes (review round 4). That test is named rather than located: round 8 found
+    /// this comment still saying "300 lines below" when the distance had become 406.
+    #[test]
+    fn eager_base_source_error_surfaces_rather_than_truncating() {
+        let schema = small_schema();
+        let base = base_of(vec![
+            Ok(batch(schema.clone(), &["a"], &[1])),
+            Err(CoreError::ReadFileSliceError("base read blew up".into())),
+        ]);
+        let it = FileGroupMergeStream::new_eager(base, schema, None, new_stream_stats_handle());
+        let chunks = drain(it);
+        assert_eq!(
+            rows(&chunks[0].as_ref().unwrap().clone()),
+            vec![("a".to_string(), 1)],
+            "the batch read before the failure still comes through"
+        );
+        match chunks.get(1) {
+            Some(Err(e)) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("base read blew up"),
+                    "the source's own error must reach the caller, got: {msg}"
+                );
+            }
+            other => panic!("expected the base source error to surface, got {other:?}"),
+        }
+        // The `match` above already establishes that the error is reported rather than
+        // swallowed. What this adds is the absence of a THIRD chunk: nothing is
+        // appended after a terminal error.
+        assert_eq!(
+            chunks.len(),
+            2,
+            "exactly two chunks — the batch and the error, nothing appended after it"
+        );
+    }
+
     /// A base source that fails mid-read surfaces the failure. The rows already
     /// emitted make a truncated read look like a short but successful one, so
     /// swallowing the error here would report partial data as complete - the

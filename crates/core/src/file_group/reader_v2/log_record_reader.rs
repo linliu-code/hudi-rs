@@ -2904,4 +2904,84 @@ mod tests {
         );
         assert_eq!(pass2.current_instant_log_blocks.len(), 3);
     }
+
+    /// The log-side pushdown gate: a parquet `RowFilter` reaches a log block's
+    /// decoder only when `mor_pk_safe` says the predicate is safe across the
+    /// merge.
+    ///
+    /// This is asserted here rather than in the decoder because the gate LIVES
+    /// here. Upstream of this branch it sat inside `Decoder`, reading
+    /// `reader_context.mor_pk_safe` directly, and internal main still tests it
+    /// there. When the decoder was decoupled from `ReaderContext` the condition
+    /// moved to `block_decoder` and its coverage did not come with it — a gate
+    /// that silently stops gating returns extra-filtered log records, which
+    /// reads as missing data downstream and never as a failure here.
+    fn reader_with(
+        mor_pk_safe: bool,
+        row_filter: Option<crate::storage::RowFilterBuilder>,
+    ) -> BaseHoodieLogRecordReader {
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config.insert(
+            HudiTableConfig::OrderingFields.as_ref().to_string(),
+            "ts".to_string(),
+        );
+        ctx.rebuild_record_context(String::new());
+        ctx.mor_pk_safe = mor_pk_safe;
+        ctx.row_filter_builder = row_filter;
+        BaseHoodieLogRecordReader {
+            reader_context: Arc::new(ctx),
+            storage: Storage::new_with_base_url(
+                crate::storage::util::parse_uri("file:///tmp").unwrap(),
+            )
+            .unwrap(),
+            log_file_paths: vec![],
+            latest_instant_time: "20260101000000000".to_string(),
+            instant_range: None,
+            force_full_scan: false,
+            record_buffer: make_test_buffer(),
+            allow_inflight_instants: false,
+            completion_gate_inputs: None,
+            valid_block_instants: vec![],
+            total_log_files: 0,
+            total_log_blocks: 0,
+            total_log_records: 0,
+            total_corrupt_blocks: 0,
+            total_rollbacks: 0,
+            progress: 0.0,
+            log_block_read_us: 0,
+            log_block_fetch_us: 0,
+            log_block_decode_us: 0,
+            merge_upsert_us: 0,
+            merge_insert_us: 0,
+        }
+    }
+
+    fn a_row_filter_builder() -> crate::storage::RowFilterBuilder {
+        Arc::new(|_, _| None)
+    }
+
+    #[test]
+    fn log_block_decoder_installs_the_row_filter_when_the_predicate_is_pk_safe() {
+        let reader = reader_with(true, Some(a_row_filter_builder()));
+        assert!(
+            reader.block_decoder().has_row_filter(),
+            "a PK-safe predicate must reach the log block decoder"
+        );
+    }
+
+    #[test]
+    fn log_block_decoder_withholds_the_row_filter_when_the_predicate_is_not_pk_safe() {
+        let reader = reader_with(false, Some(a_row_filter_builder()));
+        assert!(
+            !reader.block_decoder().has_row_filter(),
+            "a non-PK predicate must NOT reach a log block: a log block only exists \
+             on a merging slice, so filtering it drops records the merge needed"
+        );
+    }
+
+    #[test]
+    fn log_block_decoder_installs_nothing_when_no_predicate_was_pushed() {
+        let reader = reader_with(true, None);
+        assert!(!reader.block_decoder().has_row_filter());
+    }
 }
