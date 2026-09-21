@@ -33,8 +33,29 @@ get_filename_component(TARGET_DIR ${HUDI_LIB_PATH} DIRECTORY)
 get_filename_component(TARGET_DIR ${TARGET_DIR} DIRECTORY)  # Go up one level to get target directory
 set(CXX_BRIDGE_DIR "${TARGET_DIR}/cxxbridge")
 
+# libhudi exports the bridge's extern "C" shims but not the cxx C++ runtime (rust::Error's
+# vtable, typeinfo and destructor, which lib.rs.cc needs), so compile the runtime in too. cxx-build
+# links rust/cxx.h to the include/ dir of the exact cxx crate in use; cxx.cc sits beside it in src/.
+# Safe because the runtime crossing the .so boundary is the extern "C" cxxbridge1$ surface, which
+# libhudi does export; rust::Error is constructed and caught entirely inside this executable. Any
+# other consumer of the cdylib will need the same, so this belongs on cpp/'s Hudi::Hudi target
+# eventually - it lives here because this change may only touch demo/.
+get_filename_component(CXX_HEADER_REALPATH "${CXX_BRIDGE_DIR}/rust/cxx.h" REALPATH)
+get_filename_component(CXX_CRATE_DIR "${CXX_HEADER_REALPATH}" DIRECTORY)
+get_filename_component(CXX_CRATE_DIR "${CXX_CRATE_DIR}" DIRECTORY)
+
+# REALPATH returns its input unchanged when it cannot resolve, so without this the build fails on a
+# plausible-looking path under target/cxxbridge that says nothing about the cause.
+if(NOT EXISTS "${CXX_CRATE_DIR}/src/cxx.cc")
+  message(FATAL_ERROR
+    "Could not resolve the cxx crate from ${CXX_BRIDGE_DIR}/rust/cxx.h "
+    "(resolved to ${CXX_HEADER_REALPATH}). Build the Rust library first, so cxx-build "
+    "regenerates the bridge.")
+endif()
+
 target_sources(file_group_api_cpp PRIVATE
   ${CXX_BRIDGE_DIR}/hudi/src/lib.rs.cc
+  ${CXX_CRATE_DIR}/src/cxx.cc
 )
 
 # Make sure the executable depends on the rust build completing

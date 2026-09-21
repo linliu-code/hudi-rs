@@ -17,13 +17,17 @@
 
 FROM rust:1.94
 
-RUN apt-get update && apt-get install -y cmake curl ca-certificates protobuf-compiler
+RUN apt-get update && apt-get install -y cmake curl ca-certificates protobuf-compiler clang libclang-dev
 
 ADD https://astral.sh/uv/install.sh /uv-installer.sh
 
-RUN sh /uv-installer.sh && rm /uv-installer.sh
+# compose.yaml runs this container as the host's uid, which cannot read /root, so install uv
+# and its managed Python outside /root where that user can reach them
+ENV UV_INSTALL_DIR=/usr/local/bin
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+ENV UV_PYTHON_BIN_DIR=/usr/local/bin
 
-ENV PATH="/root/.local/bin/:$PATH"
+RUN sh /uv-installer.sh && rm /uv-installer.sh
 
 RUN uv python install 3.13
 
@@ -35,6 +39,9 @@ ENV VIRTUAL_ENV=/opt/.venv
 ENV PATH="/opt/.venv/bin:$PATH"
 
 RUN uv pip install --only-binary=all 'pyarrow==20.0.0'
+
+# `make setup develop` installs into the venv as the host's uid
+RUN chmod -R a+rwX /opt/.venv
 
 WORKDIR /opt
 

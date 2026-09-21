@@ -58,6 +58,12 @@ services:
       context: ./infra/runner
     container_name: runner
     user: "${HOST_UID}:${HOST_GID}"
+    # Wait for mc to finish seeding the test data. The apps read s3://hudi-demo/... and only the
+    # minutes of cargo build before that hid the race; with exit codes no longer swallowed, losing
+    # it would mean a red job with a confusing "table not found".
+    depends_on:
+      mc:
+        condition: service_completed_successfully
     volumes:
       - ../.:/opt/hudi-rs
     environment:

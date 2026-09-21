@@ -17,6 +17,20 @@
 # specific language governing permissions and limitations
 # under the License.
 #
+# Fail on the first failing step, so a failing app turns the job red
+set -e
+
+# Always tear down the compose stack to release file locks and avoid cache save issues,
+# then exit with the status of the step that ended the script
+teardown() {
+  local status=$?
+  trap - EXIT INT TERM
+  docker compose down -v || echo 'Warning: Failed to tear down compose stack' >&2
+  if [ $status -ne 0 ]; then
+    echo "ci_run.sh failed with exit status $status" >&2
+  fi
+  exit $status
+}
 # Enable BuildKit for faster, cache-friendly builds
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
@@ -25,25 +39,32 @@ export COMPOSE_DOCKER_CLI_BUILD=1
 export HOST_UID=$(id -u)
 export HOST_GID=$(id -g)
 
+app_path=$1
+if [ -z "$app_path" ]; then
+  echo "Usage: $0 <path_to_app>" >&2
+  exit 1
+fi
+
+# Armed only now, after the argument check: this tears the stack down with -v, and before the
+# script has brought one up that stack would be one the developer started by hand
+trap teardown EXIT INT TERM
+
 docker compose up --build -d
 
 max_attempts=30
 attempt=0
 
-until [ "$(docker inspect -f '{{.State.Status}}' runner)" = "running" ] || [ $attempt -eq $max_attempts ]; do
-  attempt=$(( $attempt + 1 ))
+until [ "$(docker inspect -f '{{.State.Status}}' runner 2>/dev/null)" = "running" ] || [ $attempt -eq $max_attempts ]; do
+  attempt=$(( attempt + 1 ))
   echo "Waiting for container... (attempt $attempt of $max_attempts)"
   sleep 1
 done
 
-if [ $attempt -eq $max_attempts ]; then
-  echo "Container failed to become ready in time"
-  exit 1
-fi
-
-app_path=$1
-if [ -z "$app_path" ]; then
-  echo "Usage: $0 <path_to_app>"
+# Re-read the state rather than inferring it from the counter, which reported a failure when the
+# container became ready on exactly the last attempt, and report what was actually observed
+runner_state=$(docker inspect -f '{{.State.Status}}' runner 2>/dev/null || echo "absent")
+if [ "$runner_state" != "running" ]; then
+  echo "Runner container is not running after $attempt attempts (state: $runner_state)" >&2
   exit 1
 fi
 
@@ -73,15 +94,12 @@ elif [ "$app_path" = "hudi-file-group-api/cpp" ]; then
   docker compose exec -T runner /bin/bash -c "
     cd /opt/hudi-rs/cpp && ../build-wrapper.sh cargo build --release && \
     cd $app_path_in_container && \
-    mkdir build && cd build && \
+    rm -rf build && mkdir build && cd build && \
     cmake .. && \
     make && \
     ./file_group_api_cpp
     "
 else
-  echo "Unknown app path: $app_path"
+  echo "Unknown app path: $app_path" >&2
   exit 1
 fi
-
-# Always tear down the compose stack to release file locks and avoid cache save issues
-docker compose down -v || echo 'Warning: Failed to tear down compose stack' >&2

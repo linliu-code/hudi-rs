@@ -25,8 +25,10 @@ name: ASF Allowlist Check
 on:
   workflow_dispatch:
   pull_request:
-    branches:
-      - main
+    # No `branches:` filter. GitHub matches it against the pull request's BASE branch, so
+    # scoping it to `main` gave a PR onto any other base NO checks at all -- not a red one,
+    # none, which reads as green. Internal `main`'s own ci.yml already drops the filter; this
+    # follows that precedent. Cost: every PR onto every branch now runs this workflow.
   push:
     branches:
       - main
@@ -36,6 +38,15 @@ permissions:
   contents: read
 
 jobs:
+  # Runs EVERYWHERE, including on this fork. It was previously guarded upstream-only on the
+  # grounds that it was red here "by construction" -- that was wrong, and the correction is worth
+  # recording. The ASF allowlist matches action refs EXACTLY (apache/infrastructure-actions,
+  # allowlist-check/check_asf_allowlist.py: owners actions/github/apache are trusted outright,
+  # everything else must fnmatch an approved pattern). It DOES carry
+  # aws-actions/configure-aws-credentials -- at five pinned v6.2.x SHAs. The only offender in this
+  # tree was the floating `@v4` tag, which matches none of them. Pinning that one ref to an
+  # approved SHA takes the tree to zero offenders, so the check can run here and be green, which
+  # is strictly better than a permanently skipped check nobody ever sees execute.
   asf-allowlist-check:
     runs-on: ubuntu-latest
     steps:
