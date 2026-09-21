@@ -23,11 +23,14 @@
 //! Reached from `file_group::reader::FileGroupReader` through [`super::adapter`].
 
 use crate::Result;
-use crate::config::table::BaseFileFormatValue;
+use crate::config::table::{BaseFileFormatValue, HudiTableConfig};
 use crate::error::CoreError;
 use crate::file_group::base_file::hfile::HFileBaseFileReader;
 use crate::file_group::base_file::reader::{
     BaseFileReadOptions, BaseFileReader, create_base_file_reader,
+};
+use crate::file_group::reader_v2::base_file_provider::{
+    BaseFileDataProviderRef, BaseFileDataRequest, BaseFileProviderStats,
 };
 use crate::file_group::reader_v2::buffer::BufferType;
 use crate::file_group::reader_v2::buffer::loader::{
@@ -38,7 +41,7 @@ use crate::file_group::reader_v2::buffered_record_converter::BufferedRecordConve
 use crate::file_group::reader_v2::input_split::InputSplit;
 use crate::file_group::reader_v2::iterator_mode::IteratorMode;
 use crate::file_group::reader_v2::merge_iterator::{
-    FileGroupMergeStream, StreamStatsHandle, new_stream_stats_handle,
+    BaseBatchStream, FileGroupMergeStream, StreamStatsHandle, new_stream_stats_handle,
 };
 use crate::file_group::reader_v2::output_converter::OutputConverter;
 use crate::file_group::reader_v2::profiling::profile_once;
@@ -46,12 +49,17 @@ use crate::file_group::reader_v2::read_stats::HoodieReadStats;
 use crate::file_group::reader_v2::reader_context::ReaderContext;
 use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
 use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
+use crate::storage::util::join_url_segments;
 use crate::storage::{RowFilterBuilder, RowGroupSelector, Storage};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use futures::StreamExt;
 use std::str::FromStr;
 use std::sync::Arc;
+// Aliased because an unqualified `Mutex` in this neighbourhood reads as
+// `tokio::sync::Mutex`. The provider-stats slot is deliberately the std lock: it
+// is only ever held for a handful of field additions, never across an `.await`.
+use std::sync::Mutex as StdMutex;
 
 /// The top-level file group reader orchestrator.
 ///
@@ -130,6 +138,41 @@ pub struct HoodieFileGroupReader {
     /// Converter for engine records to [`BufferedRecord`].
     /// Mirrors Java's `BufferedRecordConverter<T> bufferedRecordConverter`.
     buffered_record_converter: Option<Box<dyn BufferedRecordConverter>>,
+
+    /// Optional injected base-file data provider (dependency injection).
+    ///
+    /// `None` on the default (OSS) path — the reader then reads every base file
+    /// from object storage. When set via
+    /// [`HoodieFileGroupReaderBuilder::with_base_file_provider`], the reader
+    /// offers each base file to the provider before the object-store read.
+    /// hudi-core implements no provider; see [`super::base_file_provider`].
+    base_file_provider: Option<BaseFileDataProviderRef>,
+
+    /// The one provider-stats sink for this reader.
+    ///
+    /// Shared rather than plain because the base source is **lazy**: only the
+    /// setup counters (`files_served`, `storage_fallbacks`, the wall timings) are
+    /// known when [`Self::base_file_source`] returns, while the drain counters
+    /// (`rows_served`, `bytes_materialized`, `batches_received`) fill in as the
+    /// caller pulls the merge stream — which, on the FFI path, happens after the
+    /// reader itself has been dropped. So the slot is seeded at serve time and
+    /// topped up in place by [`served_batch_stream`].
+    ///
+    /// [`Self::read`] snapshots it into
+    /// [`HoodieReadStats::base_file_provider`](super::read_stats::HoodieReadStats::base_file_provider)
+    /// once the stream is exhausted; a streaming caller reads it live through
+    /// [`Self::base_file_provider_live_stats`]. All-zero when no provider is
+    /// injected, so the seam costs the default path one `Arc` allocation and
+    /// nothing else.
+    base_file_provider_stats: Arc<StdMutex<BaseFileProviderStats>>,
+
+    /// Guards the "exactly one provider attempt per reader" invariant that
+    /// [`Self::record_provider_stats`] relies on to rule out double-counting.
+    ///
+    /// An atomic rather than a plain `bool` so recording stays a `&self`
+    /// operation: the seam runs inside `base_file_source`, which is already
+    /// holding an immutable borrow of `self` through its `read_options` closure.
+    provider_stats_recorded: std::sync::atomic::AtomicBool,
     // NOTE: the optional parquet `RowFilter` builder lives on
     // `reader_context`, not this struct, so the same builder is
     // visible to (a) the base parquet read here, and (b) the parquet log
@@ -211,6 +254,90 @@ impl BaseSource {
             batches: futures::stream::empty().boxed(),
         }
     }
+}
+
+/// Adapt a provider's served base file into the stream the merge consumes.
+///
+/// **One blocking task owns the reader for its whole life.** That is what keeps
+/// the two properties the provider contract rests on:
+/// - *Thread affinity.* Every `next()` runs on the same OS thread, so a provider
+///   may hold a thread-local arena or a thread-bound connection, and may call
+///   `block_on` on the read's runtime — a blocking-pool thread has that runtime's
+///   handle set but is not "entered", so nested `block_on` does not panic there.
+///   Pulling each batch in its own `spawn_blocking` would move the reader between
+///   pool threads and quietly withdraw both guarantees.
+/// - *No runtime worker is stalled.* `next()` may block on IO for as long as it
+///   likes without holding up the executor driving the rest of the merge.
+///
+/// Batches cross back over a depth-1 channel, so the file stays lazy — but the
+/// producer is not lock-step with the consumer. With one batch delivered, one
+/// more sits in the channel and a third is blocked in `blocking_send`, so the
+/// reader runs **up to two batches ahead** and at most three are resident at
+/// once. Bounded and small against `MERGE_CHUNK_ROWS`, and nothing like the whole
+/// file — but it does mean a read that ends early may have paid for two batches
+/// nobody consumed, so a provider's `next()` must be free of side effects it
+/// would not want on a cancelled read. That is the whole deviation from strictly
+/// demand-driven, and it is what buys the affinity above.
+///
+/// Per batch, in this order: the batch is evolved to `evolve_to` — the same
+/// per-batch projection the object-store read applies, so a served file and a
+/// read file are indistinguishable downstream — and then the **drain** counters
+/// are tallied into `stats`, post-projection, which is what
+/// [`BaseFileProviderStats::bytes_materialized`] documents itself as.
+///
+/// Errors are forwarded, never swallowed into end-of-stream: a mid-stream
+/// provider failure must fail the read rather than silently truncate it into a
+/// short success. The producer stops after the first error, so the reader is not
+/// polled again.
+///
+/// The task is not tracked by a `JoinHandle` because the channel already bounds
+/// it: dropping the returned stream drops the receiver, the next `blocking_send`
+/// fails, and the producer returns. There is no path on which it outlives its
+/// consumer by more than one batch.
+///
+/// It does occupy a blocking-pool slot for the whole served read rather than for
+/// one batch, so the ceiling is concurrently-open file groups, not batches. That
+/// is bounded by the caller's split concurrency (~16 for Velox) against tokio's
+/// 512-thread default, and the thread is parked on `blocking_send` for most of
+/// its life. A caller opening thousands of file groups at once against a serving
+/// provider would need to raise `max_blocking_threads`.
+fn served_batch_stream(
+    reader: Box<dyn arrow_array::RecordBatchReader + Send>,
+    evolve_to: SchemaRef,
+    stats: Arc<StdMutex<BaseFileProviderStats>>,
+) -> BaseBatchStream {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
+    tokio::task::spawn_blocking(move || {
+        for item in reader {
+            let projected = match item {
+                Ok(batch) => {
+                    crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)
+                }
+                Err(e) => Err(CoreError::ReadFileSliceError(format!(
+                    "base-file provider stream failed: {e}"
+                ))),
+            };
+            if let Ok(batch) = &projected {
+                // Ignore lock poison defensively: the counters are advisory and
+                // must never fail a read.
+                if let Ok(mut slot) = stats.lock() {
+                    slot.batches_received += 1;
+                    slot.rows_served += batch.num_rows() as u64;
+                    slot.bytes_materialized += batch.get_array_memory_size() as u64;
+                }
+            }
+            let was_err = projected.is_err();
+            // `Err` here means the consumer dropped the stream: stop pulling the
+            // provider for a read nobody is reading.
+            if tx.blocking_send(projected).is_err() || was_err {
+                return;
+            }
+        }
+    });
+    futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    })
+    .boxed()
 }
 
 /// `schema` without the internal row-position column.
@@ -398,6 +525,9 @@ impl HoodieFileGroupReader {
             stream_stats: new_stream_stats_handle(),
             valid_block_instants: Vec::new(),
             buffered_record_converter: None,
+            base_file_provider: None,
+            base_file_provider_stats: Arc::new(StdMutex::new(BaseFileProviderStats::default())),
+            provider_stats_recorded: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -493,6 +623,7 @@ impl HoodieFileGroupReader {
         // drove it to exhaustion. Drain them back into `self.read_stats` so
         // `read_stats()`-based callers (fg-bench, tests, reader_v1) observe them.
         self.drain_stream_stats();
+        self.snapshot_provider_stats();
         Ok(batch)
     }
 
@@ -1013,11 +1144,26 @@ impl HoodieFileGroupReader {
                 Vec::new()
             };
 
-        // ONE verdict, both consumers, withdrawn in one block. That is the same
-        // property the merge-safety gate is bound once for, one layer in: an edit
-        // to the condition cannot leave the row-group selector behind, and pruning
-        // is the one that must not be left behind — it drops rows before anything
-        // downstream can see them.
+        // ONE verdict, THREE consumers. This SHADOWS the merge-safety gate bound
+        // above: the row filter, the row-group selector and the injected
+        // provider's `can_push_predicate` all read the narrowed value from here
+        // down, so a consumer cannot be left behind by a later edit. That is the
+        // same property the merge gate is bound once for, one layer in.
+        //
+        // The provider is the consumer that would otherwise be left behind, and
+        // nothing would have said so: it arrived on a branch that forked BEFORE
+        // this gate existed (`2ba0dbd`), so the merge that brought it in was
+        // textually clean and touched no call site the repair work had ever seen.
+        // A provider told it may push applies the predicate to the file's own
+        // physical values and drops the same rows the in-process `RowFilter`
+        // would have — rows the post-merge filter cannot restore. Withdrawing
+        // only the in-process filter would leave the FFI reader exposed on
+        // exactly the files this guard exists for.
+        //
+        // Rebound rather than folded into the `if` below because the value, not
+        // the branch, is what the provider request reads: it is the same
+        // narrowing internal `reader/mod.rs` applies, expressed for this tree.
+        let pushdown_is_safe = pushdown_is_safe && repair_conflict.is_empty();
         if !repair_conflict.is_empty() {
             let volume = self.storage.read_volume();
             // Counted for every withdrawal; `row_group_selector_suppressed` can
@@ -1055,6 +1201,69 @@ impl HoodieFileGroupReader {
             return Ok(BaseSource::empty(base_read_schema));
         }
 
+        // ── Injected base-file data provider (base file only) ───────────────
+        // Offer the base file to an injected provider before the object-store
+        // read. Skipped under position-based merge, which needs the synthetic
+        // row-index column a provider does not supply (there `base_read_schema`
+        // = required + row-index, while a provider returns only projected data
+        // columns). Served batches arrive at the `intersection` schema — the
+        // same shape the object-store read below produces — and are evolved to
+        // `base_read_schema` per batch, exactly like that read.
+        //
+        // Offered only after `base_file_in_range` has kept the file: a file the
+        // instant range excludes contributes no rows either way, and asking a
+        // provider for it would be a round-trip for nothing.
+        //
+        // `None`, or no provider injected, falls through to the unchanged read.
+        //
+        // `can_push_predicate` below is the REPAIR-NARROWED verdict, not the
+        // merge gate: `pushdown_is_safe` was rebound above, after the footer read
+        // and before this request, which is the only ordering on which the
+        // provider can see the same decision the in-process `RowFilter` got for
+        // this file.
+        if !use_position && let Some(provider) = self.base_file_provider.clone() {
+            let file_uri = join_url_segments(&self.storage.base_url, &[path.as_str()])
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| path.clone());
+            let partition_fields = self.partition_fields();
+            let (outcome, stats) = provider
+                .try_base_file(BaseFileDataRequest {
+                    file_uri: &file_uri,
+                    projected_schema: &intersection,
+                    can_push_predicate: pushdown_is_safe,
+                    partition_path: &self.input_split.partition_path,
+                    partition_fields: &partition_fields,
+                    data_schema: self.schema_handler.data_schema.as_ref(),
+                })
+                .await;
+            // Seed the shared slot with the setup counters on BOTH outcomes: a
+            // fallback still reports its discover/connect timings, and
+            // `storage_fallbacks` is the counter that makes a silent
+            // fall-through visible.
+            self.record_provider_stats(&stats);
+            if let Some(served) = outcome {
+                // trace, not debug: one line per base file per read, matching
+                // the level the internal reader logs these at.
+                log::trace!(
+                    "[HoodieFileGroupReader] base-file provider served '{path}' \
+                     ({} intersect cols, streaming)",
+                    intersection.fields().len()
+                );
+                return Ok(BaseSource {
+                    schema: base_read_schema.clone(),
+                    batches: served_batch_stream(
+                        served,
+                        base_read_schema,
+                        self.base_file_provider_stats.clone(),
+                    ),
+                });
+            }
+            log::trace!(
+                "[HoodieFileGroupReader] base-file provider declined '{path}' — \
+                 falling through to the object-store read"
+            );
+        }
+
         // Open the base file as a stream. The whole file never lives in memory;
         // one batch does. The gated RowFilter and row-group selector are both
         // threaded through the intersection read. Only the SELECTOR skips IO: a
@@ -1087,6 +1296,83 @@ impl HoodieFileGroupReader {
             schema: base_read_schema,
             batches: evolved.boxed(),
         })
+    }
+
+    /// The table's partition field names, in `hoodie.table.partition.fields`
+    /// order. Empty for a non-partitioned table, or when the config is absent.
+    ///
+    /// Only the provider seam needs these: they are how a provider maps the
+    /// split's `partition_path` back onto typed partition columns.
+    fn partition_fields(&self) -> Vec<String> {
+        self.reader_context
+            .table_config
+            .get(HudiTableConfig::PartitionFields.as_ref())
+            .map(|fields| {
+                fields
+                    .split(',')
+                    .map(|field| field.trim().to_string())
+                    .filter(|field| !field.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Fold one provider attempt's setup counters into the shared slot.
+    ///
+    /// The single writer, so "no counter is recorded twice" is a property of this
+    /// function rather than an invariant spread across call sites. It holds
+    /// because a reader offers exactly one base file to the provider, so this
+    /// runs at most once per reader — asserted in debug builds via
+    /// [`Self::provider_stats_recorded`]. The condition it catches is real on
+    /// this lineage too: [`Self::base_file_source`] is reached from both
+    /// [`Self::open`] and [`Self::read`], so driving one reader through both (or
+    /// through `read()` twice) would silently double the setup counters.
+    ///
+    /// In release a second call accumulates rather than panicking: these are
+    /// diagnostic counters and must never fail a read. The lock poison is
+    /// swallowed for the same reason.
+    fn record_provider_stats(&self, stats: &BaseFileProviderStats) {
+        let already = self
+            .provider_stats_recorded
+            .swap(true, std::sync::atomic::Ordering::Relaxed);
+        debug_assert!(
+            !already,
+            "base-file provider stats recorded twice on one reader — the \
+             single-sink invariant that rules out double-counting is broken; \
+             `base_file_source` was driven more than once"
+        );
+        if let Ok(mut slot) = self.base_file_provider_stats.lock() {
+            slot.merge(stats);
+        }
+    }
+
+    /// Copy the shared provider slot into [`Self::read_stats`].
+    ///
+    /// Called by [`Self::read`], where the stream is exhausted and the drain
+    /// counters are therefore final. `None` stays `None` when no provider ever
+    /// ran, so `base_file_provider: Some(all zeroes)` cannot be confused with
+    /// "no provider injected".
+    fn snapshot_provider_stats(&mut self) {
+        if self.base_file_provider.is_none() {
+            return;
+        }
+        if let Ok(slot) = self.base_file_provider_stats.lock() {
+            self.read_stats.base_file_provider = Some(slot.clone());
+        }
+    }
+
+    /// Live handle to this reader's provider counters.
+    ///
+    /// The setup counters are populated by the time [`Self::open`] returns; the
+    /// drain counters (`rows_served` / `bytes_materialized` /
+    /// `batches_received`) fill in as the caller pulls the merge stream, so read
+    /// this **after** draining for the complete picture. All-zero when no
+    /// provider served a base file.
+    ///
+    /// FFI consumers capture this before dropping the reader, for the same
+    /// reason they capture [`Self::stream_stats_handle`].
+    pub fn base_file_provider_live_stats(&self) -> Arc<StdMutex<BaseFileProviderStats>> {
+        self.base_file_provider_stats.clone()
     }
 
     /// Whether this slice's base file is inside the read's instant range.
@@ -1297,6 +1583,8 @@ pub struct HoodieFileGroupReaderBuilder {
     /// Set by `with_repair_risk_columns`; copied onto the cloned reader_context.
     /// Absent leaves the repair guard OFF.
     repair_risk_columns: Option<Vec<String>>,
+    /// Set by `with_base_file_provider`; injected onto the reader at build time.
+    base_file_provider: Option<BaseFileDataProviderRef>,
 }
 
 /// Reached only from the test harness — see the builder's own note.
@@ -1392,6 +1680,17 @@ impl HoodieFileGroupReaderBuilder {
         self
     }
 
+    /// Inject a base-file data provider (dependency injection).
+    ///
+    /// The built reader offers each base file to `provider` before the
+    /// object-store read; a provider that returns `None` falls through to that
+    /// read. hudi-core ships no provider — a downstream crate supplies one. See
+    /// [`BaseFileDataProvider`](super::base_file_provider::BaseFileDataProvider).
+    pub fn with_base_file_provider(mut self, provider: BaseFileDataProviderRef) -> Self {
+        self.base_file_provider = Some(provider);
+        self
+    }
+
     pub fn build(self) -> Result<HoodieFileGroupReader> {
         let reader_context = self
             .reader_context
@@ -1430,7 +1729,7 @@ impl HoodieFileGroupReaderBuilder {
             reader_context
         };
 
-        let reader = HoodieFileGroupReader::new(
+        let mut reader = HoodieFileGroupReader::new(
             reader_context,
             storage,
             input_split,
@@ -1438,6 +1737,7 @@ impl HoodieFileGroupReaderBuilder {
             self.data_schema,
             self.requested_schema,
         )?;
+        reader.base_file_provider = self.base_file_provider;
 
         Ok(reader)
     }
@@ -3410,6 +3710,118 @@ mod tests {
         );
     }
 
+    // ── the repair gate vs. the INJECTED PROVIDER ────────────────────────────
+    //
+    // Ported from internal `file_group/reader/mod.rs`
+    // (`repair_conflict_also_withdraws_provider_pushdown`) and re-expressed for
+    // this tree: different file, different reader, different provider trait, and
+    // a stub that lives in this module rather than that one — so this is a port
+    // from tree, not a cherry-pick.
+    //
+    // The pair matters more than either half. `..._withdraws_provider_pushdown`
+    // alone would pass against a seam hard-wired to `false`; `..._keeps_...`
+    // alone would pass against the un-narrowed merge gate, which is exactly the
+    // defect. Only both together pin the verdict to the per-file decision.
+
+    /// THE PROVIDER PATH. `can_push_predicate` must carry the same verdict the
+    /// in-process `RowFilter` got for this file.
+    ///
+    /// An injected provider told it may push applies the predicate to the file's
+    /// own physical values and drops the same rows the parquet `RowFilter` would
+    /// have — and the post-merge filter cannot restore them. So a guard that
+    /// clears only `row_filter`/`row_group_selector` leaves the FFI reader
+    /// exposed on precisely the files it exists for.
+    ///
+    /// Mutation proof: revert the `let pushdown_is_safe = pushdown_is_safe &&
+    /// repair_conflict.is_empty();` rebinding in `base_file_source` and this test
+    /// fails on the `!can_push` assertion, while every other test in this file
+    /// still passes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repair_conflict_also_withdraws_provider_pushdown() {
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(
+            tmp.path(),
+            base_name,
+            arrow_schema::TimeUnit::Microsecond, // the LIE
+        );
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            straddling_table_schema(),
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        // Declines to serve, so the read falls through to storage and the only
+        // thing under test is the request the provider was handed.
+        let provider = StubDataProvider::not_serving();
+        reader.base_file_provider = Some(provider.clone());
+        assert!(
+            reader.base_read_pushdown_is_safe(),
+            "the merge gate passes on a slice with no log files; the repair \
+             conflict is what must withdraw the provider's pushdown"
+        );
+
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        let seen = provider
+            .seen()
+            .expect("the provider must have been offered the file");
+        assert!(
+            !seen.can_push_predicate,
+            "a file needing a value-reinterpreting repair must withdraw PROVIDER \
+             pushdown too, not only the in-process row filter"
+        );
+    }
+
+    /// The other half, and the reason the assertion above is not vacuous: the
+    /// same fixture with an honestly labelled file must still hand the provider
+    /// `true`.
+    ///
+    /// Without this, `can_push_predicate: false` — a blanket regression that
+    /// costs every well-formed table its provider-side pushdown — passes the test
+    /// above.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_honestly_labelled_file_keeps_provider_pushdown() {
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Millisecond);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            straddling_table_schema(),
+            builder,
+            None,
+            &["ts"], // the guard is ARMED; the file is simply honest
+        )
+        .await;
+        let provider = StubDataProvider::not_serving();
+        reader.base_file_provider = Some(provider.clone());
+
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        let seen = provider
+            .seen()
+            .expect("the provider must have been offered the file");
+        assert!(
+            seen.can_push_predicate,
+            "an armed guard over an honestly labelled file must leave provider \
+             pushdown intact"
+        );
+    }
+
     #[test]
     fn builder_routes_repair_risk_columns_into_reader_context() {
         let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
@@ -3442,5 +3854,820 @@ mod tests {
             reader.reader_context.repair_risk_columns.is_empty(),
             "unset must leave the guard disarmed, not populated by accident"
         );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Injected base-file data provider (`base_file_provider`).
+    //
+    // hudi-core defines the trait and never implements it, so these tests
+    // supply their own in-module stub. That is the point: the whole contract —
+    // served data is used, `None` falls through, counters land in the shared
+    // slot and in `HoodieReadStats::base_file_provider` — is verifiable with no
+    // concrete provider in the picture.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Test-only [`BaseFileDataProvider`] returning a canned outcome and
+    /// recording the request it was handed.
+    struct StubDataProvider {
+        /// Batches to serve; `None` reports a storage fallback.
+        serve: Option<Vec<RecordBatch>>,
+        /// When set, the served reader yields `serve`'s batches and *then* an
+        /// error — a provider that reports SERVED and dies mid-stream, the shape
+        /// the streaming contract makes query-visible.
+        fail_after_serving: bool,
+        /// The request fields of the last call.
+        seen: StdMutex<Option<SeenRequest>>,
+    }
+
+    /// What [`StubDataProvider`] records off a [`BaseFileDataRequest`]. A struct
+    /// rather than a tuple so an assertion names the field it is checking.
+    #[derive(Clone, Debug, PartialEq)]
+    struct SeenRequest {
+        file_uri: String,
+        projected_schema: SchemaRef,
+        can_push_predicate: bool,
+        partition_path: String,
+        partition_fields: Vec<String>,
+    }
+
+    impl StubDataProvider {
+        fn serving(batches: Vec<RecordBatch>) -> Arc<Self> {
+            Arc::new(Self {
+                serve: Some(batches),
+                fail_after_serving: false,
+                seen: StdMutex::new(None),
+            })
+        }
+
+        /// Serves `batches`, then errors instead of ending the stream cleanly.
+        fn serving_then_failing(batches: Vec<RecordBatch>) -> Arc<Self> {
+            Arc::new(Self {
+                serve: Some(batches),
+                fail_after_serving: true,
+                seen: StdMutex::new(None),
+            })
+        }
+
+        fn not_serving() -> Arc<Self> {
+            Arc::new(Self {
+                serve: None,
+                fail_after_serving: false,
+                seen: StdMutex::new(None),
+            })
+        }
+
+        fn seen(&self) -> Option<SeenRequest> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    /// The error a `serving_then_failing` stub injects. Matched on by the
+    /// mid-stream tests so they cannot pass on some unrelated failure.
+    const STUB_MID_STREAM_ERROR: &str = "stub provider died mid-stream";
+
+    #[async_trait::async_trait]
+    impl crate::file_group::reader_v2::base_file_provider::BaseFileDataProvider for StubDataProvider {
+        async fn try_base_file(
+            &self,
+            req: BaseFileDataRequest<'_>,
+        ) -> (
+            Option<Box<dyn arrow_array::RecordBatchReader + Send + 'static>>,
+            BaseFileProviderStats,
+        ) {
+            *self.seen.lock().unwrap() = Some(SeenRequest {
+                file_uri: req.file_uri.to_string(),
+                projected_schema: req.projected_schema.clone(),
+                can_push_predicate: req.can_push_predicate,
+                partition_path: req.partition_path.to_string(),
+                partition_fields: req.partition_fields.to_vec(),
+            });
+            match &self.serve {
+                Some(batches) => {
+                    // Serve the batches as a lazy reader, matching the real
+                    // provider's streaming contract.
+                    let schema = batches
+                        .first()
+                        .map(|b| b.schema())
+                        .unwrap_or_else(|| req.projected_schema.clone());
+                    let mut items: Vec<std::result::Result<RecordBatch, arrow_schema::ArrowError>> =
+                        batches.clone().into_iter().map(Ok).collect();
+                    if self.fail_after_serving {
+                        items.push(Err(arrow_schema::ArrowError::ExternalError(Box::new(
+                            std::io::Error::other(STUB_MID_STREAM_ERROR),
+                        ))));
+                    }
+                    let reader = arrow_array::RecordBatchIterator::new(items.into_iter(), schema);
+                    (
+                        Some(Box::new(reader)),
+                        BaseFileProviderStats {
+                            files_served: 1,
+                            ..Default::default()
+                        },
+                    )
+                }
+                None => (
+                    None,
+                    BaseFileProviderStats {
+                        storage_fallbacks: 1,
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+    }
+
+    /// One-column `{id: int32}` batch — the smallest thing both the on-disk base
+    /// file and the stubbed provider can carry, so a value difference proves
+    /// which source the reader actually used.
+    fn id_batch(values: Vec<i32>) -> (SchemaRef, RecordBatch) {
+        use arrow_array::Int32Array;
+        let schema: SchemaRef =
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "id",
+                arrow_schema::DataType::Int32,
+                true,
+            )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap();
+        (schema, batch)
+    }
+
+    fn id_values(batch: &RecordBatch) -> Vec<i32> {
+        use arrow_array::Int32Array;
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        (0..col.len()).map(|i| col.value(i)).collect()
+    }
+
+    /// A reader over `base_name` with `provider` injected through the same
+    /// builder field the FFI bridge sets.
+    async fn reader_with_provider(
+        dir: &std::path::Path,
+        base_name: &str,
+        required: SchemaRef,
+        provider: Arc<StubDataProvider>,
+    ) -> HoodieFileGroupReader {
+        let mut reader = test_file_group_reader_for_base_file(dir, base_name, required).await;
+        reader.base_file_provider = Some(provider);
+        reader
+    }
+
+    /// Served data is used instead of the object-store read, and is counted.
+    ///
+    /// The provider's batch deliberately holds different values from the parquet
+    /// file on disk, so the assertion can only pass if the provider's data — not
+    /// the file's — reached the caller.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn base_file_provider_data_is_served_instead_of_the_base_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let (_, served) = id_batch(vec![7, 8]);
+        let provider = StubDataProvider::serving(vec![served]);
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema.clone(), provider).await;
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+        assert_eq!(
+            id_values(&out),
+            vec![7, 8],
+            "the provider's batch must be served, not the file on disk"
+        );
+        let stats = reader.base_file_provider_live_stats();
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.files_served, 1, "the served file is counted");
+        assert_eq!(stats.storage_fallbacks, 0);
+    }
+
+    /// The served source is **lazy**: its drain counters (rows/bytes/batches)
+    /// fill the FFI-observable slot only as batches are pulled, not up front.
+    /// That is the memory contract — the whole served file is never resident at
+    /// serve time — and a counter populated early is the symptom of losing it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn base_file_provider_served_source_is_lazy_and_counts_on_drain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        // Two served batches so `batches_received` is meaningfully > 1.
+        let (_, b1) = id_batch(vec![7, 8]);
+        let (_, b2) = id_batch(vec![9]);
+        let provider = StubDataProvider::serving(vec![b1, b2]);
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema.clone(), provider).await;
+
+        let live = reader.base_file_provider_live_stats();
+        let source = reader.base_file_source().await.unwrap();
+
+        // Setup counter seeded at serve time; drain counters still zero because
+        // the lazy source has not been pulled yet.
+        {
+            let s = live.lock().unwrap();
+            assert_eq!(s.files_served, 1, "setup counter seeded before drain");
+            assert_eq!(s.batches_received, 0, "no batches drained yet");
+            assert_eq!(s.rows_served, 0, "no rows drained yet");
+        }
+
+        // Draining the lazy source fills the drain counters in place.
+        let out = drain_base_source(source).await;
+        assert_eq!(id_values(&out), vec![7, 8, 9], "served data, streamed");
+        let s = live.lock().unwrap();
+        assert_eq!(
+            s.batches_received, 2,
+            "both served batches counted on drain"
+        );
+        assert_eq!(s.rows_served, 3, "all served rows counted on drain");
+        // Bound it rather than just `> 0`: three i32 values plus validity cannot
+        // plausibly need a megabyte, and an unbounded assertion would pass on a
+        // counter that had accumulated garbage.
+        assert!(
+            (1..1_048_576).contains(&s.bytes_materialized),
+            "materialized bytes counted on drain, within a sane range: {}",
+            s.bytes_materialized
+        );
+    }
+
+    /// `read()` snapshots the shared slot into `read_stats` once the merge has
+    /// drained it, so a `read_stats()`-based caller sees the complete picture —
+    /// setup counters *and* drain counters — without knowing the slot exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn base_file_provider_read_snapshots_the_slot_into_read_stats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let (_, b1) = id_batch(vec![7, 8]);
+        let (_, b2) = id_batch(vec![9]);
+        let provider = StubDataProvider::serving(vec![b1, b2]);
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema.clone(), provider).await;
+
+        let batch = reader.read().await.unwrap();
+        assert_eq!(
+            id_values(&batch),
+            vec![7, 8, 9],
+            "served data reached read()"
+        );
+
+        let recorded = reader
+            .read_stats()
+            .base_file_provider
+            .as_ref()
+            .expect("read() snapshots the provider stats");
+        assert_eq!(recorded.files_served, 1, "setup counter preserved");
+        assert_eq!(recorded.batches_received, 2, "both batches counted");
+        assert_eq!(recorded.rows_served, 3, "all rows counted");
+        assert!(
+            recorded.bytes_materialized > 0,
+            "materialized bytes counted by the time read() returns"
+        );
+    }
+
+    /// **Anti-truncation guard for the served source.**
+    ///
+    /// A lazy source means a provider error is no longer classified before any
+    /// data is handed downstream: it has to surface *mid-iteration*. The
+    /// regression this catches is an adapter that maps that error to
+    /// end-of-stream, because then a provider dying halfway through returns a
+    /// short, *successful* read and silently drops the remaining base rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn base_file_provider_mid_stream_error_surfaces_and_never_ends_the_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        // One good batch, then the provider dies.
+        let (_, good) = id_batch(vec![7, 8]);
+        let provider = StubDataProvider::serving_then_failing(vec![good]);
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema.clone(), provider).await;
+
+        let source = reader
+            .base_file_source()
+            .await
+            .expect("serving succeeds — the failure is mid-stream, not at setup");
+        let mut batches = source.batches;
+
+        // Batch 1 arrives normally.
+        let first = batches
+            .next()
+            .await
+            .expect("a first item")
+            .expect("first batch is good");
+        assert_eq!(id_values(&first), vec![7, 8]);
+
+        // Batch 2 is the injected failure. It MUST be `Some(Err(_))`, never
+        // `None` — `None` here is the silent-truncation bug.
+        let second = batches
+            .next()
+            .await
+            .expect("mid-stream failure must be reported, not silently end the stream");
+        let err = second.expect_err("second item must be the provider's error");
+        assert!(
+            err.to_string().contains(STUB_MID_STREAM_ERROR),
+            "the provider's own error must reach the consumer, not be replaced: {err}"
+        );
+    }
+
+    /// The same anti-truncation guarantee, one layer up: an error from the base
+    /// source must come out of the **merge** as an error, not as a clean end of
+    /// iteration. This is the level a query actually observes, and it covers the
+    /// no-log-file (CoW / MOR `_ro`) shape, which takes the eager merge iterator
+    /// rather than the record buffer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn base_file_provider_mid_stream_error_fails_the_merge_not_truncates_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let (_, good) = id_batch(vec![7, 8]);
+        let provider = StubDataProvider::serving_then_failing(vec![good]);
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema.clone(), provider).await;
+
+        let mut merged = reader.open_stream().await.expect("open succeeds");
+
+        // Drive the merge to completion, recording whether an error appeared.
+        let mut saw_error = None;
+        let mut ok_rows = 0usize;
+        while let Some(item) = merged.next().await {
+            match item {
+                Ok(batch) => ok_rows += batch.num_rows(),
+                Err(e) => {
+                    saw_error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        let err = saw_error.expect(
+            "the merge must surface the provider's mid-stream error; ending cleanly here \
+             would be a short successful read — silent data loss",
+        );
+        assert!(
+            err.contains(STUB_MID_STREAM_ERROR),
+            "the underlying provider error must be preserved through the merge: {err}"
+        );
+        // Whatever made it through before the failure is fine to have emitted —
+        // the point is that the read did not *complete* on it.
+        assert!(
+            ok_rows <= 2,
+            "only the pre-failure batch could have been emitted, got {ok_rows} rows"
+        );
+    }
+
+    /// A provider that returns `None` falls through to the object-store read,
+    /// and is still counted — the failure mode this guards is an unserved file
+    /// quietly emptying a read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn base_file_provider_none_falls_through_to_the_base_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::not_serving();
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema.clone(), provider).await;
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+        assert_eq!(
+            id_values(&out),
+            vec![1, 2],
+            "a fallback must read the base file exactly as if no provider were injected"
+        );
+        let stats = reader.base_file_provider_live_stats();
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.storage_fallbacks, 1, "a fallback reports its attempt");
+        assert_eq!(stats.files_served, 0);
+        assert_eq!(stats.rows_served, 0, "a fallback serves no rows");
+    }
+
+    /// With no provider injected the read is unchanged and `base_file_provider`
+    /// stays `None`, so the provider concept costs the default path nothing —
+    /// and `Some(all-zeroes)` can never be confused with "no provider injected".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_base_file_provider_leaves_read_and_stats_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let mut reader =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, schema.clone()).await;
+        let batch = reader.read().await.unwrap();
+        assert_eq!(id_values(&batch), vec![1, 2]);
+        assert!(
+            reader.read_stats().base_file_provider.is_none(),
+            "no provider injected → no provider stats section at all"
+        );
+    }
+
+    /// The provider is handed the base file's absolute URI, the projected schema
+    /// the read wants back, the reader's pushdown decision and the partition
+    /// coordinates — the inputs an implementation cannot be correct without.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn base_file_provider_request_carries_uri_schema_and_pushdown_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let provider = StubDataProvider::not_serving();
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema.clone(), provider.clone()).await;
+        // Partition fields are read off the table config, so set one and prove it
+        // is parsed rather than passed through verbatim (note the stray space).
+        {
+            let ctx = Arc::get_mut(&mut reader.reader_context).expect("sole owner in test");
+            ctx.table_config.insert(
+                HudiTableConfig::PartitionFields.as_ref().to_string(),
+                "city, ts".to_string(),
+            );
+        }
+        let expected_gate = reader.base_read_pushdown_is_safe();
+        let _ = reader.base_file_source().await.unwrap();
+
+        let seen = provider.seen().expect("provider called");
+        assert!(
+            seen.file_uri.ends_with(base_name),
+            "request must carry the base file's own URI, got {}",
+            seen.file_uri
+        );
+        assert_eq!(
+            seen.projected_schema, schema,
+            "request must carry the projected schema the read wants back"
+        );
+        assert_eq!(
+            seen.can_push_predicate, expected_gate,
+            "request must carry the reader's pushdown decision for this file. \
+             This fixture arms no repair-risk column, so the repair gate cannot \
+             narrow anything and the decision coincides with the merge gate; the \
+             case where it does NOT is \
+             `repair_conflict_also_withdraws_provider_pushdown`"
+        );
+        assert_eq!(
+            seen.partition_fields,
+            vec!["city".to_string(), "ts".to_string()],
+            "partition fields must be split and trimmed"
+        );
+        assert_eq!(
+            seen.partition_path, "",
+            "the split's partition path is passed through as-is"
+        );
+    }
+
+    /// A base file the instant range excludes is never offered to the provider.
+    ///
+    /// The range is a per-file decision settled before the read opens, so asking
+    /// a provider to serve a file whose rows are all going to be dropped would be
+    /// a round-trip for nothing — and, if a provider ever forgot the range, a way
+    /// for excluded rows to reach an incremental query.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn base_file_provider_is_not_offered_a_file_outside_the_instant_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        // The base file's own commit instant is "001" (…_001.parquet).
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+        let (_, served) = id_batch(vec![7, 8, 9]);
+
+        // Range that EXCLUDES the base file's instant: open start "100" > "001".
+        let provider = StubDataProvider::serving(vec![served.clone()]);
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema.clone(), provider.clone()).await;
+        {
+            let ctx = Arc::get_mut(&mut reader.reader_context).expect("sole owner in test");
+            ctx.instant_range = Some(InstantRange::within_open_closed("100", "999", "UTC"));
+        }
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+        assert_eq!(
+            out.num_rows(),
+            0,
+            "a base file outside the instant range contributes no rows"
+        );
+        assert!(
+            provider.seen().is_none(),
+            "an excluded base file must not be offered to the provider at all"
+        );
+
+        // Control: a range that INCLUDES "001" reaches the provider and keeps the
+        // served rows, proving the zero above came from the range and not from
+        // the seam being unreachable.
+        let provider = StubDataProvider::serving(vec![served]);
+        let mut reader =
+            reader_with_provider(tmp.path(), base_name, schema.clone(), provider.clone()).await;
+        {
+            let ctx = Arc::get_mut(&mut reader.reader_context).expect("sole owner in test");
+            ctx.instant_range = Some(InstantRange::up_to("999", "UTC"));
+        }
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+        assert_eq!(
+            id_values(&out),
+            vec![7, 8, 9],
+            "served rows inside the instant range survive"
+        );
+        assert!(provider.seen().is_some(), "an in-range file is offered");
+    }
+
+    /// Position-based merge skips the provider: the base read carries a
+    /// synthetic row-index column the position buffer matches log records
+    /// against, and a provider returns only projected data columns. Serving one
+    /// would drop the column and break the merge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn base_file_provider_is_skipped_under_position_based_merge() {
+        let (tmp, base_name, log_name, schema) = position_merge_slice();
+        let provider = StubDataProvider::serving(vec![id_batch(vec![7, 8]).1]);
+
+        let base_path = tmp.path().to_str().unwrap().to_string();
+        let hudi_configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath.as_ref(),
+            base_path,
+        )]));
+        let storage = Storage::new(Arc::new(HashMap::new()), hudi_configs).unwrap();
+        let input_split = InputSplit::new(
+            Some(base_name),
+            Some("001".to_string()),
+            vec![log_name],
+            String::new(),
+        );
+        let mut reader_context = ReaderContext::empty();
+        reader_context.latest_commit_time =
+            crate::file_group::reader_v2::MAX_INSTANT_TIME.to_string();
+        reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+        reader_context.rebuild_record_context(String::new());
+        let params = ReaderParameters {
+            use_record_position: true,
+            ..Default::default()
+        };
+
+        let mut reader = HoodieFileGroupReader::new(
+            Arc::new(reader_context),
+            storage,
+            input_split,
+            params,
+            None,
+            None,
+        )
+        .unwrap();
+        reader.schema_handler.required_schema = Some(schema);
+        reader.base_file_provider = Some(provider.clone());
+
+        assert!(
+            reader.use_record_position(),
+            "the fixture must actually take the position-merge path"
+        );
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+        assert!(
+            provider.seen().is_none(),
+            "position-based merge must not offer the base file to a provider"
+        );
+        assert_eq!(
+            id_values(&out.project(&[0]).unwrap()),
+            vec![1, 2],
+            "the base file itself is read, row-index column and all"
+        );
+        assert!(
+            out.schema()
+                .column_with_name(ROW_INDEX_TEMPORARY_COLUMN_NAME)
+                .is_some(),
+            "the row-index column the provider cannot supply is still present"
+        );
+    }
+
+    /// A base file plus one (empty) log file, so `use_record_position` is
+    /// satisfied: it needs log files, a parquet base file and a base commit time.
+    fn position_merge_slice() -> (tempfile::TempDir, String, String, SchemaRef) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+        let log_name = ".f1-0_20240101120000000.log.1_0-0-0";
+        std::fs::write(tmp.path().join(log_name), b"").unwrap();
+        (tmp, base_name.to_string(), log_name.to_string(), schema)
+    }
+
+    /// Counters accumulate per base file into one per-read total.
+    #[test]
+    fn base_file_provider_stats_merge_sums_counters() {
+        let mut total = BaseFileProviderStats {
+            files_served: 1,
+            local_served: 1,
+            rows_served: 10,
+            ..Default::default()
+        };
+        total.merge(&BaseFileProviderStats {
+            storage_fallbacks: 2,
+            remote_served: 1,
+            rows_served: 5,
+            fetch_wall_nanos: 7,
+            ..Default::default()
+        });
+        assert_eq!(total.files_served, 1);
+        assert_eq!(total.storage_fallbacks, 2);
+        assert_eq!(total.local_served, 1);
+        assert_eq!(total.remote_served, 1);
+        assert_eq!(total.rows_served, 15, "summed, not replaced");
+        assert_eq!(total.fetch_wall_nanos, 7);
+    }
+    /// A provider reader that records which thread each `next()` ran on, and
+    /// optionally drives an async fetch with `block_on` while it is there.
+    struct ProbeReader {
+        remaining: usize,
+        schema: SchemaRef,
+        threads: Arc<StdMutex<Vec<std::thread::ThreadId>>>,
+        block_on_each_next: bool,
+    }
+
+    impl Iterator for ProbeReader {
+        type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.remaining == 0 {
+                return None;
+            }
+            self.remaining -= 1;
+            self.threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            if self.block_on_each_next {
+                // The contract this pins: a served reader may drive async work
+                // with `block_on` on the very runtime driving the read. A
+                // blocking-pool thread has that runtime's handle set but is not
+                // "entered", so this does not panic — which is the whole reason
+                // the reader is moved onto the blocking pool rather than pulled
+                // from a runtime worker.
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async { tokio::task::yield_now().await });
+            }
+            Some(Ok(RecordBatch::new_empty(self.schema.clone())))
+        }
+    }
+
+    impl arrow_array::RecordBatchReader for ProbeReader {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+    }
+
+    /// A provider serving `batches` empty batches through a [`ProbeReader`].
+    struct ProbeProvider {
+        batches: usize,
+        threads: Arc<StdMutex<Vec<std::thread::ThreadId>>>,
+        block_on_each_next: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::file_group::reader_v2::base_file_provider::BaseFileDataProvider for ProbeProvider {
+        async fn try_base_file(
+            &self,
+            req: BaseFileDataRequest<'_>,
+        ) -> (
+            Option<Box<dyn arrow_array::RecordBatchReader + Send + 'static>>,
+            BaseFileProviderStats,
+        ) {
+            (
+                Some(Box::new(ProbeReader {
+                    remaining: self.batches,
+                    schema: req.projected_schema.clone(),
+                    threads: self.threads.clone(),
+                    block_on_each_next: self.block_on_each_next,
+                })),
+                BaseFileProviderStats {
+                    files_served: 1,
+                    ..Default::default()
+                },
+            )
+        }
+    }
+
+    async fn drive_probe(batches: usize, block_on_each_next: bool) -> Vec<std::thread::ThreadId> {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let threads = Arc::new(StdMutex::new(Vec::new()));
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), base_name, schema).await;
+        reader.base_file_provider = Some(Arc::new(ProbeProvider {
+            batches,
+            threads: threads.clone(),
+            block_on_each_next,
+        }));
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+        assert_eq!(out.num_rows(), 0, "the probe serves empty batches");
+        let seen = threads.lock().unwrap().clone();
+        assert_eq!(seen.len(), batches, "every batch must have been pulled");
+        seen
+    }
+
+    /// Every `next()` on a served reader runs on one thread, and not on the
+    /// thread driving the merge.
+    ///
+    /// What this pins is the second half: a blocking pull from a runtime worker
+    /// would stall the executor, and that this catches. It is **weak evidence for
+    /// the first half** — tokio hands sequential `spawn_blocking` calls back to
+    /// the same idle pool thread, so a per-`next()` implementation passes this
+    /// too (verified, not assumed). The structural guarantee that one task owns
+    /// the reader is pinned by
+    /// [`a_served_reader_runs_two_batches_ahead_and_no_further`] instead, which
+    /// that implementation cannot satisfy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_served_reader_is_pulled_from_one_thread_throughout() {
+        let driver = std::thread::current().id();
+        let seen = drive_probe(6, false).await;
+
+        let first = seen[0];
+        assert!(
+            seen.iter().all(|t| *t == first),
+            "every next() must run on one thread, saw {seen:?}"
+        );
+        assert_ne!(
+            first, driver,
+            "and not on the thread driving the merge — a blocking pull there \
+             would stall the executor"
+        );
+    }
+
+    /// The served reader runs **two batches ahead** of the merge, and no further.
+    ///
+    /// Both bounds are the contract, and the exact number is worth pinning
+    /// because it is the resident-memory bound: with one batch delivered, one
+    /// waits in the depth-1 channel and one is blocked in `blocking_send`, so
+    /// three exist at once.
+    ///
+    /// *Runs ahead at all* is the observable signature of one blocking task
+    /// owning the reader — a per-`next()` `spawn_blocking` produces nothing until
+    /// asked, so it stalls at 1 and fails here. *No further* is the memory
+    /// contract: an adapter that drained the source up front would reach 4.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_served_reader_runs_two_batches_ahead_and_no_further() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (schema, on_disk) = id_batch(vec![1, 2]);
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_parquet_file(tmp.path(), base_name, &on_disk);
+
+        let threads = Arc::new(StdMutex::new(Vec::new()));
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), base_name, schema).await;
+        reader.base_file_provider = Some(Arc::new(ProbeProvider {
+            batches: 4,
+            threads: threads.clone(),
+            block_on_each_next: false,
+        }));
+
+        let mut batches = reader.base_file_source().await.unwrap().batches;
+        let _first = batches.next().await.expect("a first batch").expect("ok");
+
+        // The producer runs concurrently, so poll for the read-ahead rather than
+        // sleeping a guessed interval. A per-next() implementation never gets
+        // past 1 and this loop runs out.
+        let produced = || threads.lock().unwrap().len();
+        for _ in 0..200 {
+            if produced() >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            produced(),
+            3,
+            "one delivered + one buffered + one blocked in send (a per-pull \
+             adapter stalls at 1)"
+        );
+
+        // And it stays there: the producer is blocked, not merely slow. Without
+        // this an eager drain would pass the assertion above on its way to 4.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            produced(),
+            3,
+            "the producer must stay blocked until the merge takes another batch \
+             — reaching 4 means the served file is being drained up front"
+        );
+    }
+
+    /// **`block_on` inside `next()` does not panic.** The reader runs on a
+    /// blocking-pool thread, which carries the runtime's handle but is not
+    /// "entered", so a provider may drive an async fetch inline.
+    ///
+    /// Worth a test because the opposite is true one thread over: the same call
+    /// from a runtime worker panics, and a panic unwinding across the FFI
+    /// boundary is undefined behavior. If the adapter ever stopped moving the
+    /// reader onto the blocking pool, this test would panic rather than fail
+    /// quietly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_served_reader_may_block_on_the_reads_own_runtime() {
+        let seen = drive_probe(3, true).await;
+        assert_eq!(seen.len(), 3, "all three batches survived the block_on");
     }
 }

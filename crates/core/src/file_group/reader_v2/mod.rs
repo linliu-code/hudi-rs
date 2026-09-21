@@ -39,6 +39,9 @@
 pub const MAX_INSTANT_TIME: &str = "99991231235959999";
 
 pub(crate) mod adapter;
+/// The injectable base-file data provider seam. `pub` items inside, re-exported
+/// from [`crate::ffi_support`] so a downstream crate can implement the trait.
+pub(crate) mod base_file_provider;
 pub(crate) mod buffer;
 pub(crate) mod buffered_record;
 pub(crate) mod buffered_record_converter;

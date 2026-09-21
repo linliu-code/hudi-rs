@@ -54,7 +54,7 @@ use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::ffi::FFI_ArrowSchema;
 use async_trait::async_trait;
 
-use crate::base_file_provider::{
+use hudi_dep::ffi_support::{
     BaseFileDataProvider, BaseFileDataProviderRef, BaseFileDataRequest, BaseFileProviderStats,
 };
 
