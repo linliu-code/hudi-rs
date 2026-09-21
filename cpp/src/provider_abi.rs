@@ -537,12 +537,26 @@ impl BaseFileDataProvider for CApiBaseFileDataProvider {
                 &c_req as *const HudiBaseFileDataRequest,
                 &mut c_res as *mut HudiBaseFileDataResult,
             );
-            (code, c_res)
+            // `owned` is returned, LAST, rather than left to drop with the
+            // closure's captures — the ordering is the fix, not the clone.
+            //
+            // On the CANCELLED path the awaiting future is gone, so tokio has
+            // no handle to deliver this to and simply drops it. If `owned` died
+            // with the closure, `destroy(ctx)` would run first and the discarded
+            // `c_res` would then release an `FFI_ArrowArrayStream` whose callback
+            // points into freed memory. Tuple fields drop in index order, so
+            // putting `owned` after `c_res` releases the stream first and
+            // destroys the ctx second.
+            //
+            // On every other path this costs nothing: `try_base_file` borrows
+            // `&self`, so `self.inner` keeps the ctx alive for the whole call and
+            // `owned` is never the last reference while this function runs.
+            (code, c_res, owned)
         })
         .await;
 
-        let (outcome_code, mut c_res) = match call {
-            Ok(pair) => pair,
+        let (outcome_code, mut c_res, _owned) = match call {
+            Ok(triple) => triple,
             Err(e) => {
                 log::warn!(
                     "[hudi-provider-abi] provider call task failed; falling back to storage read: {e}"
@@ -1687,6 +1701,133 @@ mod tests {
 
     extern "C" fn counting_destroy(_ctx: *mut c_void) {
         CALL_CTX_DESTROYED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    // ── The other half of the same hazard: the stream the call RETURNS ──────────
+    //
+    // `an_abandoned_call_keeps_the_ctx_alive_until_the_c_call_returns` pins the
+    // CALL. This pins what the call hands back. On the abandoned path the
+    // `JoinHandle` is gone, so tokio discards the task's output — and that output
+    // owns an `FFI_ArrowArrayStream` whose `release` callback points into the same
+    // `ctx`. If the keep-alive reference dies with the closure's captures,
+    // `destroy(ctx)` runs first and the discarded stream then releases into freed
+    // memory.
+    //
+    // Observed as an ORDER, not a count: both callbacks stamp a shared sequence,
+    // and the release must stamp first.
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    static STREAM_RELEASED_AT: AtomicUsize = AtomicUsize::new(0);
+    static CTX_DESTROYED_AT: AtomicUsize = AtomicUsize::new(0);
+    static SERVE_ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static SERVE_MAY_RETURN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    unsafe extern "C" fn recording_release(stream: *mut FFI_ArrowArrayStream) {
+        STREAM_RELEASED_AT.store(SEQ.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+        // Honour the C Data Interface: a released stream marks itself released.
+        if !stream.is_null() {
+            unsafe { (*stream).release = None };
+        }
+    }
+
+    extern "C" fn ordering_destroy(_ctx: *mut c_void) {
+        CTX_DESTROYED_AT.store(SEQ.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+    }
+
+    /// Parks inside C until released, then hands back a SERVED stream whose
+    /// `release` is `recording_release`.
+    extern "C" fn serving_blocking_try(
+        _ctx: *mut c_void,
+        _req: *const HudiBaseFileDataRequest,
+        out: *mut HudiBaseFileDataResult,
+    ) -> c_int {
+        SERVE_ENTERED.store(true, Ordering::SeqCst);
+        while !SERVE_MAY_RETURN.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // SAFETY: `out` is the fresh out-parameter the adapter passed in.
+        let res = unsafe { &mut *out };
+        res.stream.release = Some(recording_release);
+        res.outcome = HUDI_PROVIDER_OUTCOME_SERVED;
+        HUDI_PROVIDER_OUTCOME_SERVED
+    }
+
+    /// The `ctx` must outlive the stream the abandoned call returned.
+    ///
+    /// Mutation that this kills: returning `(code, c_res)` and letting `owned`
+    /// drop with the closure's captures. Then `destroy` stamps first and the
+    /// ordering assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_calls_returned_stream_is_released_before_the_ctx_dies() {
+        let vtable = HudiBaseFileDataProviderVTable {
+            abi_version: HUDI_BASE_FILE_DATA_PROVIDER_ABI_VERSION,
+            try_base_file: serving_blocking_try,
+            destroy: ordering_destroy,
+        };
+        // SAFETY: the vtable is valid for this call; `ordering_destroy` ignores
+        // the `ctx`, so a null one is sound for this fixture.
+        let provider = unsafe { CApiBaseFileDataProvider::from_raw(&vtable, std::ptr::null_mut()) }
+            .expect("a well-formed vtable yields a provider");
+
+        let schema = sample_schema();
+        let fields: Vec<String> = Vec::new();
+
+        // ABANDON the call while it is parked inside C.
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            provider.try_base_file(sample_request(&schema, &fields)),
+        )
+        .await;
+
+        struct ReleaseOnDrop;
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                SERVE_MAY_RETURN.store(true, Ordering::SeqCst);
+            }
+        }
+        let _release = ReleaseOnDrop;
+
+        assert!(abandoned.is_err(), "the fixture must still be inside C");
+        assert!(
+            SERVE_ENTERED.load(Ordering::SeqCst),
+            "the C call must have started, or this test proves nothing"
+        );
+
+        // Drop the caller's reference FIRST, so the blocking task's clone is the
+        // last one and its drop is what runs `destroy`.
+        drop(provider);
+        assert_eq!(
+            CTX_DESTROYED_AT.load(Ordering::SeqCst),
+            0,
+            "destroy ran while the C call was still executing on that ctx"
+        );
+
+        // Let C return a SERVED stream. The output is discarded, because the
+        // awaiting future is gone.
+        SERVE_MAY_RETURN.store(true, Ordering::SeqCst);
+
+        // Both callbacks must fire; bounded so a regression reports rather than hangs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (STREAM_RELEASED_AT.load(Ordering::SeqCst) == 0
+            || CTX_DESTROYED_AT.load(Ordering::SeqCst) == 0)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let released = STREAM_RELEASED_AT.load(Ordering::SeqCst);
+        let destroyed = CTX_DESTROYED_AT.load(Ordering::SeqCst);
+        assert_ne!(released, 0, "the discarded stream was never released");
+        assert_ne!(
+            destroyed, 0,
+            "the ctx was never destroyed — a leak, not a fix"
+        );
+        assert!(
+            released < destroyed,
+            "the stream must be released BEFORE the ctx is destroyed, but release \
+             stamped {released} and destroy stamped {destroyed} — the discarded \
+             FFI_ArrowArrayStream released into a freed ctx"
+        );
     }
 
     /// Abandoning a read mid-call must not free the `ctx` the C call is using.
