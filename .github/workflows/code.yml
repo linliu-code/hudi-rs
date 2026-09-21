@@ -45,6 +45,14 @@ jobs:
       - name: Test the JNI carrier Makefile rules
         run: make test-jni-carrier
 
+      # Needs neither cargo nor a venv, so it runs before the expensive setup below and a
+      # version that has drifted out of its single source fails in seconds.
+      - name: Check the version is single-sourced
+        run: make check-version
+
+      - name: Test the version single-source checker
+        run: make test-version-check
+
       - name: Install system dependencies
         run: |
           sudo apt-get update

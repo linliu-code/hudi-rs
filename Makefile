@@ -51,8 +51,11 @@ COV_THRESHOLD ?= 60
 # REPORT below, but --workspace still COMPILED the crate, and on this fork that drags in
 # `substrait` -> `protobuf-src`, which builds protobuf from source and exhausted the runner's disk
 # (`No space left on device` installing libprotoc.a). Excluding the package changes no coverage
-# number -- its sources were already out of the report -- and the crate keeps its own dedicated
-# gate, the `cpp-ffi` job, which builds and tests it.
+# report, so no line that was being measured stops being measured. It does remove hudi-cpp's
+# OWN TESTS from the run, which could have exercised hudi-core lines, so the measured
+# percentage can move slightly -- worth knowing if COV_THRESHOLD is ever enforced in CI, which
+# today it is not. The crate keeps its own dedicated gate, the `cpp-ffi` job, which builds and
+# tests it.
 COV_EXCLUDE := \
 	--exclude hudi-cpp \
 	--exclude-files 'cpp/src/*' \
@@ -109,7 +112,23 @@ format-python: ## Format Python code
 	ruff format $(PYTHON_DIR)
 
 .PHONY: check
-check: check-rust check-python ## Run check on Rust and Python
+check: check-version check-rust check-python ## Run check on version single-sourcing, Rust and Python
+
+.PHONY: check-version
+check-version: ## Assert the project version has exactly one authority
+	$(info --- Check the version is single-sourced ---)
+	@.github/scripts/check-version-single-source.sh
+
+.PHONY: version-sync
+version-sync: ## Propagate [workspace.package] version to the manifests that cannot derive it
+	$(info --- Sync the version from Cargo.toml ---)
+	@.github/scripts/check-version-single-source.sh --fix
+
+.PHONY: test-version-check
+test-version-check: ## Test the version single-source checker and the derived JNI_VERSION (python3; cmake for the CMake case)
+	$(info --- Test the version single-source checker ---)
+	python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+	.github/jni-tests/jni-version.sh
 
 .PHONY: check-rust
 check-rust: ## Run check on Rust
