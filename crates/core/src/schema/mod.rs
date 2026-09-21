@@ -23,6 +23,7 @@ use arrow_schema::{Schema, SchemaRef};
 use serde_json::Value;
 use std::sync::Arc;
 
+pub mod avro_names;
 pub mod avro_schema_utils;
 pub mod batch_evolution;
 pub mod delete;

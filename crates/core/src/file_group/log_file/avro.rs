@@ -18,6 +18,7 @@
  */
 use crate::Result;
 use crate::error::CoreError;
+use crate::schema::avro_names::canonicalize_avro_schema_json;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_avro::reader::{Decoder as ArrowAvroDecoder, ReaderBuilder};
 use arrow_avro::schema::{AvroSchema as ArrowAvroSchema, SINGLE_OBJECT_MAGIC, SchemaStore};
@@ -79,10 +80,22 @@ pub struct RegisteredWriterSchema {
 
 impl RegisteredWriterSchema {
     /// Parse and fingerprint `writer_schema_json`.
+    ///
+    /// The schema is canonicalised first: `arrow-avro` matches named types on
+    /// their literal `name`/`namespace` attributes, so a writer and a reader
+    /// that spell one namespace differently do not resolve against each other
+    /// even when the Avro spec calls them identical. See
+    /// [`canonicalize_avro_schema_json`]. This is the whole crate's writer-side
+    /// entry to `arrow-avro`, and the reader side is canonicalised in
+    /// [`AvroBlockDecoder::try_new_with_registered`], so the two sides always
+    /// arrive in the same spelling. The Rabin fingerprint is unaffected: it is
+    /// computed from the parsing canonical form, which applies namespace
+    /// inheritance itself.
     pub fn new(writer_schema_json: &str) -> Result<Self> {
+        let writer_schema_json = canonicalize_avro_schema_json(writer_schema_json)?;
         let mut store = SchemaStore::new();
         let fingerprint = store
-            .register(ArrowAvroSchema::new(writer_schema_json.to_string()))
+            .register(ArrowAvroSchema::new(writer_schema_json))
             .map_err(|e| {
                 CoreError::LogBlockError(format!("Failed to register block writer schema: {e}"))
             })?;
@@ -147,6 +160,12 @@ impl AvroBlockDecoder {
         reader_schema_json: Option<&str>,
         batch_size: usize,
     ) -> Result<Self> {
+        // Canonicalised once here rather than in `build_inner`, which reruns per
+        // batch; the stored string is what every rebuild reuses.
+        let reader_schema_json = reader_schema_json
+            .map(canonicalize_avro_schema_json)
+            .transpose()?;
+        let reader_schema_json = reader_schema_json.as_deref();
         let fingerprint = registered.fingerprint;
 
         let arrow_avro::schema::Fingerprint::Rabin(rabin) = fingerprint else {
@@ -465,6 +484,34 @@ mod multi_batch_tests {
 #[cfg(test)]
 mod tests {
     use super::AvroBlockDecoder;
+    use super::RegisteredWriterSchema;
+
+    /// Building a decoder from an already-registered writer schema does not
+    /// re-canonicalise the reader schema it has already seen.
+    ///
+    /// The two callers that matter build one decoder per HFile WINDOW
+    /// (`base_file::hfile`'s `decode_window`) and one per log BLOCK
+    /// (`log_file::content`'s `avro_decoder_for`), always with the same reader
+    /// schema string; canonicalising it there is a full parse and re-emit of a
+    /// schema that is 8 KB on the metadata table, which is more than the rest of
+    /// either loop. The writer half has been registered once per schema since it
+    /// was written — this pins the same property for the reader half.
+    #[test]
+    fn the_reader_schema_is_canonicalised_once_however_many_decoders_are_built() {
+        let writer = r#"{"type":"record","name":"r","namespace":"org.example","fields":[{"name":"num","type":"int"}]}"#;
+        let reader = r#"{"type":"record","name":"r","namespace":"org.example","fields":[{"name":"num","type":"long"}]}"#;
+
+        let registered = RegisteredWriterSchema::new(writer).unwrap();
+        let before = crate::schema::avro_names::canonicalizations_run();
+        for _ in 0..16 {
+            AvroBlockDecoder::try_new_with_registered(&registered, Some(reader), 1024).unwrap();
+        }
+        assert_eq!(
+            crate::schema::avro_names::canonicalizations_run() - before,
+            1,
+            "16 decoders over one reader schema must canonicalise it once"
+        );
+    }
 
     /// A block written before a column was promoted still reads at the promoted
     /// type. Avro defines int → long as a promotion, so the decoder resolves it
@@ -507,6 +554,48 @@ mod tests {
             batch.schema().field(0).data_type(),
             &arrow_schema::DataType::Int64
         );
+    }
+
+    /// OI-47: the two spellings of one nested named type.
+    ///
+    /// Java's `Schema.toString()` omits a nested `namespace` that equals the
+    /// enclosing one (`Schema.java:744-753`), so every schema Hudi writes is in
+    /// the first form. Avro's own `Schema` object model materialises the
+    /// inherited namespace, so anything round-tripped through avro-tools (or
+    /// built field by field) is in the second. The Avro spec calls them the same
+    /// schema.
+    const NESTED_JAVA_FORM: &str = r#"{"type":"record","name":"Outer","namespace":"org.example","fields":[{"name":"inner","type":{"type":"record","name":"Inner","fields":[{"name":"v","type":"int"}]}}]}"#;
+    const NESTED_EXPLICIT_NS: &str = r#"{"type":"record","name":"Outer","namespace":"org.example","fields":[{"name":"inner","type":{"type":"record","name":"Inner","namespace":"org.example","fields":[{"name":"v","type":"int"}]}}]}"#;
+
+    /// OI-47: an explicit-namespace READER schema against a Java-form writer.
+    ///
+    /// `arrow-avro` 58 compares named types on their literal `name`/`namespace`
+    /// attributes and drops the enclosing namespace at that one comparison
+    /// (`codec.rs:1250`, `full_name_set` -> `make_full_name(name, ns, None)`), so
+    /// before the fix this failed with
+    /// `Record name mismatch writer=Inner, reader=Inner` — two names that print
+    /// identically.
+    #[test]
+    fn a_reader_schema_with_explicit_namespaces_resolves_against_a_java_form_writer() {
+        let mut decoder =
+            AvroBlockDecoder::try_new_with_reader(NESTED_JAVA_FORM, Some(NESTED_EXPLICIT_NS), 1024)
+                .expect("an explicit-namespace reader schema must resolve");
+        decoder.decode(&[0x0E]).unwrap(); // int 7, zigzag encoded
+        let batch = decoder.flush().unwrap().expect("a batch");
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    /// OI-47, the other direction: an explicit-namespace WRITER schema against a
+    /// Java-form reader. Same comparison, same failure, so the canonicalising
+    /// pass has to run on the writer side too.
+    #[test]
+    fn a_writer_schema_with_explicit_namespaces_resolves_against_a_java_form_reader() {
+        let mut decoder =
+            AvroBlockDecoder::try_new_with_reader(NESTED_EXPLICIT_NS, Some(NESTED_JAVA_FORM), 1024)
+                .expect("an explicit-namespace writer schema must resolve");
+        decoder.decode(&[0x0E]).unwrap();
+        let batch = decoder.flush().unwrap().expect("a batch");
+        assert_eq!(batch.num_rows(), 1);
     }
 
     /// Without a reader schema the block reads at the schema it was written

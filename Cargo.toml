@@ -83,7 +83,21 @@ datafusion-ffi = { version = "54.1" }
 # serde
 percent-encoding = { version = "2" }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1" }
+# `preserve_order` keeps a JSON object's keys in the order they were parsed.
+# `schema::avro_names` re-emits Avro schema JSON and has to give back the input
+# byte for byte when it is already in Java's `Schema.toString()` form; the
+# default `BTreeMap` backing would silently alphabetise every schema instead,
+# losing that identity and making the HFile reader's schema-resolution cost gate
+# miss on the path it exists for.
+#
+# It is a WORKSPACE-WIDE behavioural choice, deliberately: Cargo unifies features
+# across the whole build graph, so anyone depending on the published `hudi` crate
+# gets `serde_json::Map` backed by an `IndexMap` in their own code as well —
+# including `Map::remove`'s `swap_remove` semantics. Narrowing the declaration to
+# the one crate that needs the property would not shield them, which is why it is
+# stated here rather than hidden. Every in-repo consumer was audited when it went
+# in; none depends on alphabetised output.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # "stdlib"
 thiserror = { version = "2" }

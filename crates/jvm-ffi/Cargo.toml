@@ -46,3 +46,6 @@ log = { workspace = true }
 
 [dev-dependencies]
 hudi-test = { path = "../test" }
+# Test-only: the OI-47 test rewrites the fixture reader schema into its
+# explicit-namespace spelling, which needs a JSON tree rather than a string edit.
+serde_json = { workspace = true }
