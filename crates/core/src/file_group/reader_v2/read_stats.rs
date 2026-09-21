@@ -42,7 +42,19 @@ pub struct HoodieReadStats {
     // the read pipeline. Zero behavioral effect — instrumentation only.
     //
     /// Wall us spent reading + projecting the base parquet file
-    /// (`HoodieFileGroupReader::make_base_file_batches`).
+    /// (`HoodieFileGroupReader::base_file_source`).
+    ///
+    /// ⚠️ **Since ENG-48159 this span also covers the decode of the first
+    /// `BASE_READ_INITIAL_PREFETCH_BATCHES` batches** on the object-store leg,
+    /// which `base_file_source()` now awaits before it returns. The remaining
+    /// row groups are still decoded lazily inside the merge.
+    ///
+    /// Worth stating because the gap reads as a regression and is not one: a
+    /// before/after comparison across that change shows `base_read_us` rise by
+    /// roughly two batches' decode while the merge loop falls by the same
+    /// amount. **The work has only MOVED** — onto the thread the FFI drives
+    /// `open()` from, which is the whole point of ENG-48159. Same trap
+    /// `log_block_fetch_us` documents below, in the opposite direction.
     pub base_read_us: u64,
     /// Wall us spent reading log-block metadata + bytes off storage during the
     /// log scan Pass-1 (`BaseHoodieLogRecordReader::scan_internal`).
