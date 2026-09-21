@@ -267,9 +267,9 @@ impl FileGroup {
         Ok(self)
     }
 
-    /// Add multiple [LogFile]s to the corresponding [FileSlice]s in the [FileGroup].
-    /// Add several [LogFile]s, in the order [`add_log_file`](Self::add_log_file)
-    /// needs rather than the order they arrive in.
+    /// Add several [LogFile]s to the corresponding [FileSlice]s in the [FileGroup], in
+    /// the order [`add_log_file`](Self::add_log_file) needs rather than the order they
+    /// arrive in.
     ///
     /// Placement consults the slices already present, so a log file added before
     /// an earlier one finds nothing to attach to and starts a slice of its own.
@@ -278,8 +278,30 @@ impl FileGroup {
     /// remember: getting it wrong splits a log-only file group in two, and a
     /// read as of an instant then sees only the later half.
     ///
-    /// [`LogFile`]'s own ordering is the right one — it keys on completion time,
-    /// which is what placement looks up.
+    /// [`LogFile`]'s own ordering is the right one to sort by, and since `m7.3` it is
+    /// right for a second reason. It keys on the request instant (deltaCommitTime), so
+    /// the files arrive oldest-request-first and the log-only slice is keyed by the
+    /// EARLIEST request instant in the group. Every later file then attaches to that
+    /// slice instead of starting another, by whichever of the two lookups below applies:
+    /// a completed file compares its completion time, which is `>=` its own request
+    /// instant and so `>=` the key (a commit completes no earlier than it was
+    /// requested); a file with no completion timestamp compares its request instant
+    /// directly, likewise `>=` the key.
+    ///
+    /// Java sorts the same way at the same point:
+    /// `AbstractTableFileSystemView.buildFileGroups` feeds
+    /// `logFiles.stream().sorted(HoodieLogFile.getLogFileComparator())`
+    /// (`AbstractTableFileSystemView.java:253`) into
+    /// `HoodieFileGroup.addLogFile(completionTimeQueryView, logFile)`
+    /// (`HoodieFileGroup.java:138`) — the same forward deltaCommitTime order.
+    ///
+    /// The way it keyed on completion time before `m7.3` was NOT safe here. With
+    /// completions out of request order the first-processed file could be a LATER
+    /// request, so the slice was keyed later than the group's earliest deltacommit and
+    /// a read as of an instant between the two saw nothing. And a file with no
+    /// completion timestamp sorted after every completed one, so an archived
+    /// deltacommit was processed last and started a slice of its own. Both are pinned
+    /// by `test_add_log_files_keys_the_slice_by_the_earliest_request_instant`.
     pub fn add_log_files<I>(&mut self, log_files: I) -> Result<&Self>
     where
         I: IntoIterator<Item = LogFile>,
@@ -542,6 +564,76 @@ mod tests {
             slice.base_file.as_ref().unwrap().completion_timestamp,
             Some("20250113230310000".to_string())
         );
+    }
+
+    /// The slice key `add_log_files` produces is chosen by the SORT ORDER, because
+    /// `add_log_file` keys a new log-only slice by the first-processed file's own
+    /// request instant. So `LogFile::Ord` is load-bearing here, not just in the merge.
+    ///
+    /// Two shapes that the pre-`m7.3` completion-time ordering got wrong and that
+    /// `test_add_log_files_out_of_order_forms_one_slice` cannot see, because its
+    /// fixture's completion order equals its request order:
+    ///
+    /// 1. **Completions inverted.** A(req t1, done t4) and B(req t2, done t3) with
+    ///    t1 < t2 < t3 < t4. Completion order processes B first and keys the slice t2,
+    ///    so `get_file_slice_as_of(t1)` finds nothing even though A's records exist at
+    ///    t1. Request order keys it t1.
+    /// 2. **An archived file, carrying no completion timestamp.** The old ordering
+    ///    sorted every `None` after every `Some`, so the archived (oldest) file was
+    ///    processed last and, finding no slice at or below its own REQUEST instant (it
+    ///    has no completion time — that is what makes it take this branch), started a
+    ///    second one, splitting one file group's records across two slices.
+    #[test]
+    fn test_add_log_files_keys_the_slice_by_the_earliest_request_instant() {
+        const FILE_ID: &str = "7483a08a-02f1-4510-bc1d-1317924f4189-0";
+        let log_file = |requested: &str, completion: Option<&str>| {
+            let mut lf =
+                LogFile::from_str(&format!(".{FILE_ID}_{requested}.log.1_0-16-23")).unwrap();
+            lf.completion_timestamp = completion.map(|c| c.to_string());
+            lf
+        };
+
+        // (1) completion order is the INVERSE of request order.
+        let mut fg = FileGroup::new(FILE_ID.to_string(), EMPTY_PARTITION_PATH.to_string());
+        fg.add_log_files(vec![
+            log_file("20250113230310000", Some("20250113230315000")), // req t2, done t3
+            log_file("20250113230300000", Some("20250113230320000")), // req t1, done t4
+        ])
+        .unwrap();
+        assert_eq!(
+            fg.file_slices.len(),
+            1,
+            "one file group's log files must form one slice, whatever order they \
+             completed in"
+        );
+        let slice = fg
+            .get_file_slice_as_of("20250113230300000")
+            .expect("the slice must be visible as of the EARLIEST request instant");
+        assert_eq!(
+            slice.creation_instant_time(),
+            "20250113230300000",
+            "the slice is keyed by the earliest request instant, not by whichever \
+             file happened to complete first"
+        );
+        assert_eq!(slice.log_files.len(), 2);
+
+        // (2) the oldest file is ARCHIVED, so it carries no completion timestamp.
+        let mut fg = FileGroup::new(FILE_ID.to_string(), EMPTY_PARTITION_PATH.to_string());
+        fg.add_log_files(vec![
+            log_file("20250113230310000", Some("20250113230315000")),
+            log_file("20250113230300000", None), // archived: below the active timeline
+        ])
+        .unwrap();
+        assert_eq!(
+            fg.file_slices.len(),
+            1,
+            "an archived log file belongs to the same slice, not to one of its own"
+        );
+        let slice = fg
+            .get_file_slice_as_of("20250113230300000")
+            .expect("keyed by the archived file's request instant, the earliest here");
+        assert_eq!(slice.creation_instant_time(), "20250113230300000");
+        assert_eq!(slice.log_files.len(), 2);
     }
 
     #[test]

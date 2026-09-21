@@ -388,4 +388,61 @@ mod tests {
             "and none attached yet — log files are added after construction"
         );
     }
+    #[test]
+    fn test_log_files_ordered_by_delta_commit_not_completion() {
+        // Gold parity, and note WHICH Java container this mirrors. It is NOT
+        // `FileSlice.logFiles`: that one is a `TreeSet` over
+        // `getReverseLogFileComparator()` (FileSlice.java:68/82/90), i.e. DESCENDING,
+        // which is why `getLatestLogFile()` is `logFiles.stream().findFirst()`. The
+        // ascending list hudi-rs's `BTreeSet` iteration corresponds to is the MOR
+        // read's own, `InputSplit.java:56`, which re-sorts with the FORWARD comparator.
+        //
+        // Either way the comparator keys off deltaCommitTime and never completion
+        // time, and this is the container whose iteration order feeds the log-block
+        // merge sequence — so it is the level at which a wrong `Ord` changes which
+        // record wins.
+        //
+        // Scenario: two committed v8+ log files on the same file group whose
+        // completion order is the INVERSE of their delta-commit (request) order
+        // (concurrent writers completing out of request order). The set must
+        // iterate in delta-commit order to match the Java reader's merge sequence.
+        let mut slice = FileSlice::new_log_only(
+            "file-0".to_string(),
+            "20250113230300000".to_string(),
+            EMPTY_PARTITION_PATH.to_string(),
+        );
+
+        // Earlier request instant (20...300000), COMPLETES later (20...320000).
+        slice.log_files.insert(LogFile {
+            file_id: "file-0".to_string(),
+            timestamp: "20250113230300000".to_string(),
+            completion_timestamp: Some("20250113230320000".to_string()),
+            extension: "log".to_string(),
+            version: 1,
+            write_token: "0-1-1".to_string(),
+            file_metadata: None,
+        });
+        // Later request instant (20...310000), COMPLETES earlier (20...315000).
+        slice.log_files.insert(LogFile {
+            file_id: "file-0".to_string(),
+            timestamp: "20250113230310000".to_string(),
+            completion_timestamp: Some("20250113230315000".to_string()),
+            extension: "log".to_string(),
+            version: 1,
+            write_token: "0-1-1".to_string(),
+            file_metadata: None,
+        });
+
+        let order: Vec<&str> = slice
+            .log_files
+            .iter()
+            .map(|lf| lf.timestamp.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["20250113230300000", "20250113230310000"],
+            "FileSlice log files must iterate in deltaCommitTime order (gold), \
+             not completion-timestamp order"
+        );
+    }
 }
