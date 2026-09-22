@@ -179,8 +179,14 @@ JNI_STAGE ?= $(JNI_OUT)/stage
 # Where cargo actually writes the release build; overridden by jni-lib-portable so a container
 # build never touches this host's normal target/release/libhudi_jni.so (D-27, OI-72).
 JNI_CARGO_TARGET_DIR ?= target
-# internal-only default; override for other hosts
-CODEARTIFACT_URL ?= https://onehouse-194159489498.d.codeartifact.us-west-2.amazonaws.com/maven/onehouse-internal/
+# The Maven repository `jni-deploy` publishes to. No default: publishing the carrier is a
+# deployer's decision, and a wrong default is worse than a missing one -- `jni-deploy` refuses
+# rather than guessing. `JNI_MAVEN_REPO_ID` must name a matching server in ~/.m2/settings.xml.
+JNI_MAVEN_REPO_URL ?=
+JNI_MAVEN_REPO_ID  ?=
+# The groupId the carrier jar is published and installed under. Overridable so a downstream
+# distributor can publish it under its own coordinate without patching this file.
+JNI_GROUP_ID ?= org.apache.hudi
 
 # D-27: manylinux_2_28 images for the portable (glibc<=2.28-floor) container build; jni-lib-portable
 DOCKER_MANYLINUX_x86_64  := quay.io/pypa/manylinux_2_28_x86_64
@@ -195,12 +201,12 @@ ifeq ($(JNI_MULTI),1)
 JNI_JAR = $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION).jar
 JNI_DEPLOY_PREREQ := jni-jar-multi
 JNI_CLASSIFIER_ARG :=
-JNI_DEPLOY_COORD = io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION)
+JNI_DEPLOY_COORD = $(JNI_GROUP_ID):hudi-jni-native:$(JNI_VERSION)
 else
 JNI_JAR = $(JNI_OUT)/hudi-jni-native-$(JNI_VERSION)-$(JNI_OS)-$(JNI_ARCH).jar
 JNI_DEPLOY_PREREQ := jni-jar
 JNI_CLASSIFIER_ARG := -Dclassifier=$(JNI_OS)-$(JNI_ARCH)
-JNI_DEPLOY_COORD = io.onehouse.hudi-rs:hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH)
+JNI_DEPLOY_COORD = $(JNI_GROUP_ID):hudi-jni-native:$(JNI_VERSION):$(JNI_OS)-$(JNI_ARCH)
 endif
 
 # The staged copy is stripped. Measured on an aarch64 build: 74,330,712 B -> 55,604,776 B, and
@@ -309,16 +315,18 @@ jni-lib-portable: ## D-27: build libhudi_jni.so inside a manylinux_2_28 containe
 	.github/jni-portable/portability-floor.sh $(JNI_PORTABLE_OUT)/stage/native/$(JNI_OS)-$(JNI_ARCH)/libhudi_jni.so
 
 .PHONY: jni-deploy
-jni-deploy: $(JNI_DEPLOY_PREREQ) ## Deploy the carrier jar to CodeArtifact (server id `codeartifact` in ~/.m2/settings.xml); JNI_MULTI=1 deploys the classifier-less multi-arch jar (needs JNI_EXTRA_NATIVE_DIR)
+jni-deploy: $(JNI_DEPLOY_PREREQ) ## Deploy the carrier jar to the Maven repository named by JNI_MAVEN_REPO_URL/ID; JNI_MULTI=1 deploys the classifier-less multi-arch jar (needs JNI_EXTRA_NATIVE_DIR)
+	@[ -n "$(JNI_MAVEN_REPO_URL)" ] || { echo "JNI_MAVEN_REPO_URL is unset; refusing to guess a publish target"; exit 1; }
+	@[ -n "$(JNI_MAVEN_REPO_ID)" ]  || { echo "JNI_MAVEN_REPO_ID is unset; it must name a server in ~/.m2/settings.xml"; exit 1; }
 	$(info --- Deploy $(JNI_JAR) as $(JNI_DEPLOY_COORD) ---)
-	mvn -B -ntp deploy:deploy-file -Dfile=$(JNI_JAR) -DgroupId=io.onehouse.hudi-rs -DartifactId=hudi-jni-native \
+	mvn -B -ntp deploy:deploy-file -Dfile=$(JNI_JAR) -DgroupId=$(JNI_GROUP_ID) -DartifactId=hudi-jni-native \
 	  -Dversion=$(JNI_VERSION) $(JNI_CLASSIFIER_ARG) -Dpackaging=jar -DgeneratePom=true \
-	  -DrepositoryId=codeartifact -Durl=$(CODEARTIFACT_URL)
+	  -DrepositoryId=$(JNI_MAVEN_REPO_ID) -Durl=$(JNI_MAVEN_REPO_URL)
 
 .PHONY: jni-install
 jni-install: $(JNI_DEPLOY_PREREQ) ## Install the carrier jar into the local Maven repository (~/.m2) for builds on this machine; JNI_MULTI=1 installs the classifier-less multi-arch jar (needs JNI_EXTRA_NATIVE_DIR)
 	$(info --- Install $(JNI_JAR) into the local Maven repository as $(JNI_DEPLOY_COORD) ---)
-	mvn -B -ntp install:install-file -Dfile=$(JNI_JAR) -DgroupId=io.onehouse.hudi-rs -DartifactId=hudi-jni-native \
+	mvn -B -ntp install:install-file -Dfile=$(JNI_JAR) -DgroupId=$(JNI_GROUP_ID) -DartifactId=hudi-jni-native \
 	  -Dversion=$(JNI_VERSION) $(JNI_CLASSIFIER_ARG) -Dpackaging=jar -DgeneratePom=true
 
 .PHONY: test-jni-carrier

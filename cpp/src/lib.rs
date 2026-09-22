@@ -60,7 +60,7 @@ use predicate::PushedFilter;
 macro_rules! log_post_merge_filter {
     ($pre_rows:expr, $filtered:expr, $filter:expr) => {
         log::debug!(
-            "[ENG-40156] post-merge filter: {} -> {} rows (cols={:?})",
+            "post-merge filter: {} -> {} rows (cols={:?})",
             $pre_rows,
             $filtered.num_rows(),
             $filter.columns()
@@ -121,7 +121,7 @@ fn init_logger() {
 #[cxx::bridge]
 mod ffi {
     // ════════════════════════════════════════════════════════════════════════
-    // ENG-40156 — predicate pushdown wire format
+    // predicate pushdown wire format
     // ════════════════════════════════════════════════════════════════════════
     //
     // Velox HudiSplitReader forwards the Substrait filter that Gluten emitted
@@ -230,7 +230,7 @@ mod ffi {
         base_file_name: String,
         log_file_names: Vec<String>,
 
-        // ── predicate pushdown (ENG-40156) ────────────────────────────────
+        // ── predicate pushdown ────────────────────────────────
         // prost-serialized substrait::proto::ExtendedExpression. Empty when
         // the caller pushed no predicate (e.g. unfiltered scan, or Gluten
         // didn't run the Hudi pushdown path for this query).
@@ -297,7 +297,7 @@ mod ffi {
         fn get_closable_iterator(self: &HoodieFileGroupReader) -> Result<*mut ArrowArrayStream>;
 
         /// The reader's PEAK in-memory native footprint for this file group, in
-        /// bytes (ENG-44436).
+        /// bytes.
         ///
         /// Returns the tracked footprint of the merge map hudi-rs holds (see
         /// `SpillableRecordMap::current_in_memory_bytes` — the pinned source
@@ -344,7 +344,7 @@ mod ffi {
         /// `get_closable_iterator` nor `read_record_batch` has run on this
         /// reader.
         fn base_file_provider_stats(self: &HoodieFileGroupReader) -> FfiBaseFileProviderStats;
-        /// [ENG-47483] Bytes fetched from storage by this reader, summed over every
+        /// Bytes fetched from storage by this reader, summed over every
         /// range read, counted at the `AsyncFileReader` boundary.
         ///
         /// Exact and page-cache independent: a warm re-read reports the same number
@@ -357,35 +357,35 @@ mod ffi {
         /// prunes row groups — the predicate columns are still fetched in full.
         fn hudi_bytes_read(self: &HoodieFileGroupReader) -> u64;
 
-        /// [ENG-47483] Storage round trips (`get_bytes` / `get_byte_ranges` calls).
+        /// Storage round trips (`get_bytes` / `get_byte_ranges` calls).
         /// A two-pass read — predicate columns first, then the selected rows — shows
         /// up as roughly double the calls of a single-pass read over the same file,
         /// which is how the cost of installing a row filter becomes measured rather
         /// than inferred.
         fn hudi_io_calls(self: &HoodieFileGroupReader) -> u64;
 
-        /// [ENG-47483] Rows this reader's stream yielded, after any parquet row
+        /// Rows this reader's stream yielded, after any parquet row
         /// filter. Read against `hudi_file_rows` for selectivity, and against
         /// `hudi_bytes_read` for what that selectivity cost.
         fn hudi_rows_out(self: &HoodieFileGroupReader) -> u64;
 
-        /// [ENG-47483] Rows the base file contains, from parquet footer metadata —
+        /// Rows the base file contains, from parquet footer metadata —
         /// no extra IO, the footer is already read. Denominator for
         /// `hudi_rows_out`.
         fn hudi_file_rows(self: &HoodieFileGroupReader) -> u64;
 
-        /// [ENG-47483] Row groups this reader actually read. Equals
+        /// Row groups this reader actually read. Equals
         /// `hudi_file_row_groups` when nothing prunes; the GAP between them is
         /// the row-group pruning win, and is the only way to see that
         /// `with_row_groups` did anything. Velox's own "skipped row groups"
         /// counter reads 0 on this path because Velox is not doing the reading.
         fn hudi_row_groups_read(self: &HoodieFileGroupReader) -> u64;
 
-        /// [ENG-47483] Row groups the base files contain, from footer metadata.
+        /// Row groups the base files contain, from footer metadata.
         /// Denominator for `hudi_row_groups_read`.
         fn hudi_file_row_groups(self: &HoodieFileGroupReader) -> u64;
 
-        /// [ENG-47483] Times the row-group selector closure ran.
+        /// Times the row-group selector closure ran.
         ///
         /// Needed because the selector returns None when it cannot prune, so
         /// `hudi_row_groups_read == hudi_file_row_groups` is identical whether the
@@ -409,7 +409,7 @@ mod ffi {
         /// the output converter only.
         fn hudi_output_build_ms(self: &HoodieFileGroupReader) -> u64;
 
-        /// [ENG-40156] 1 if the Substrait predicate Velox handed to
+        /// 1 if the Substrait predicate Velox handed to
         /// `new_file_group_reader_with_context` DECODED into an evaluable
         /// filter, 0 otherwise (no bytes were passed, or `PushedFilter::decode`
         /// dropped them — malformed protobuf, missing base_schema, or a function
@@ -423,7 +423,7 @@ mod ffi {
         /// is a gap or a bug, decoded but not installed is a deliberate gate.
         fn hudi_pushdown_decoded(self: &HoodieFileGroupReader) -> u64;
 
-        /// [ENG-40156] How many parquet `RowFilter`s this reader actually
+        /// How many parquet `RowFilter`s this reader actually
         /// installed — the number of base files read with EARLY filtering.
         ///
         /// NOT final until the split has drained. `open()` holds the base file
@@ -545,7 +545,7 @@ pub struct HoodieFileGroupReader {
     // happens-before comes from Velox's split lifecycle, not this ordering.
     row_filters_installed: Arc<AtomicU64>,
 
-    // ── [ENG-47483] read-volume counters ────────────────────────────
+    // ── read-volume counters ────────────────────────────
     // Clone of this reader's Storage-scoped ReadVolume, captured at construction so
     // it stays readable after the read without holding the Storage.
     //
@@ -575,7 +575,7 @@ pub struct HoodieFileGroupReader {
     stream_stats: OnceLock<hudi_dep::ffi_support::StreamStatsHandle>,
 }
 
-/// [ENG-40156] Wrap `PushedFilter::build_row_filter` in a `RowFilterBuilder`
+/// Wrap `PushedFilter::build_row_filter` in a `RowFilterBuilder`
 /// that counts the times it actually produced a parquet `RowFilter`.
 ///
 /// The count is taken from `build_row_filter`'s own return value, which is the
@@ -608,7 +608,7 @@ pub(crate) fn counting_row_filter_builder(
     })
 }
 
-/// ENG-48206 — which of a pushed predicate's columns the apache/hudi#18132 repair
+/// which of a pushed predicate's columns the apache/hudi#18132 repair
 /// could make it misread, decided before any file is opened.
 ///
 /// Parquet evaluates a pushed predicate against a file's PHYSICAL values, and the
@@ -688,7 +688,7 @@ pub(crate) fn repair_risk_columns_for(
                     // default `info` filter a 10k-split scan would emit 10k warnings
                     // for nothing (CLAUDE.md §10: never warn per item).
                     log::debug!(
-                        "[ENG-48206] no decoded predicate, so the repair gate cannot \
+                        "no decoded predicate, so the repair gate cannot \
                          be scoped to the columns actually filtered; treating every \
                          repair-eligible column in the table as at risk \
                          ({at_risk:?}). An injected provider may still be applying \
@@ -705,7 +705,7 @@ pub(crate) fn repair_risk_columns_for(
                 // unparseable — but it is the one shape this function cannot
                 // screen, and it is better named than discovered.
                 log::warn!(
-                    "[ENG-48206] neither a decoded predicate nor a table schema; \
+                    "neither a decoded predicate nor a table schema; \
                      the #18132 repair gate cannot be armed for this read"
                 );
                 Vec::new()
@@ -720,7 +720,7 @@ pub(crate) fn repair_risk_columns_for(
         // fallback. `build_row_filter` refuses this plan, so hudi-rs's own read is
         // already safe; this is for the provider, which applies the caller's copy.
         log::warn!(
-            "[ENG-48206] a pushed predicate references a field index that does not \
+            "a pushed predicate references a field index that does not \
              resolve to a column name (a wire-format bug on the C++ side); \
              screening the repair gate against the table instead of a truncated \
              reference list"
@@ -734,7 +734,7 @@ pub(crate) fn repair_risk_columns_for(
         }
         None => {
             log::warn!(
-                "[ENG-48206] no table schema available, so predicate columns \
+                "no table schema available, so predicate columns \
                  {referenced:?} cannot be pre-screened; treating all of them as \
                  at risk and letting each file's footer decide"
             );
@@ -752,7 +752,7 @@ pub fn new_file_group_reader_with_context(
     // Capture transport-only file names before ctx is consumed by .into().
     let base_file_name = ctx.base_file_name.clone();
     let log_file_names: Vec<String> = ctx.log_file_names.to_vec();
-    // ENG-40156 — snapshot substrait filter bytes before `ctx.into()` consumes ctx.
+    // snapshot substrait filter bytes before `ctx.into()` consumes ctx.
     let substrait_filter_bytes = ctx.substrait_filter_bytes.clone();
     // Snapshot the provider handle before `ctx.into()` consumes ctx.
     let base_file_provider_handle = ctx.base_file_provider_handle;
@@ -1023,7 +1023,7 @@ pub fn new_file_group_reader_with_context(
         Ok(pf) => pf,
         Err(e) => {
             log::warn!(
-                "[ENG-40156] could not decode pushed filter ({e}); dropping it \
+                "could not decode pushed filter ({e}); dropping it \
                  and relying on Velox's post-scan filter to apply the original \
                  predicate"
             );
@@ -1032,12 +1032,12 @@ pub fn new_file_group_reader_with_context(
     };
     if let Some(ref pf) = pushed_filter {
         log::debug!(
-            "[ENG-40156] decoded substrait predicate over columns {:?}",
+            "decoded substrait predicate over columns {:?}",
             pf.columns()
         );
     }
 
-    // ── 7a. ENG-42866 — compute MOR pushdown safety ──────────────────
+    // ── 7a. compute MOR pushdown safety ──────────────────
     // Java's `SparkFileFormatInternalRowReaderContext.filterIsSafeForPrimaryKey`
     // pushes a filter into MOR base + log readers iff every column it
     // references is in the primary-key field set (or is the
@@ -1057,21 +1057,21 @@ pub fn new_file_group_reader_with_context(
         .unwrap_or(false);
     if let Some(ref pf) = pushed_filter {
         log::debug!(
-            "[ENG-42866] mor_pk_safe={mor_pk_safe} (predicate columns={:?}, \
+            "mor_pk_safe={mor_pk_safe} (predicate columns={:?}, \
              primary keys={:?})",
             pf.columns(),
             record_key_fields,
         );
     }
 
-    // ── 7a-bis. ENG-48206 — which predicate columns the #18132 repair can reach ──
+    // ── 7a-bis. which predicate columns the #18132 repair can reach ──
     // Decided here, beside `mor_pk_safe`, and for the same reason: the base read
     // and the injected provider must see one decision.
     let repair_risk_columns =
         repair_risk_columns_for(pushed_filter.as_ref(), schema_handler.table_schema.as_ref());
     if !repair_risk_columns.is_empty() {
         log::debug!(
-            "[ENG-48206] predicate columns {repair_risk_columns:?} may carry the \
+            "predicate columns {repair_risk_columns:?} may carry the \
              #18132 mislabel; base reads will check each file's footer and decline \
              pushdown on the ones that mislabel them"
         );
@@ -1092,7 +1092,7 @@ pub fn new_file_group_reader_with_context(
         .as_ref()
         .map(|pf| counting_row_filter_builder(pf, Arc::clone(&row_filters_installed)));
 
-    // ENG-47483 — row-group pruning from footer statistics. Built from the same
+    // row-group pruning from footer statistics. Built from the same
     // decoded predicate as the row filter, but it is a different mechanism with
     // a different payoff: the filter saves decode, this saves IO. Both ride on
     // ReaderContext and share the base-read pushdown gate.
@@ -1156,7 +1156,7 @@ pub fn new_file_group_reader_with_context(
     let base_file_provider =
         unsafe { provider_abi::take_provider_from_handle(base_file_provider_handle) };
 
-    // [ENG-47483] Capture the read-volume handle before `storage` moves into the
+    // Capture the read-volume handle before `storage` moves into the
     // struct below.
     let read_volume = storage.read_volume();
 
@@ -1190,7 +1190,7 @@ impl HoodieFileGroupReader {
         partition_path_fields: Option<Vec<String>>,
     ) -> std::result::Result<Self, String> {
         // ENG-42276 v4.3 — no per-fg tokio runtime (see struct doc).
-        // [ENG-47483] capture before `storage` moves into the literal.
+        // capture before `storage` moves into the literal.
         let read_volume = storage.read_volume();
         Ok(Self {
             reader_context,
@@ -1248,7 +1248,7 @@ impl HoodieFileGroupReader {
             );
         }
 
-        // ENG-42276 / ENG-42866 — the row_filter_builder + mor_pk_safe live
+        // ENG-42276 / the row_filter_builder + mor_pk_safe live
         // on reader_context (set at FFI entry, see new_file_group_reader_with_context).
         // The FG reader gate at make_base_file_batches and the parquet log
         // block decoder in `Decoder::decode_parquet_record_content` both
@@ -1320,7 +1320,7 @@ impl HoodieFileGroupReader {
             record_batch.num_columns(),
         );
 
-        // ── ENG-40156 — post-merge predicate evaluation ───────────────
+        // ── post-merge predicate evaluation ───────────────
         // Safe for all MOR shapes: the merge has already resolved log
         // updates so predicate values reflect the snapshot the caller
         // would see.
@@ -1343,7 +1343,7 @@ impl HoodieFileGroupReader {
                     }
                     Err(e) => {
                         log::warn!(
-                            "[ENG-40156] filter eval failed; falling back to \
+                            "filter eval failed; falling back to \
                              Velox post-scan filter: {e}; cols={:?}",
                             filter.columns()
                         );
@@ -1362,7 +1362,7 @@ impl HoodieFileGroupReader {
     /// `ArrowArrayStream::get_next` until the release callback signals
     /// end-of-stream.
     ///
-    /// ENG-42991 — true streaming output. Async work
+    /// true streaming output. Async work
     /// (base file decode + log scan + buffer population) still runs
     /// up-front via `block_on(reader.open())` on `OBJECT_STORE_RUNTIME`;
     /// from then on the iterator is pure synchronous in-memory work
@@ -1445,7 +1445,7 @@ impl HoodieFileGroupReader {
 
         let merge_iter = BlockingMergeStream::new(merge_stream);
 
-        // ENG-44436 — publish the reader's PEAK native footprint ONCE, here.
+        // publish the reader's PEAK native footprint ONCE, here.
         // `open()` has fully populated the merge map during the log scan, and the
         // base file is streamed (not accumulated) through the merge from here on,
         // so the footprint only decreases as chunks drain — this post-`open()`
@@ -1659,7 +1659,7 @@ impl Iterator for PostMergePredicateFilter {
                 // Deterministic for a given predicate + schema, so it would
                 // otherwise repeat on every emitted chunk.
                 warn_once!(
-                    "[ENG-40156] filter eval failed; falling back to \
+                    "filter eval failed; falling back to \
                      Velox post-scan filter: {e}; cols={:?}",
                     filter.columns()
                 );
@@ -1860,7 +1860,7 @@ pub(crate) mod tests {
         unsafe { hudi_free_arrow_stream(std::ptr::null_mut()) };
     }
 
-    /// ENG-44436 — `hudi_reader_memory_bytes` publishes the reader's PEAK native
+    /// `hudi_reader_memory_bytes` publishes the reader's PEAK native
     /// footprint: 0 before the file group is opened, a plausible non-zero value
     /// once `get_closable_iterator` has opened it (the merge map is fully
     /// populated during the log scan — the true maximum, since the base file is

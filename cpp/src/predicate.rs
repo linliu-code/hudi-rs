@@ -17,7 +17,7 @@
  * under the License.
  */
 
-//! ENG-40156 — Substrait predicate pushdown from Velox into hudi-rs.
+//! Substrait predicate pushdown from Velox into hudi-rs.
 //!
 //! Wire format: `substrait::proto::ExtendedExpression` serialized via prost.
 //! Velox `HudiSplitReader` builds this from the Substrait filter that Gluten
@@ -115,7 +115,7 @@ impl PushedFilter {
             return Ok(None);
         }
         let ext_expr = ExtendedExpression::decode(bytes)
-            .map_err(|e| format!("[ENG-40156] failed to decode ExtendedExpression: {e}"))?;
+            .map_err(|e| format!("failed to decode ExtendedExpression: {e}"))?;
         let ExtendedExpression {
             base_schema,
             extensions,
@@ -127,7 +127,7 @@ impl PushedFilter {
             Some(schema) => schema.names,
             None => {
                 log::warn!(
-                    "[ENG-40156] ExtendedExpression missing base_schema; \
+                    "ExtendedExpression missing base_schema; \
                      dropping pushed filter, relying on Velox post-scan filter"
                 );
                 return Ok(None);
@@ -139,7 +139,7 @@ impl PushedFilter {
                 Some(expression_reference::ExprType::Expression(e)) => e,
                 _ => {
                     log::warn!(
-                        "[ENG-40156] ExtendedExpression.referred_expr[0] is not \
+                        "ExtendedExpression.referred_expr[0] is not \
                          an Expression (likely a Measure); dropping pushed filter"
                     );
                     return Ok(None);
@@ -147,7 +147,7 @@ impl PushedFilter {
             },
             None => {
                 log::warn!(
-                    "[ENG-40156] ExtendedExpression had no referred expression; \
+                    "ExtendedExpression had no referred expression; \
                      dropping pushed filter, relying on Velox post-scan filter"
                 );
                 return Ok(None);
@@ -173,7 +173,7 @@ impl PushedFilter {
                         function_map.insert(f.function_anchor, known);
                     }
                     None => log::debug!(
-                        "[ENG-40156] declared substrait function '{}' (anchor={}) is not \
+                        "declared substrait function '{}' (anchor={}) is not \
                          evaluable here; ignoring unless the pushed expression uses it",
                         f.name,
                         f.function_anchor
@@ -188,12 +188,12 @@ impl PushedFilter {
             }
             match declared_names.get(anchor) {
                 Some(name) => log::warn!(
-                    "[ENG-40156] pushed expression references unsupported substrait \
+                    "pushed expression references unsupported substrait \
                      function '{name}' (anchor={anchor}); dropping pushed filter, \
                      relying on Velox post-scan filter"
                 ),
                 None => log::warn!(
-                    "[ENG-40156] pushed expression references function anchor {anchor} \
+                    "pushed expression references function anchor {anchor} \
                      with no declaration in the extensions table; dropping pushed \
                      filter, relying on Velox post-scan filter"
                 ),
@@ -319,7 +319,7 @@ impl PushedFilter {
         true
     }
 
-    /// ENG-47483 — choose which row groups can be skipped outright, from the
+    /// choose which row groups can be skipped outright, from the
     /// footer statistics parquet has already fetched.
     ///
     /// This is the only mechanism on the FFI path that avoids reading bytes. A
@@ -638,12 +638,11 @@ pub fn filter_batch(batch: &RecordBatch, filter: &PushedFilter) -> Result<Record
     let mask = filter.evaluate(batch)?;
     // arrow_select's filter_record_batch treats null mask entries as "drop",
     // which is what we want for SQL WHERE semantics.
-    filter_record_batch(batch, &mask)
-        .map_err(|e| format!("[ENG-40156] filter_record_batch failed: {e}"))
+    filter_record_batch(batch, &mask).map_err(|e| format!("filter_record_batch failed: {e}"))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Parquet-level pushdown adapter (ENG-42276)
+// Parquet-level pushdown adapter
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Adapts a `PushedFilter` to parquet's `ArrowPredicate` trait so it can be
@@ -673,7 +672,7 @@ impl ArrowPredicate for PushedFilterArrowPredicate {
                 // calls this per RecordBatch, so it would otherwise emit one
                 // line per batch per row group per file.
                 crate::warn_once!(
-                    "[ENG-40156] parquet pushdown eval failed; emitting all-true \
+                    "parquet pushdown eval failed; emitting all-true \
                      mask so post-merge filter runs: {e}"
                 );
                 Ok(BooleanArray::from(vec![true; batch.num_rows()]))
@@ -905,7 +904,7 @@ impl PushedFilter {
     ///   repay the second decode pass** — in practice a predicate built only from
     ///   `IsNotNull`/And/Or/Not, which passes everything but the 2-3% null
     ///   fraction. See ENG-42276 v4.1, and `is_worth_row_filtering` for why
-    ///   `IsNull` is explicitly *not* in that set (ENG-47480).
+    ///   `IsNull` is explicitly *not* in that set.
     ///
     /// On `None`, the caller's existing post-merge filter still evaluates
     /// the predicate correctly — only the parquet-layer optimisation is
@@ -914,17 +913,17 @@ impl PushedFilter {
         let referenced = self.referenced_field_indices();
         if referenced.is_empty() {
             log::debug!(
-                "[ENG-40156] pushdown: expression references no fields; \
+                "pushdown: expression references no fields; \
                  skipping parquet RowFilter"
             );
             return None;
         }
 
-        // ENG-42276 v4.1 / ENG-47480 — selectivity gate: skip pushdown when
+        // ENG-42276 v4.1 / selectivity gate: skip pushdown when
         // no leaf rejects enough rows to repay the second decode pass.
         if !self.is_worth_row_filtering(&self.expression, false) {
             log::debug!(
-                "[ENG-42276] pushdown: no leaf of the predicate is selective \
+                "pushdown: no leaf of the predicate is selective \
                  (IsNotNull/And/Or/Not only) — skipping parquet RowFilter to \
                  avoid paying a second decode pass that rejects almost nothing"
             );
@@ -944,7 +943,7 @@ impl PushedFilter {
                     // C++ side, not an expected schema difference. Pushdown is
                     // skipped either way, so this is diagnostic only.
                     crate::warn_once!(
-                        "[ENG-40156] pushdown: substrait field index {sub_idx} out of \
+                        "pushdown: substrait field index {sub_idx} out of \
                          range of column_names (len={}); skipping pushdown",
                         self.column_names.len()
                     );
@@ -962,7 +961,7 @@ impl PushedFilter {
                 Some(i) => parquet_col_indices.push(i),
                 None => {
                     log::debug!(
-                        "[ENG-40156] pushdown: column '{col_name}' not in parquet schema; \
+                        "pushdown: column '{col_name}' not in parquet schema; \
                          skipping pushdown for this file"
                     );
                     return None;
@@ -976,7 +975,7 @@ impl PushedFilter {
             projection,
         };
         log::debug!(
-            "[ENG-40156] pushdown: installing parquet RowFilter over cols {:?}",
+            "pushdown: installing parquet RowFilter over cols {:?}",
             self.column_names
         );
         Some(RowFilter::new(vec![Box::new(predicate)]))
@@ -1088,16 +1087,9 @@ impl Value {
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "[ENG-40156] expected boolean column, got {}",
-                        arr.data_type()
-                    )
-                }),
+                .ok_or_else(|| format!("expected boolean column, got {}", arr.data_type())),
             Value::Scalar(ScalarValue::Bool(b)) => Ok(BooleanArray::from(vec![b; num_rows])),
-            other => Err(format!(
-                "[ENG-40156] cannot coerce {other:?} to BooleanArray"
-            )),
+            other => Err(format!("cannot coerce {other:?} to BooleanArray")),
         }
     }
 }
@@ -1114,7 +1106,7 @@ impl PushedFilter {
                 self.eval_singular_or_list(or_list, batch).map(Value::Bool)
             }
             other => Err(format!(
-                "[ENG-40156] unsupported expression variant at evaluation: {other:?}"
+                "unsupported expression variant at evaluation: {other:?}"
             )),
         }
     }
@@ -1143,17 +1135,17 @@ impl PushedFilter {
         let value_expr = or_list
             .value
             .as_ref()
-            .ok_or_else(|| "[ENG-40156] SingularOrList has no tested value".to_string())?;
+            .ok_or_else(|| "SingularOrList has no tested value".to_string())?;
         let column = match self.eval(value_expr, batch)? {
             Value::Column(arr) => arr,
             other => {
                 return Err(format!(
-                    "[ENG-40156] SingularOrList tested value must be a column, got {other:?}"
+                    "SingularOrList tested value must be a column, got {other:?}"
                 ));
             }
         };
         if or_list.options.is_empty() {
-            return Err("[ENG-40156] SingularOrList with no options".to_string());
+            return Err("SingularOrList with no options".to_string());
         }
 
         let num_rows = batch.num_rows();
@@ -1162,20 +1154,18 @@ impl PushedFilter {
             let literal = match &option.rex_type {
                 Some(RexType::Literal(lit)) => decode_literal(lit)?,
                 other => {
-                    return Err(format!(
-                        "[ENG-40156] SingularOrList option is not a literal: {other:?}"
-                    ));
+                    return Err(format!("SingularOrList option is not a literal: {other:?}"));
                 }
             };
             let matches = compare_column_scalar(&column, Cmp::Eq, &literal, false, num_rows)?;
             mask = Some(match mask {
                 None => matches,
                 Some(acc) => boolean::or_kleene(&acc, &matches)
-                    .map_err(|e| format!("[ENG-40156] IN or_kleene fold failed: {e}"))?,
+                    .map_err(|e| format!("IN or_kleene fold failed: {e}"))?,
             });
         }
         // `options` is non-empty, so at least one fold step ran.
-        mask.ok_or_else(|| "[ENG-40156] SingularOrList produced no mask".to_string())
+        mask.ok_or_else(|| "SingularOrList produced no mask".to_string())
     }
 
     fn eval_field_ref(&self, fr: &FieldReference, batch: &RecordBatch) -> Result<ArrayRef, String> {
@@ -1185,22 +1175,18 @@ impl PushedFilter {
         let direct = match &fr.reference_type {
             Some(field_reference::ReferenceType::DirectReference(seg)) => seg,
             other => {
-                return Err(format!(
-                    "[ENG-40156] unsupported field reference type: {other:?}"
-                ));
+                return Err(format!("unsupported field reference type: {other:?}"));
             }
         };
         let idx = match &direct.reference_type {
             Some(reference_segment::ReferenceType::StructField(sf)) => sf.field as usize,
             other => {
-                return Err(format!(
-                    "[ENG-40156] unsupported reference segment: {other:?}"
-                ));
+                return Err(format!("unsupported reference segment: {other:?}"));
             }
         };
         let col_name = self.column_names.get(idx).ok_or_else(|| {
             format!(
-                "[ENG-40156] field index {idx} out of bounds (base_schema has {} field(s))",
+                "field index {idx} out of bounds (base_schema has {} field(s))",
                 self.column_names.len()
             )
         })?;
@@ -1208,7 +1194,7 @@ impl PushedFilter {
             let schema = batch.schema();
             let avail: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             format!(
-                "[ENG-40156] referenced column '{col_name}' not in RecordBatch; \
+                "referenced column '{col_name}' not in RecordBatch; \
                  available={avail:?}"
             )
         })?;
@@ -1222,7 +1208,7 @@ impl PushedFilter {
             .ok_or_else(|| {
                 // Shouldn't happen — decode() drops the filter if any anchor is unknown.
                 format!(
-                    "[ENG-40156] no KnownFunction for anchor {} at eval time \
+                    "no KnownFunction for anchor {} at eval time \
                  (decode invariant violated)",
                     sf.function_reference
                 )
@@ -1234,9 +1220,7 @@ impl PushedFilter {
             .iter()
             .map(|a| match &a.arg_type {
                 Some(function_argument::ArgType::Value(e)) => self.eval(e, batch),
-                other => Err(format!(
-                    "[ENG-40156] unsupported function argument type: {other:?}"
-                )),
+                other => Err(format!("unsupported function argument type: {other:?}")),
             })
             .collect();
         let args = args?;
@@ -1281,7 +1265,7 @@ fn decode_literal(lit: &Literal) -> Result<ScalarValue, String> {
         Some(LiteralType::Decimal(d)) => {
             if d.value.len() != 16 {
                 return Err(format!(
-                    "[ENG-40156] Decimal literal has {} bytes, expected 16",
+                    "Decimal literal has {} bytes, expected 16",
                     d.value.len()
                 ));
             }
@@ -1299,7 +1283,7 @@ fn decode_literal(lit: &Literal) -> Result<ScalarValue, String> {
         #[allow(deprecated)]
         Some(LiteralType::Timestamp(ts)) => Ok(ScalarValue::TimestampNanos(
             ts.checked_mul(1_000)
-                .ok_or_else(|| format!("[ENG-40156] Timestamp µs->ns overflow for {ts}"))?,
+                .ok_or_else(|| format!("Timestamp µs->ns overflow for {ts}"))?,
         )),
         // PrecisionTimestamp carries an explicit precision (0=s, 3=ms, 6=µs, 9=ns).
         // Normalise UP to ns at decode time (lossless); the column is scaled to
@@ -1312,7 +1296,7 @@ fn decode_literal(lit: &Literal) -> Result<ScalarValue, String> {
         )),
         Some(LiteralType::Null(_)) => Ok(ScalarValue::Null),
         None if lit.nullable => Ok(ScalarValue::Null),
-        other => Err(format!("[ENG-40156] unsupported literal type: {other:?}")),
+        other => Err(format!("unsupported literal type: {other:?}")),
     }
 }
 
@@ -1327,13 +1311,11 @@ fn rescale_to_nanos(value: i64, precision: i32) -> Result<i64, String> {
         6 => 1_000,
         9 => 1,
         other => {
-            return Err(format!(
-                "[ENG-40156] unsupported PrecisionTimestamp precision: {other}"
-            ));
+            return Err(format!("unsupported PrecisionTimestamp precision: {other}"));
         }
     };
     value.checked_mul(factor).ok_or_else(|| {
-        format!("[ENG-40156] PrecisionTimestamp overflow rescaling {value} (precision {precision}) to ns")
+        format!("PrecisionTimestamp overflow rescaling {value} (precision {precision}) to ns")
     })
 }
 
@@ -1352,7 +1334,7 @@ fn boolean_and(args: Vec<Value>, n: usize) -> Result<BooleanArray, String> {
     // (SITE-1) and the unfiltered(+warn) fallback in lib.rs filter_batch caller
     // (SITE-2), so we over-include + warn rather than dropping rows.
     if args.is_empty() {
-        return Err("[ENG-40156] and() with no arguments".to_string());
+        return Err("and() with no arguments".to_string());
     }
     fold_kleene(args, n, boolean::and_kleene, "and")
 }
@@ -1362,7 +1344,7 @@ fn boolean_or(args: Vec<Value>, n: usize) -> Result<BooleanArray, String> {
     // rows at the parquet RowFilter (unrecoverable under-include). Return Err so
     // the SITE-1/SITE-2 fallbacks over-include + warn instead.
     if args.is_empty() {
-        return Err("[ENG-40156] or() with no arguments".to_string());
+        return Err("or() with no arguments".to_string());
     }
     fold_kleene(args, n, boolean::or_kleene, "or")
 }
@@ -1379,25 +1361,22 @@ fn fold_kleene(
     // The empty case is rejected by the callers, so `next()` is always Some.
     let first = iter
         .next()
-        .ok_or_else(|| format!("[ENG-40156] {op}() with no arguments"))?;
+        .ok_or_else(|| format!("{op}() with no arguments"))?;
     let mut acc = first.into_bool_array(n)?;
     for value in iter {
         let next = value.into_bool_array(n)?;
-        acc = kernel(&acc, &next).map_err(|e| format!("[ENG-40156] {op}() kernel failed: {e}"))?;
+        acc = kernel(&acc, &next).map_err(|e| format!("{op}() kernel failed: {e}"))?;
     }
     Ok(acc)
 }
 
 fn boolean_not(args: Vec<Value>, n: usize) -> Result<BooleanArray, String> {
     if args.len() != 1 {
-        return Err(format!(
-            "[ENG-40156] not() expects 1 argument, got {}",
-            args.len()
-        ));
+        return Err(format!("not() expects 1 argument, got {}", args.len()));
     }
     let arr = args.into_iter().next().unwrap().into_bool_array(n)?;
     // arrow's `not` leaves null entries null — SQL's NOT NULL = NULL.
-    boolean::not(&arr).map_err(|e| format!("[ENG-40156] not() kernel failed: {e}"))
+    boolean::not(&arr).map_err(|e| format!("not() kernel failed: {e}"))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1410,38 +1389,33 @@ fn boolean_not(args: Vec<Value>, n: usize) -> Result<BooleanArray, String> {
 /// operator for the error message.
 fn null_test_column(args: Vec<Value>, op: &str) -> Result<ArrayRef, String> {
     if args.len() != 1 {
-        return Err(format!(
-            "[ENG-40156] {op}() expects 1 argument, got {}",
-            args.len()
-        ));
+        return Err(format!("{op}() expects 1 argument, got {}", args.len()));
     }
     match args.into_iter().next().unwrap() {
         Value::Column(arr) => Ok(arr),
         // Scalar null test applied row-wise — but we don't know the row count
         // from a scalar alone. This shape is degenerate (filter collapses to a
         // constant). Caller would have folded this.
-        Value::Scalar(ScalarValue::Null) => {
-            Err(format!("[ENG-40156] {op} on a scalar without row context"))
-        }
+        Value::Scalar(ScalarValue::Null) => Err(format!("{op} on a scalar without row context")),
         Value::Scalar(_) => Err(format!(
-            "[ENG-40156] {op} on a non-null scalar — should have been folded"
+            "{op} on a non-null scalar — should have been folded"
         )),
         Value::Bool(_) => Err(format!(
-            "[ENG-40156] {op} on a boolean expression result — unusual; not supported"
+            "{op} on a boolean expression result — unusual; not supported"
         )),
     }
 }
 
 fn is_null(args: Vec<Value>) -> Result<BooleanArray, String> {
     let arr = null_test_column(args, "is_null")?;
-    boolean::is_null(&arr).map_err(|e| format!("[ENG-40156] is_null() kernel failed: {e}"))
+    boolean::is_null(&arr).map_err(|e| format!("is_null() kernel failed: {e}"))
 }
 
 /// Unlike a comparison, the result of a null test is itself never null: every
 /// row gets a definite TRUE/FALSE. arrow's `is_not_null` kernel matches that.
 fn is_not_null(args: Vec<Value>) -> Result<BooleanArray, String> {
     let arr = null_test_column(args, "is_not_null")?;
-    boolean::is_not_null(&arr).map_err(|e| format!("[ENG-40156] is_not_null() kernel failed: {e}"))
+    boolean::is_not_null(&arr).map_err(|e| format!("is_not_null() kernel failed: {e}"))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1519,18 +1493,14 @@ fn apply_cmp(
     } else {
         (column, scalar)
     };
-    cmp_op.kernel()(lhs, rhs).map_err(|e| format!("[ENG-40156] comparison kernel failed: {e}"))
+    cmp_op.kernel()(lhs, rhs).map_err(|e| format!("comparison kernel failed: {e}"))
 }
 
 fn comparison(known: KnownFunction, args: Vec<Value>, n: usize) -> Result<BooleanArray, String> {
-    let cmp = Cmp::from_known(known).ok_or_else(|| {
-        format!("[ENG-40156] comparison() called with non-comparison function {known:?}")
-    })?;
+    let cmp = Cmp::from_known(known)
+        .ok_or_else(|| format!("comparison() called with non-comparison function {known:?}"))?;
     if args.len() != 2 {
-        return Err(format!(
-            "[ENG-40156] {known:?} expects 2 arguments, got {}",
-            args.len()
-        ));
+        return Err(format!("{known:?} expects 2 arguments, got {}", args.len()));
     }
     let mut iter = args.into_iter();
     let lhs = iter.next().unwrap();
@@ -1544,13 +1514,13 @@ fn comparison(known: KnownFunction, args: Vec<Value>, n: usize) -> Result<Boolea
             // Possible to support but Gluten doesn't currently emit these to
             // Hudi (extractFiltersFromRemainingFilter only extracts
             // column-vs-literal predicates).
-            Err("[ENG-40156] column-vs-column comparison not supported".to_string())
+            Err("column-vs-column comparison not supported".to_string())
         }
         (Value::Scalar(a), Value::Scalar(b)) => Err(format!(
-            "[ENG-40156] scalar-vs-scalar comparison ({a:?} vs {b:?}) — should be constant-folded"
+            "scalar-vs-scalar comparison ({a:?} vs {b:?}) — should be constant-folded"
         )),
         (Value::Bool(_), _) | (_, Value::Bool(_)) => {
-            Err("[ENG-40156] comparison applied to a boolean expression result".to_string())
+            Err("comparison applied to a boolean expression result".to_string())
         }
     }
 }
@@ -1606,14 +1576,12 @@ fn compare_column_scalar(
                 return Ok(BooleanArray::from(vec![None; n]));
             }
             let literal = scalar_array(col.data_type(), scalar)?;
-            // ENG-47570 — see `normalize_signed_zeros`. A no-op for every
+            // see `normalize_signed_zeros`. A no-op for every
             // column type and every literal except a float against ±0.0.
             let (column, literal) = normalize_signed_zeros(col.clone(), literal);
             apply_cmp(cmp, &column, &Scalar::new(&literal), reversed)
         }
-        other => Err(format!(
-            "[ENG-40156] comparison on unsupported column type {other}"
-        )),
+        other => Err(format!("comparison on unsupported column type {other}")),
     }
 }
 
@@ -1721,7 +1689,7 @@ fn scalar_array(data_type: &DataType, scalar: &ScalarValue) -> Result<ArrayRef, 
         }
         (_, other) => {
             return Err(format!(
-                "[ENG-40156] type mismatch: column is {data_type} but scalar is {other:?}"
+                "type mismatch: column is {data_type} but scalar is {other:?}"
             ));
         }
     };
@@ -1753,16 +1721,14 @@ fn compare_timestamp_column(
         ScalarValue::Null => return Ok(BooleanArray::from(vec![None; n])),
         other => {
             return Err(format!(
-                "[ENG-40156] type mismatch: column is Timestamp but scalar is {other:?}"
+                "type mismatch: column is Timestamp but scalar is {other:?}"
             ));
         }
     };
     let timezone = match col.data_type() {
         DataType::Timestamp(_, tz) => tz.clone(),
         other => {
-            return Err(format!(
-                "[ENG-40156] expected Timestamp column, got {other}"
-            ));
+            return Err(format!("expected Timestamp column, got {other}"));
         }
     };
 
@@ -1773,7 +1739,7 @@ fn compare_timestamp_column(
         col.clone()
     } else {
         cast_with_options(col, &target, &LOSSLESS_CAST)
-            .map_err(|e| format!("[ENG-40156] Timestamp ->ns cast failed: {e}"))?
+            .map_err(|e| format!("Timestamp ->ns cast failed: {e}"))?
     };
     let literal = TimestampNanosecondArray::from(vec![nanos]).with_timezone_opt(timezone);
     apply_cmp(cmp, &column_nanos, &Scalar::new(&literal), reversed)
@@ -1805,7 +1771,7 @@ fn compare_decimal_column(
         ScalarValue::Null => return Ok(BooleanArray::from(vec![None; n])),
         other => {
             return Err(format!(
-                "[ENG-40156] type mismatch: column is Decimal128 but scalar is {other:?}"
+                "type mismatch: column is Decimal128 but scalar is {other:?}"
             ));
         }
     };
@@ -1813,18 +1779,18 @@ fn compare_decimal_column(
     let common_scale = (col_scale as i32).max(scalar_scale);
     if common_scale > DECIMAL128_MAX_PRECISION as i32 {
         return Err(format!(
-            "[ENG-40156] Decimal common scale {common_scale} exceeds Decimal128 limit"
+            "Decimal common scale {common_scale} exceeds Decimal128 limit"
         ));
     }
     let scale_up_factor = |from: i32, to: i32| -> Result<i128, String> {
         let exp = to - from;
         10i128
             .checked_pow(exp as u32)
-            .ok_or_else(|| format!("[ENG-40156] Decimal rescale overflow: 10^{exp}"))
+            .ok_or_else(|| format!("Decimal rescale overflow: 10^{exp}"))
     };
     let rescaled_literal = scalar_value
         .checked_mul(scale_up_factor(scalar_scale, common_scale)?)
-        .ok_or_else(|| "[ENG-40156] Decimal rescale value overflow".to_string())?;
+        .ok_or_else(|| "Decimal rescale value overflow".to_string())?;
 
     let target = DataType::Decimal128(DECIMAL128_MAX_PRECISION, common_scale as i8);
     let column_rescaled: ArrayRef =
@@ -1832,11 +1798,11 @@ fn compare_decimal_column(
             col.clone()
         } else {
             cast_with_options(col, &target, &LOSSLESS_CAST)
-                .map_err(|e| format!("[ENG-40156] Decimal rescale cast failed: {e}"))?
+                .map_err(|e| format!("Decimal rescale cast failed: {e}"))?
         };
     let literal = Decimal128Array::from(vec![rescaled_literal])
         .with_precision_and_scale(DECIMAL128_MAX_PRECISION, common_scale as i8)
-        .map_err(|e| format!("[ENG-40156] Decimal literal does not fit the column scale: {e}"))?;
+        .map_err(|e| format!("Decimal literal does not fit the column scale: {e}"))?;
     apply_cmp(cmp, &column_rescaled, &Scalar::new(&literal), reversed)
 }
 
@@ -3260,7 +3226,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // ENG-42276 — Parquet RowFilter pushdown tests
+    // Parquet RowFilter pushdown tests
     // ════════════════════════════════════════════════════════════════════
     //
     // These tests verify the parquet-level pushdown adapter on `PushedFilter`:
@@ -4394,7 +4360,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // ENG-40156 — degenerate combinators must Err (not under-include)
+    // degenerate combinators must Err (not under-include)
     // ════════════════════════════════════════════════════════════════════
 
     #[test]
@@ -4424,7 +4390,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // ENG-40156 — function validation is scoped to REFERENCED functions.
+    // function validation is scoped to REFERENCED functions.
     // Gluten serialises the whole plan's function table into the blob, so an
     // unrelated declaration must not drop a perfectly supported predicate.
     // ════════════════════════════════════════════════════════════════════
@@ -4503,7 +4469,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // ENG-47570 — signed zero.
+    // signed zero.
     //
     // Arrow compares floats by IEEE-754 totalOrder: `is_eq` is literally
     // `to_bits() == to_bits()`, so `-0.0` and `0.0` are distinct and `-0.0`

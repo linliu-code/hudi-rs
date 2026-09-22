@@ -205,7 +205,7 @@ pub struct HoodieFileGroupReader {
 /// `--release --ignored --nocapture`).
 const MERGE_CHUNK_ROWS: usize = 1024;
 
-/// [ENG-48159] How many base-file batches `base_file_source()` fetches **before**
+/// How many base-file batches `base_file_source()` fetches **before**
 /// it hands the stream back, on the object-store read path.
 ///
 /// **The problem.** Velox prepares a split on its connector IO executor, ahead of
@@ -297,7 +297,7 @@ impl BaseSource {
     }
 }
 
-/// [ENG-48159] Fetch up to `batches` items from `stream` **now**, then return a
+/// Fetch up to `batches` items from `stream` **now**, then return a
 /// stream that serves those before pulling any more.
 ///
 /// Called from `base_file_source()`, which is awaited inside
@@ -1792,7 +1792,7 @@ impl HoodieFileGroupReader {
             Err(e) => Err(CoreError::from(e)),
         });
 
-        // ENG-48159 — pay for a bounded prefix HERE, while still on the thread
+        // pay for a bounded prefix HERE, while still on the thread
         // Velox prepared the split on. This body already runs inside
         // `OBJECT_STORE_RUNTIME.block_on(reader.open())`, so the `.await` is
         // mandatory: driving the prefetch through a synchronous adapter's
@@ -7639,7 +7639,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // ENG-48159 — the bounded initial prefetch (T-1).
+    // the bounded initial prefetch (T-1).
     //
     // These six tests are `ROW-S17(c)`'s `initial_prefetch_*` family, re-expressed
     // against this tree's `BoxStream` shape. They could not be carried as code:
@@ -7954,7 +7954,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // ENG-48159 — the RE-MEASUREMENT required by m22's AC-2.
+    // the RE-MEASUREMENT required by m22's AC-2.
     //
     //   cargo test -p hudi-core --release --lib eng_48159_prefetch_bench \
     //       -- --ignored --nocapture
