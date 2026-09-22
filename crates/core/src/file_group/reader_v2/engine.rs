@@ -198,12 +198,21 @@ pub struct HoodieFileGroupReader {
 /// rows those become 2.8 ms and ~40 ms. So the chunk size is what bounds how long
 /// a single poll occupies its executor, and it is set here rather than inherited.
 ///
-/// 1024 is what `parquet` already defaults to, so this pins today's behaviour
-/// instead of changing it. Pinned because the bound is silent if it moves: a
-/// larger default upstream would multiply the blocking above with nothing
-/// failing. Measured by `spilled_merge_blocking_duration` (ignored; run with
-/// `--release --ignored --nocapture`).
-const MERGE_CHUNK_ROWS: usize = 1024;
+/// 4096, not `parquet`'s 1024 default. A direct 4096-vs-1024 comparison on this
+/// merge path measured 4096 the faster of the two, and `merge_cpu_bench`'s
+/// baseline agrees on direction: per-row cost falls from 53.7 to 46.8 ns
+/// (3 cols) between 1024 and 8192 rows, as the per-chunk overhead amortises
+/// over more rows.
+///
+/// That throughput is paid for in the blocking above, which is linear in the
+/// same quantity — a spilled merge holds its executor roughly 4x longer per
+/// poll at 4096 than at 1024. The two move together, so re-measure them
+/// together: `spilled_merge_blocking_duration` (ignored; run with
+/// `--release --ignored --nocapture`) sweeps this constant directly.
+///
+/// Set explicitly, so a change to `parquet`'s default cannot move the bound
+/// silently.
+pub(crate) const MERGE_CHUNK_ROWS: usize = 4096;
 
 /// How many base-file batches `base_file_source()` fetches **before**
 /// it hands the stream back, on the object-store read path.
@@ -3844,7 +3853,9 @@ mod tests {
             arrow_schema::DataType::Int32,
             true,
         )]));
-        let rows = 5_000;
+        // Derived from the bound, not pinned: four full chunks plus a remainder,
+        // so this test cannot go vacuous if `MERGE_CHUNK_ROWS` is raised again.
+        let rows = (MERGE_CHUNK_ROWS * 4 + 1) as i32;
         let ids: Vec<i32> = (0..rows).collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -3975,7 +3986,9 @@ mod tests {
             arrow_schema::DataType::Utf8,
             false,
         )]));
-        let base_rows: usize = 5_000;
+        // Derived from the bound, not pinned: four full chunks plus a remainder,
+        // so the chunk-count assertion below keeps its teeth if the bound moves.
+        let base_rows: usize = MERGE_CHUNK_ROWS * 4 + 1;
         let keys: Vec<String> = (0..base_rows).map(|i| format!("base-{i:05}")).collect();
         let batch = RecordBatch::try_new(
             schema.clone(),

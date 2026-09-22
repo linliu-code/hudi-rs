@@ -4148,15 +4148,17 @@ mod tests {
     #[test]
     #[ignore = "measurement, not an assertion"]
     fn spilled_merge_blocking_duration() {
+        use crate::file_group::reader_v2::engine::MERGE_CHUNK_ROWS;
         use std::time::Instant;
 
         // Enough distinct keys to span far more spill batches than the decoded
         // cache holds, so a scattered probe order really does evict.
         const KEYS: usize = 50_000;
-        // 1024 is what a real chunk holds: `base_read_options` never sets a
-        // parquet batch size, so arrow-rs's default applies. 8192 is an upper
-        // bound for what a caller that raised it would see.
-        const CHUNK_SIZES: [usize; 2] = [1_024, 8_192];
+        // The middle value is what a real chunk holds: `base_read_options`
+        // sets the parquet batch size to `MERGE_CHUNK_ROWS`, so the shipped
+        // value is swept rather than assumed. 1024 is the previous
+        // setting, kept as the low anchor; 8192 bounds a caller that raised it.
+        const CHUNK_SIZES: [usize; 3] = [1_024, MERGE_CHUNK_ROWS, 8_192];
 
         let build = |budget: &[(&str, &str)]| {
             let mut buffer =
