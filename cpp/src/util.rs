@@ -20,7 +20,7 @@ use crate::ffi;
 use arrow_array::RecordBatchReader;
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 
-/// [ENG-42991] Wrap any [`RecordBatchReader`] in a heap-allocated
+/// Wrap any [`RecordBatchReader`] in a heap-allocated
 /// `FFI_ArrowArrayStream` returned as an opaque cxx pointer.
 ///
 /// The reader is consumed lazily by the C++ side via

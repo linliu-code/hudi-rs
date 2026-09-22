@@ -244,7 +244,7 @@ jobs:
   #
   # Internal's version opens with `aws-actions/configure-aws-credentials@v4`, which is NOT ported.
   # That step exists solely so `.cargo/config.toml`'s `token-from-stdout` credential provider can
-  # mint a CodeArtifact token for the forked arrow crates internal `main` pins through
+  # mint a token for any private registry a fork's manifests pin through
   # `[patch.crates-io]`. This branch has neither the patch section nor the registry -- it takes
   # `arrow = "58"` from crates.io -- so the step would authenticate against nothing. Dropping it is
   # the arrow-rs posture applied, not a shortcut around it.

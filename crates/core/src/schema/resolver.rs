@@ -217,7 +217,7 @@ pub(crate) fn sanitize_avro_schema_str(avro_schema_str: &str) -> String {
 /// be rejected. Returns the input **verbatim** if it is unparseable or not a top-level record.
 /// Callers skip this when the names already agree, so the common path does no JSON work.
 ///
-/// Ported from hudi-rs-internal #114 (ENG-46300), which fixed this on internal `main`. This branch
+/// Ported from hudi-rs-internal #114, which fixed this on internal `main`. This branch
 /// forks from apache/hudi-rs `main`, so it never carried that commit; the port keeps the OSS-core
 /// reader from regressing a case internal `main` already handles.
 pub(crate) fn adopt_writer_record_identity(

@@ -100,7 +100,7 @@ So `638ce3b` sits squarely in the "do not bump" case, and `JNI_ABI_VERSION` stay
 - **Development**: `-Dhudi.native.lib.path=/path/to/libhudi_jni.so` — point at a freshly
   built library (e.g. straight out of `target/release/`).
 - **CI / deployments**: the classpath resource `/native/<os>-<arch>/libhudi_jni.so`, packaged
-  into the `io.onehouse.hudi-rs:hudi-jni-native` Maven artifact that `hudi-native-reader`
+  into the `$(JNI_GROUP_ID):hudi-jni-native` Maven artifact that `hudi-native-reader`
   depends on (runtime scope, version pinned by the `hudi.jni.native.version` property). This
   is what lets aarch64 CI runners with no access to this repo run the native reader.
 
@@ -109,22 +109,22 @@ So `638ce3b` sits squarely in the "do not bump" case, and `JNI_ABI_VERSION` stay
 The Maven coordinates are the same regardless of where the jar comes from — only the repository
 it resolves from (and whether a classifier is present) changes:
 
-- **CodeArtifact**, via `make jni-deploy` — a single-arch
-  `io.onehouse.hudi-rs:hudi-jni-native:<version>:<os>-<arch>` jar, or with `JNI_MULTI=1` the
-  classifier-less `io.onehouse.hudi-rs:hudi-jni-native:<version>` jar carrying BOTH Linux arches
-  (needs a fresh `codeartifact` token in `~/.m2/settings.xml`). CI (`jni-native.yml`, see
+- **the configured Maven repository**, via `make jni-deploy` — a single-arch
+  `$(JNI_GROUP_ID):hudi-jni-native:<version>:<os>-<arch>` jar, or with `JNI_MULTI=1` the
+  classifier-less `$(JNI_GROUP_ID):hudi-jni-native:<version>` jar carrying BOTH Linux arches
+  (needs a fresh `$(JNI_MAVEN_REPO_ID)` token in `~/.m2/settings.xml`). CI (`jni-native.yml`, see
   "Building the carrier" below) builds that multi-arch jar but does not publish it: it uploads
   it as the `hudi-jni-native-carrier` workflow artifact.
 - **This machine's local Maven repository**, via `make jni-install` (single-arch,
   classifier) or `make jni-install JNI_MULTI=1` (multi-arch, no classifier).
-- **A pre-release asset on `onehouseinc/hudi-internal`**. hudi-internal's
+- **A pre-release asset on `<your distribution repo>`**. hudi-internal's
   `.github/actions/install-jni-carrier` installs this asset into the runner's local repository
-  when the coordinate does not resolve from CodeArtifact.
+  when the coordinate does not resolve from the configured Maven repository.
 
   **The asset MUST be the multi-arch, classifier-less jar, uploaded byte-for-byte as built; the
   action pins that jar's own md5.**
   The consuming action runs `install:install-file` with **no** `-Dclassifier`, so whatever bytes
-  it downloads become `io.onehouse.hudi-rs:hudi-jni-native:<version>`, the coordinate every
+  it downloads become `$(JNI_GROUP_ID):hudi-jni-native:<version>`, the coordinate every
   module and all 14 bundles resolve. Publishing a single-arch `-linux-aarch64` jar there would
   seed every runner with an aarch64-only library under the multi-arch coordinate: aarch64 passes,
   x86_64 builds succeed and then fail the bundle smoke (no `native/linux-x86_64/…`), and any
@@ -134,12 +134,12 @@ it resolves from (and whether a classifier is present) changes:
   Take the jar from the workflow run's own `hudi-jni-native-carrier` artifact — never rebuilt,
   never re-jarred — and upload it as-is:
   ```
-  gh run download <run-id> -R onehouseinc/hudi-rs-internal -n hudi-jni-native-carrier -D /tmp/carrier
+  gh run download <run-id> -R <your fork> -n hudi-jni-native-carrier -D /tmp/carrier
   (cd /tmp/carrier && md5sum -c hudi-jni-native-<version>.jar.md5)   # checks the md5 the workflow recorded
   cut -d' ' -f1 /tmp/carrier/hudi-jni-native-<version>.jar.md5        # the value to pin
   gh release create hudi-jni-native/<version> \
     /tmp/carrier/hudi-jni-native-<version>.jar \
-    --repo onehouseinc/hudi-internal --prerelease --target <a pushed hudi-internal sha>
+    --repo <your distribution repo> --prerelease --target <a pushed hudi-internal sha>
   ```
   Then set that md5 in `install-jni-carrier/action.yml`. If CI is unavailable altogether, build
   the jar locally with `make jni-jar-multi-portable` (below) — the portable build, never
@@ -310,7 +310,7 @@ or writing anything the target refuses unless both `native/linux-x86_64/libhudi_
 symbols; a jar missing an arch would otherwise publish a one-arch library under the multi-arch
 coordinate. `make jni-install JNI_MULTI=1` / `make jni-deploy
 JNI_MULTI=1` (both depend on `jni-jar-multi`, so they still need `JNI_EXTRA_NATIVE_DIR`)
-install/deploy that jar under `io.onehouse.hudi-rs:hudi-jni-native:<version>` with no
+install/deploy that jar under `$(JNI_GROUP_ID):hudi-jni-native:<version>` with no
 classifier.
 
 ### Multi-arch jar layout and properties keys
@@ -393,8 +393,8 @@ make jni-jar-multi-portable
                      # jni-lib-portable + the same packaging against
                      # target/jni-portable/stage — the shape to use for a
                      # release asset or any jar that leaves this machine
-make jni-deploy      # mvn deploy:deploy-file the jar to CodeArtifact
-                     # (server id `codeartifact` in ~/.m2/settings.xml);
+make jni-deploy      # mvn deploy:deploy-file the jar to the configured Maven repository
+                     # (server id `$(JNI_MAVEN_REPO_ID)` in ~/.m2/settings.xml);
                      # JNI_MULTI=1 deploys the jni-jar-multi jar (no classifier)
 make jni-install     # mvn install:install-file the jar into the local Maven
                      # repository (~/.m2) for builds on this machine;
@@ -435,7 +435,7 @@ library its commit was built against and nothing already published is ever silen
 **Never re-tag an existing version — cut a new `-dev.<sha>` instead.** A re-run produces
 different bytes even from the identical commit (`built=` is a timestamp, and the Rust build is
 not bit-reproducible), so rebuilding `jni-native/<an existing version>` yields a second jar under
-the same version: deploying it fails on CodeArtifact's immutability and, if the release asset is
+the same version: deploying it fails on the configured Maven repository's immutability and, if the release asset is
 re-cut from it, it silently invalidates the MD5 that hudi-internal's `install-jni-carrier` action
 pins for that version.
 
