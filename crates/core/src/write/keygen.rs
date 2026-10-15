@@ -24,7 +24,7 @@ use arrow::record_batch::RecordBatch;
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig::{
-    IsHiveStylePartitioning, PartitionFields, RecordKeyFields,
+    IsHiveStylePartitioning, IsPartitionPathUrlencoded, PartitionFields, RecordKeyFields,
 };
 use crate::error::CoreError;
 use crate::index::HoodieKey;
@@ -86,6 +86,9 @@ pub fn hoodie_keys_for_batch_with_offset(
 
     let partition_fields: Vec<String> = hudi_configs.get_or_default(PartitionFields).into();
     let hive_style: bool = hudi_configs.get_or_default(IsHiveStylePartitioning).into();
+    let url_encode: bool = hudi_configs
+        .get_or_default(IsPartitionPathUrlencoded)
+        .into();
 
     if auto_keys {
         let instant = instant.ok_or_else(|| {
@@ -97,7 +100,8 @@ pub fn hoodie_keys_for_batch_with_offset(
         for row in 0..batch.num_rows() {
             // Match Java HoodieRecord.generateSequenceId(instant, partitionId, rowId).
             let record_key = format!("{instant}_{partition_id}_{}", row_id_offset + row);
-            let partition_path = partition_path_for_row(batch, row, &partition_fields, hive_style)?;
+            let partition_path =
+                partition_path_for_row(batch, row, &partition_fields, hive_style, url_encode)?;
             keys.push(HoodieKey {
                 record_key,
                 partition_path,
@@ -143,7 +147,13 @@ pub fn hoodie_keys_for_batch_with_offset(
             ));
         }
         let record_key = key_array.value(row).to_string();
-        let partition_path = partition_path_for_row(batch, row, &partition_fields, hive_style)?;
+        if record_key.is_empty() {
+            return Err(CoreError::Write(
+                "record key values must be non-empty".to_string(),
+            ));
+        }
+        let partition_path =
+            partition_path_for_row(batch, row, &partition_fields, hive_style, url_encode)?;
         keys.push(HoodieKey {
             record_key,
             partition_path,
@@ -157,6 +167,7 @@ fn partition_path_for_row(
     row: usize,
     partition_fields: &[String],
     hive_style: bool,
+    url_encode: bool,
 ) -> Result<String> {
     if partition_fields.is_empty() {
         return Ok(String::new());
@@ -174,6 +185,16 @@ fn partition_path_for_row(
             )));
         }
         let value = array_value_as_string(column.as_ref(), row)?;
+        let value = if value.is_empty() {
+            "__HIVE_DEFAULT_PARTITION__".to_string()
+        } else {
+            value
+        };
+        let value = if url_encode {
+            encode_partition_value(&value)
+        } else {
+            value
+        };
         if hive_style {
             segments.push(format!("{field}={value}"));
         } else {
@@ -181,6 +202,41 @@ fn partition_path_for_row(
         }
     }
     Ok(segments.join("/"))
+}
+
+// Match Java PartitionPathEncodeUtils: escape reserved ASCII, retaining Unicode
+// and spaces. URL form encoding would incorrectly turn spaces into '+'.
+fn encode_partition_value(value: &str) -> String {
+    if value.is_empty() {
+        return "__HIVE_DEFAULT_PARTITION__".to_string();
+    }
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch < ' '
+            || matches!(
+                ch,
+                '"' | '#'
+                    | '%'
+                    | '\''
+                    | '*'
+                    | '/'
+                    | ':'
+                    | '='
+                    | '?'
+                    | '\\'
+                    | '\u{7f}'
+                    | '{'
+                    | '['
+                    | ']'
+                    | '^'
+            )
+        {
+            out.push_str(&format!("%{:02X}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn array_value_as_string(array: &dyn Array, row: usize) -> Result<String> {

@@ -290,7 +290,7 @@ impl OptionResolver {
         storage: Arc<Storage>,
     ) -> Result<()> {
         let bytes = storage.get_file_data(".hoodie/hoodie.properties").await?;
-        let table_properties = parse_data_for_options(&bytes, "=")?;
+        let table_properties = crate::config::properties::parse_properties(&bytes)?;
 
         // Table properties on storage (hoodie.properties) should have the highest precedence,
         // except for writer-changeable properties like enabling metadata table/indexes.

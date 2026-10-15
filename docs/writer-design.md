@@ -183,9 +183,23 @@ and uploads run concurrently, bounded by `hoodie.write.task.parallelism`
 (default `2 × cores`). Plans are computed sequentially, executed in parallel,
 and assembled in plan order, so results are deterministic.
 
+Creation properties use the Java byte-stream properties format (Unicode and
+special characters are escaped and decoded). `with_option` accepts additional
+properties such as sizing, merge configuration, and partition URL encoding;
+creation-managed identity, layout, keys, partition fields, and metadata settings
+must use dedicated builder methods. Overrides of those properties are rejected
+before storage I/O so bootstrap state cannot disagree with the persisted config.
+URL-encoded partition paths escape individual values with Java's path encoding;
+separators remain literal, and explicit record keys must be non-null and non-empty.
+
 ### 4.5 Schema handling
 
 - Commit metadata records the **data schema** (no `_hoodie_*` meta fields).
+- Arrow aliases with one Avro representation are normalized before validation and
+  encoding: Int8/Int16 to Int32, large string/binary/list offsets to standard
+  offsets, list element names to `element`, timestamp timezones to UTC, and
+  decimals to the supported Decimal128 precision.
+  Cast failures abort the write rather than substituting nulls.
 - Incoming batches may differ from the table schema in nullability only
   (Spark evolves table schemas to all-nullable); such batches are aligned
   rather than rejected. Name/type/order changes still error.

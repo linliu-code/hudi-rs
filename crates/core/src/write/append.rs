@@ -81,6 +81,8 @@ async fn append_batches_inner(
     batches: &[RecordBatch],
     require_append_only: bool,
 ) -> Result<AppendResult> {
+    let canonical = crate::write::canonicalize_write_batches(batches)?;
+    let batches = canonical.as_slice();
     table.reload_timeline_for_write().await?;
     if !table.is_mor() {
         if require_append_only {

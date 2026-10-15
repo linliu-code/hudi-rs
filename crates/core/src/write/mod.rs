@@ -105,6 +105,78 @@ pub(crate) fn align_batch_to_schema(
     arrow_array::RecordBatch::try_new(target.clone(), batch.columns().to_vec()).ok()
 }
 
+/// Normalize Arrow aliases before validating or persisting a write schema.
+/// Avro int/string/bytes cannot preserve narrow integers or large offsets.
+pub(crate) fn canonicalize_write_batches(
+    batches: &[arrow_array::RecordBatch],
+) -> Result<Vec<arrow_array::RecordBatch>> {
+    use arrow_schema::{DataType, Field, Schema};
+    fn canonical_field(field: &Field) -> Result<Field> {
+        let ty = match field.data_type() {
+            DataType::Int8 | DataType::Int16 => DataType::Int32,
+            DataType::LargeUtf8 => DataType::Utf8,
+            DataType::LargeBinary => DataType::Binary,
+            DataType::List(item) | DataType::LargeList(item) => DataType::List(
+                std::sync::Arc::new(canonical_field(item)?.with_name("element")),
+            ),
+            DataType::Struct(fields) => DataType::Struct(
+                fields
+                    .iter()
+                    .map(|field| canonical_field(field).map(std::sync::Arc::new))
+                    .collect::<Result<Vec<_>>>()?
+                    .into(),
+            ),
+            DataType::Timestamp(unit, Some(_)) => DataType::Timestamp(*unit, Some("UTC".into())),
+            DataType::Decimal256(precision, scale) if *precision <= 38 => {
+                DataType::Decimal128(*precision, *scale)
+            }
+            DataType::Decimal256(precision, _) => {
+                return Err(CoreError::Unsupported(format!(
+                    "write decimal precision {precision} exceeds the supported Avro-to-Arrow precision 38"
+                )));
+            }
+            ty => ty.clone(),
+        };
+        Ok(field.clone().with_data_type(ty))
+    }
+    batches
+        .iter()
+        .map(|batch| {
+            let fields = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| canonical_field(field))
+                .collect::<Result<Vec<_>>>()?;
+            let schema = std::sync::Arc::new(Schema::new_with_metadata(
+                fields,
+                batch.schema().metadata().clone(),
+            ));
+            if schema == batch.schema() {
+                return Ok(batch.clone());
+            }
+            // Cast failures must abort rather than silently replacing values with null.
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(schema.fields())
+                .map(|(column, field)| {
+                    arrow::compute::cast_with_options(
+                        column,
+                        field.data_type(),
+                        &arrow::compute::CastOptions {
+                            safe: false,
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(CoreError::ArrowError)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            arrow_array::RecordBatch::try_new(schema, columns).map_err(CoreError::ArrowError)
+        })
+        .collect()
+}
+
 pub(crate) fn new_file_id() -> String {
     format!("{}-0", uuid::Uuid::new_v4())
 }

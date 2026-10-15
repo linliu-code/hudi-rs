@@ -211,22 +211,12 @@ impl PartitionPruner {
     }
 
     fn parse_segments(&self, partition_path: &str) -> Result<HashMap<String, Scalar<ArrayRef>>> {
-        let partition_path = if self.is_url_encoded {
-            percent_encoding::percent_decode(partition_path.as_bytes())
-                .decode_utf8()?
-                .into_owned()
-        } else {
-            partition_path.to_string()
-        };
-
         // Special case: single _hoodie_partition_path field uses the raw path as-is
         if self.schema.fields().len() == 1
             && self.schema.field(0).name() == MetaField::PartitionPath.as_ref()
         {
-            let scalar = SchemableFilter::cast_value(
-                &[partition_path.as_str()],
-                &arrow_schema::DataType::Utf8,
-            )?;
+            let scalar =
+                SchemableFilter::cast_value(&[partition_path], &arrow_schema::DataType::Utf8)?;
             return Ok(HashMap::from([(
                 MetaField::PartitionPath.as_ref().to_string(),
                 scalar,
@@ -263,7 +253,23 @@ impl PartitionPruner {
                 } else {
                     part
                 };
-                let scalar = SchemableFilter::cast_value(&[value], field.data_type())?;
+                // Split the physical path before decoding: an encoded slash belongs
+                // to a value and must not become another partition segment.
+                let value = if self.is_url_encoded {
+                    percent_encoding::percent_decode(value.as_bytes())
+                        .decode_utf8()?
+                        .into_owned()
+                } else {
+                    value.to_string()
+                };
+                // Java maps both empty and null values to this path. The path
+                // cannot prove their value, so let row filtering decide instead.
+                if value == "__HIVE_DEFAULT_PARTITION__" {
+                    return Err(InvalidPartitionPath(
+                        "default partition value is ambiguous".to_string(),
+                    ));
+                }
+                let scalar = SchemableFilter::cast_value(&[value.as_str()], field.data_type())?;
                 Ok((field.name().to_string(), scalar))
             })
             .collect()
@@ -423,7 +429,7 @@ mod tests {
         let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
 
         let segments = pruner
-            .parse_segments("date%3D2023-02-01%2Fcategory%3DA%2Fcount%3D10")
+            .parse_segments("date=2023-02-01/category=A%2FB%3DC/count=10")
             .unwrap();
         assert_eq!(segments.len(), 3);
         assert!(segments.contains_key("date"));
