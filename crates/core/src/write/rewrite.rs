@@ -3084,31 +3084,46 @@ fn merge_file_group_task(
                     take_batch(&old, &survivors)?
                 };
                 let old_keys = keys(&old, key_field)?;
-                let mut old_by_key = HashMap::with_capacity(old.num_rows());
-                for (index, key) in old_keys.iter().enumerate() {
-                    old_by_key.insert(key.clone(), index as u32);
-                }
                 let incoming_keys = keys(&incoming, key_field)?;
-                let mut final_indices: HashMap<String, u32> = old_by_key.clone();
-                let mut matched = 0usize;
-                for (index, key) in incoming_keys.iter().enumerate() {
-                    if old_by_key.contains_key(key) {
-                        matched += 1;
+                let incoming_key_set: HashSet<&str> =
+                    incoming_keys.iter().map(String::as_str).collect();
+                let mut old_by_key = HashMap::new();
+                let mut matched_old = Vec::new();
+                let mut selected = Vec::with_capacity(old.num_rows() + incoming.num_rows());
+                for (index, key) in old_keys.iter().enumerate() {
+                    if incoming_key_set.contains(key.as_str()) {
+                        old_by_key.insert(key.clone(), index as u32);
+                        matched_old.push(index as u32);
+                    } else {
+                        // Packing may rewrite append duplicates unrelated to this
+                        // upsert. Preserve each row, including its partial-update
+                        // fields, rather than resolving these keys to one winner.
+                        selected.push(index as u32);
                     }
-                    final_indices.insert(key.clone(), (old.num_rows() + index) as u32);
                 }
-                let mut selected = final_indices.into_values().collect::<Vec<_>>();
-                selected.sort_unstable();
+                let matched = incoming_keys
+                    .iter()
+                    .filter(|key| old_by_key.contains_key(*key))
+                    .count();
                 let combined = if old.num_rows() == 0 {
                     incoming.clone()
                 } else {
                     concat_batches(&old.schema(), [&old, &incoming])?
                 };
-                let selected = if ctx.event_time && old.num_rows() > 0 {
-                    merge_with_event_time(ctx.hudi_configs.clone(), &old, &incoming, &combined)?
+                if ctx.event_time && !matched_old.is_empty() {
+                    let matched_old = take_batch(&old, &matched_old)?;
+                    selected.extend(merge_with_event_time(
+                        ctx.hudi_configs.clone(),
+                        &matched_old,
+                        &incoming,
+                        &combined,
+                    )?);
                 } else {
-                    selected
-                };
+                    selected.extend(
+                        (0..incoming.num_rows()).map(|index| (old.num_rows() + index) as u32),
+                    );
+                }
+                selected.sort_unstable();
                 let merged = if let Some(columns) = partial_columns {
                     let merged = partial_merge(&combined, &old_by_key, &selected, &columns)?;
                     // Partially-updated rows must carry the updating commit's
