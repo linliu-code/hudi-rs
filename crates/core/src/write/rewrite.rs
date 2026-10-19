@@ -179,6 +179,50 @@ pub async fn upsert_batches(
         .await
         .tag_location(table, &incoming_hoodie_keys)
         .await?;
+    let slices_by_partition = crate::write::sizing::latest_slices_by_partition(table).await?;
+    // MergeHandle model: route each input row to its target file group, then
+    // per-group workers read+merge+write. The driver only holds the input and
+    // plan metadata.
+    let mut slice_by_file_id: HashMap<String, (String, crate::file_group::file_slice::FileSlice)> =
+        HashMap::new();
+    for (partition, slices) in &slices_by_partition {
+        for slice in slices {
+            slice_by_file_id.insert(
+                slice.file_id().to_string(),
+                (partition.clone(), slice.clone()),
+            );
+        }
+    }
+
+    // A partial update's preserved fields determine its physical partition.
+    // Keep the original index association while replacing raw input values.
+    let (incoming, incoming_hoodie_keys, locations) = if let Some(columns) = &options.update_columns
+    {
+        let effective = resolve_partial_upsert(
+            table,
+            &incoming,
+            &incoming_hoodie_keys,
+            &locations,
+            &slice_by_file_id,
+            columns,
+            &instant,
+        )
+        .await?;
+        let effective_keys = partial_effective_keys(table, &effective)?;
+        let effective_locations = incoming_hoodie_keys
+            .iter()
+            .zip(&effective_keys)
+            .map(|(original, effective)| {
+                (
+                    effective.clone(),
+                    locations.get(original).cloned().flatten(),
+                )
+            })
+            .collect();
+        (effective, effective_keys, effective_locations)
+    } else {
+        (incoming, incoming_hoodie_keys, locations)
+    };
     // Small-file packing (Java UpsertPartitioner.assignInserts): assign insert
     // rows to existing small file groups first; chosen groups join the read
     // set so their rows are preserved through the rewrite.
@@ -189,7 +233,6 @@ pub async fn upsert_batches(
         &sizing,
     )
     .await;
-    let slices_by_partition = crate::write::sizing::latest_slices_by_partition(table).await?;
     let mut insert_rows_by_partition: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, hoodie_key) in incoming_hoodie_keys.iter().enumerate() {
         if locations.get(hoodie_key).and_then(Option::as_ref).is_none() {
@@ -227,19 +270,6 @@ pub async fn upsert_batches(
             cursor += count;
         }
     }
-    // MergeHandle model: route each input row to its target file group, then
-    // per-group workers read+merge+write. The driver only holds the input and
-    // plan metadata.
-    let mut slice_by_file_id: HashMap<String, (String, crate::file_group::file_slice::FileSlice)> =
-        HashMap::new();
-    for (partition, slices) in &slices_by_partition {
-        for slice in slices {
-            slice_by_file_id.insert(
-                slice.file_id().to_string(),
-                (partition.clone(), slice.clone()),
-            );
-        }
-    }
 
     let mut updates = 0usize;
     let mut inserts = 0usize;
@@ -269,9 +299,11 @@ pub async fn upsert_batches(
         .iter()
         .map(|(id, (_, slice))| (id.clone(), slice.clone()))
         .collect();
-    let rejected_moves =
-        moved_keys_rejected_by_event_time(table, &incoming, &moved_candidates, &move_slices)
-            .await?;
+    let rejected_moves = if options.update_columns.is_some() {
+        HashSet::new()
+    } else {
+        moved_keys_rejected_by_event_time(table, &incoming, &moved_candidates, &move_slices).await?
+    };
     for (index, hoodie_key) in incoming_hoodie_keys.iter().enumerate() {
         // A location whose file group has no live slice is a stale index
         // entry (its group was replaced); the row no longer exists, so the
@@ -337,7 +369,7 @@ pub async fn upsert_batches(
             slice,
             op: GroupOp::Upsert {
                 incoming: take_batch(&incoming, &rows)?,
-                partial_columns: options.update_columns.clone(),
+                resolved: options.update_columns.is_some(),
                 evict_keys,
             },
         });
@@ -2429,6 +2461,182 @@ fn take_batch(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch> {
     RecordBatch::try_new(batch.schema(), columns).map_err(Into::into)
 }
 
+/// Resolve only touched old rows before choosing a partial update's destination.
+/// A losing input keeps the complete old winner, while a winning input takes
+/// excluded columns from that winner rather than an arbitrary old duplicate.
+async fn resolve_partial_upsert(
+    table: &Table,
+    incoming: &RecordBatch,
+    incoming_keys: &[HoodieKey],
+    locations: &HashMap<HoodieKey, Option<crate::index::RecordLocation>>,
+    slices: &HashMap<String, (String, crate::file_group::file_slice::FileSlice)>,
+    columns: &[String],
+    instant: &str,
+) -> Result<RecordBatch> {
+    let mut rows_by_group: HashMap<&str, Vec<u32>> = HashMap::new();
+    for (row, key) in incoming_keys.iter().enumerate() {
+        if let Some(location) = locations.get(key).and_then(Option::as_ref)
+            && slices.contains_key(&location.file_id)
+        {
+            rows_by_group
+                .entry(&location.file_id)
+                .or_default()
+                .push(row as u32);
+        }
+    }
+    if rows_by_group.is_empty() {
+        return Ok(incoming.clone());
+    }
+    // Preserved old nulls may be absent from a narrower incoming schema.
+    let schema = std::sync::Arc::new(table.get_schema_with_meta_fields().await?);
+    let incoming = crate::write::align_batch_to_schema(incoming, &schema).ok_or_else(|| {
+        CoreError::Schema(
+            "partial upsert batch schema does not match the current table schema".into(),
+        )
+    })?;
+    let reader = table
+        .create_file_group_reader_with_options(
+            Some(&ReadOptions::new()),
+            std::iter::empty::<(&str, String)>(),
+        )
+        .await?;
+    let event_time = uses_event_time_merge(&table.hudi_configs)?;
+    let key_field = MetaField::RecordKey.as_ref();
+    let mut batches = vec![incoming.clone()];
+    let mut selected: Vec<u32> = (0..incoming.num_rows() as u32).collect();
+    let mut offset = incoming.num_rows();
+    for (file_id, rows) in rows_by_group {
+        let (_, slice) = &slices[file_id];
+        let old = reader.read_file_slice(slice, &ReadOptions::new()).await?;
+        let wanted: HashSet<&str> = rows
+            .iter()
+            .map(|r| incoming_keys[*r as usize].record_key.as_str())
+            .collect();
+        let old_keys = keys(&old, key_field)?;
+        let matched: Vec<u32> = old_keys
+            .iter()
+            .enumerate()
+            .filter_map(|(row, key)| wanted.contains(key.as_str()).then_some(row as u32))
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        let old = take_batch(&old, &matched)?;
+        let old = if event_time {
+            RecordMerger::new(old.schema(), table.hudi_configs.clone())
+                .merge_record_batches(RecordBatches::new_with_data_batches([old]))?
+        } else {
+            deduplicate_last_by_key(&old, key_field, &table.hudi_configs)?
+        };
+        let raw = take_batch(&incoming, &rows)?;
+        let raw = crate::write::align_batch_to_schema(&raw, &old.schema()).ok_or_else(|| {
+            CoreError::Schema(
+                "partial upsert batch schema does not match the current table schema".into(),
+            )
+        })?;
+        let old_keys = keys(&old, key_field)?;
+        let old_by_key: HashMap<String, u32> = old_keys
+            .into_iter()
+            .enumerate()
+            .map(|(i, k)| (k, i as u32))
+            .collect();
+        let combined = concat_batches(&old.schema(), [&old, &raw])?;
+        let winners = if event_time {
+            merge_with_event_time(table.hudi_configs.clone(), &old, &raw, &combined)?
+        } else {
+            (old.num_rows()..combined.num_rows())
+                .map(|i| i as u32)
+                .collect()
+        };
+        let effective = partial_merge(&combined, &old_by_key, &winners, columns)?;
+        let accepted: BooleanArray = winners
+            .iter()
+            .map(|i| Some(*i as usize >= old.num_rows()))
+            .collect();
+        let effective = restamp_matched_rows(&effective, &accepted, instant)?;
+        let effective_keys = partial_effective_keys(table, &effective)?;
+        let partition_index = effective
+            .schema()
+            .index_of(MetaField::PartitionPath.as_ref())?;
+        let mut effective_columns = effective.columns().to_vec();
+        effective_columns[partition_index] = std::sync::Arc::new(StringArray::from_iter_values(
+            effective_keys.iter().map(|key| key.partition_path.as_str()),
+        ));
+        let effective = RecordBatch::try_new(effective.schema(), effective_columns)?;
+        let effective = crate::write::align_batch_to_schema(&effective, &incoming.schema())
+            .ok_or_else(|| {
+                CoreError::Schema(
+                    "resolved partial upsert schema does not match the input schema".into(),
+                )
+            })?;
+        let input_rows: HashMap<&str, u32> = rows
+            .iter()
+            .map(|r| (incoming_keys[*r as usize].record_key.as_str(), *r))
+            .collect();
+        for (row, key) in effective_keys.iter().enumerate() {
+            let target = input_rows.get(key.record_key.as_str()).ok_or_else(|| {
+                CoreError::Write(format!(
+                    "partial merger returned unexpected key '{}'",
+                    key.record_key
+                ))
+            })?;
+            selected[*target as usize] = (offset + row) as u32;
+        }
+        offset += effective.num_rows();
+        batches.push(effective);
+    }
+    take_batch(&concat_batches(&incoming.schema(), &batches)?, &selected)
+}
+
+// Java-written rows can preserve null partition fields. Only normalize the
+// key-generation copy: raw inputs were validated before fencing, and the stored
+// payload must keep its nulls. Java maps both null and empty to the default path.
+fn partial_effective_keys(table: &Table, batch: &RecordBatch) -> Result<Vec<HoodieKey>> {
+    let partition_fields: Vec<String> = table
+        .hudi_configs
+        .get_or_default(crate::config::table::HudiTableConfig::PartitionFields)
+        .into();
+    let mut fields = batch.schema().fields().to_vec();
+    let mut columns = batch.columns().to_vec();
+    for field in partition_fields {
+        let index = batch.schema().index_of(&field)?;
+        let column = &columns[index];
+        if column.null_count() == 0 {
+            continue;
+        }
+        if !matches!(
+            column.data_type(),
+            arrow_schema::DataType::Utf8
+                | arrow_schema::DataType::Int32
+                | arrow_schema::DataType::Int64
+        ) {
+            return Err(CoreError::Unsupported(
+                "partition field types currently support Utf8, Int32, and Int64".into(),
+            ));
+        }
+        let strings = arrow::compute::cast(column, &arrow_schema::DataType::Utf8)?;
+        let strings = strings
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| CoreError::Schema("partition field cast did not produce Utf8".into()))?;
+        columns[index] = std::sync::Arc::new(StringArray::from_iter_values(
+            strings.iter().map(|value| value.unwrap_or_default()),
+        ));
+        fields[index] = std::sync::Arc::new(
+            fields[index]
+                .as_ref()
+                .clone()
+                .with_data_type(arrow_schema::DataType::Utf8),
+        );
+    }
+    let schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+    hoodie_keys_for_batch(
+        &table.hudi_configs,
+        &RecordBatch::try_new(schema, columns)?,
+        None,
+    )
+}
+
 fn partial_merge(
     combined: &RecordBatch,
     old_by_key: &HashMap<String, u32>,
@@ -2953,13 +3161,13 @@ struct MergeCtx {
 
 /// What a merge worker does to its file group's rows.
 enum GroupOp {
-    /// Merge `incoming` (meta-stamped) rows into the group; `partial_columns`
-    /// limits which data columns matched rows take from the input.
+    /// Merge `incoming` (meta-stamped) rows into the group. Partial inputs are
+    /// already `resolved` before routing, using their raw ordering values.
     /// `evict_keys` are rows leaving this group for another partition
     /// (update-partition-path semantics): removed here, inserted there.
     Upsert {
         incoming: RecordBatch,
-        partial_columns: Option<Vec<String>>,
+        resolved: bool,
         evict_keys: std::sync::Arc<HashSet<String>>,
     },
     /// Remove rows by record key ((key, partition) exact or key-only).
@@ -3054,7 +3262,7 @@ fn merge_file_group_task(
         let (merged, matched) = match plan.op {
             GroupOp::Upsert {
                 incoming,
-                partial_columns,
+                resolved,
                 evict_keys,
             } => {
                 let incoming = if old.num_rows() > 0 {
@@ -3110,7 +3318,7 @@ fn merge_file_group_task(
                 } else {
                     concat_batches(&old.schema(), [&old, &incoming])?
                 };
-                if ctx.event_time && !matched_old.is_empty() {
+                if ctx.event_time && !resolved && !matched_old.is_empty() {
                     let matched_old = take_batch(&old, &matched_old)?;
                     selected.extend(merge_with_event_time(
                         ctx.hudi_configs.clone(),
@@ -3124,20 +3332,7 @@ fn merge_file_group_task(
                     );
                 }
                 selected.sort_unstable();
-                let merged = if let Some(columns) = partial_columns {
-                    let merged = partial_merge(&combined, &old_by_key, &selected, &columns)?;
-                    // Partially-updated rows must carry the updating commit's
-                    // time/seqno, or incremental readers skip the change. Only
-                    // rows the merge resolved to the INCOMING side are updates;
-                    // a stale event-time row that lost keeps its old lineage.
-                    let mask: BooleanArray = selected
-                        .iter()
-                        .map(|index| Some(*index as usize >= old.num_rows()))
-                        .collect();
-                    restamp_matched_rows(&merged, &mask, &ctx.instant)?
-                } else {
-                    take_batch(&combined, &selected)?
-                };
+                let merged = take_batch(&combined, &selected)?;
                 (merged, matched)
             }
             GroupOp::DeleteKeys { exact, keys_only } => {
