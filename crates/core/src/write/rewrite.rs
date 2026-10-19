@@ -1177,6 +1177,7 @@ async fn mor_upsert_batches(
         ));
     }
 
+    validate_write_input(table, batches, "upsert").await?;
     let incoming = concat(batches)?;
     if incoming.num_rows() == 0 {
         return Err(CoreError::Write(
