@@ -128,6 +128,7 @@ impl CollectedBlocks {
 pub struct LogFileScanner {
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
+    expects_hfile: bool,
 }
 
 impl LogFileScanner {
@@ -135,7 +136,14 @@ impl LogFileScanner {
         Self {
             hudi_configs,
             storage,
+            expects_hfile: false,
         }
+    }
+
+    /// Delete blocks carry no data format; typed metadata consumers supply it.
+    pub(crate) fn with_hfile_context(mut self) -> Self {
+        self.expects_hfile = true;
+        self
     }
 
     /// Read all blocks from multiple log files and collect rollback targets.
@@ -204,7 +212,12 @@ impl LogFileScanner {
             }
         }
 
-        if has_hfile_blocks {
+        if self.expects_hfile && has_record_blocks {
+            return Err(crate::error::CoreError::LogBlockError(
+                "Expected HFile log records but found Arrow-based data blocks".into(),
+            ));
+        }
+        if has_hfile_blocks || (self.expects_hfile && has_delete_blocks) {
             Ok(ContentType::HFile)
         } else if has_record_blocks || has_delete_blocks {
             Ok(ContentType::Records)
@@ -271,20 +284,18 @@ impl LogFileScanner {
                 LogBlockContent::HFileRecords(hfile_records) => {
                     records.extend(hfile_records);
                 }
-                LogBlockContent::Records(batches) => {
-                    if block.block_type == BlockType::Delete {
-                        for (batch, _) in &batches.delete_batches {
-                            if let Some(keys) = batch
-                                .column_by_name("recordKey")
-                                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
-                            {
-                                for i in 0..keys.len() {
-                                    if !keys.is_null(i) {
-                                        records.push(crate::hfile::HFileRecord::from_str_key(
-                                            keys.value(i),
-                                            Vec::new(),
-                                        ));
-                                    }
+                LogBlockContent::Records(batches) if block.block_type == BlockType::Delete => {
+                    for (batch, _) in &batches.delete_batches {
+                        if let Some(keys) = batch
+                            .column_by_name("recordKey")
+                            .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
+                        {
+                            for i in 0..keys.len() {
+                                if !keys.is_null(i) {
+                                    records.push(crate::hfile::HFileRecord::from_str_key(
+                                        keys.value(i),
+                                        Vec::new(),
+                                    ));
                                 }
                             }
                         }
@@ -611,3 +622,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod delete_context_tests;

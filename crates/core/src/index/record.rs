@@ -106,7 +106,7 @@ async fn load_record_index_map(
         // Only trust log blocks whose instant completed on the data timeline
         // (Java getValidInstantTimestamps) — orphan MDT commits are skipped.
         let valid = table.valid_metadata_instants().await?;
-        let scanner = LogFileScanner::new(table.hudi_configs.clone(), storage);
+        let scanner = LogFileScanner::new(table.hudi_configs.clone(), storage).with_hfile_context();
         let range = InstantRange::exact_match(valid, "UTC");
         match scanner.scan(log_paths, &range).await? {
             ScanResult::HFileRecords(records) => apply_hfile_records(&mut merged, &records)?,
@@ -192,3 +192,6 @@ pub(crate) async fn record_index_has_file_groups(table: &Table) -> bool {
     .map(|slices| !slices.is_empty())
     .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests;
