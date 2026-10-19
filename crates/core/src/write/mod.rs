@@ -265,13 +265,14 @@ pub(crate) async fn run_write_tasks<T: Send + 'static>(
     use futures::StreamExt;
     let count = tasks.len();
     let mut results: Vec<Option<Result<T>>> = std::iter::repeat_with(|| None).take(count).collect();
-    let mut stream = futures::stream::iter(
-        tasks
-            .into_iter()
-            .enumerate()
-            .map(|(index, task)| async move { (index, task.await) }),
-    )
-    .buffer_unordered(parallelism.max(1));
+    // Finish mapping before awaiting so the lazy iterator's callable does not
+    // impose higher-ranked lifetime requirements on the enclosing Send future.
+    let indexed_tasks: Vec<_> = tasks
+        .into_iter()
+        .enumerate()
+        .map(|(index, task)| async move { (index, task.await) })
+        .collect();
+    let mut stream = futures::stream::iter(indexed_tasks).buffer_unordered(parallelism.max(1));
     while let Some((index, result)) = stream.next().await {
         results[index] = Some(result);
     }
@@ -483,6 +484,99 @@ pub(crate) fn build_delete_log_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_run_write_tasks_bounds_concurrency_orders_results_and_drains_errors() {
+        use futures::{FutureExt, poll};
+        use tokio::sync::{mpsc, oneshot};
+
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (finished_tx, mut finished_rx) = mpsc::unbounded_channel();
+        let mut releases = Vec::new();
+        let mut tasks = Vec::new();
+        for index in 0..3 {
+            let (release, wait) = oneshot::channel();
+            releases.push(release);
+            let started = started_tx.clone();
+            let finished = finished_tx.clone();
+            tasks.push(
+                async move {
+                    started.send(index).unwrap();
+                    wait.await.unwrap();
+                    finished.send(index).unwrap();
+                    if index == 1 {
+                        Err(CoreError::Write("injected task failure".into()))
+                    } else {
+                        Ok(index)
+                    }
+                }
+                .boxed(),
+            );
+        }
+        let mut runner = Box::pin(run_write_tasks(tasks, 2));
+        assert!(poll!(runner.as_mut()).is_pending());
+        assert_eq!(started_rx.try_recv().unwrap(), 0);
+        assert_eq!(started_rx.try_recv().unwrap(), 1);
+        assert!(started_rx.try_recv().is_err());
+
+        let release_last = releases.pop().unwrap();
+        releases.pop().unwrap().send(()).unwrap();
+        assert!(poll!(runner.as_mut()).is_pending());
+        assert_eq!(finished_rx.try_recv().unwrap(), 1);
+        assert_eq!(started_rx.try_recv().unwrap(), 2);
+        release_last.send(()).unwrap();
+        assert!(poll!(runner.as_mut()).is_pending());
+        assert_eq!(finished_rx.try_recv().unwrap(), 2);
+        releases.pop().unwrap().send(()).unwrap();
+
+        let mut results = runner.await.into_iter();
+        assert_eq!(finished_rx.try_recv().unwrap(), 0);
+        assert_eq!(results.next().unwrap().unwrap(), 0);
+        assert!(
+            matches!(results.next().unwrap(), Err(CoreError::Write(message))
+            if message == "injected task failure")
+        );
+        assert_eq!(results.next().unwrap().unwrap(), 2);
+        assert!(results.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_run_write_tasks_zero_parallelism_runs_sequentially() {
+        use futures::{FutureExt, poll};
+        use tokio::sync::{mpsc, oneshot};
+
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let mut releases = Vec::new();
+        let mut tasks = Vec::new();
+        for index in 0..2 {
+            let (release, wait) = oneshot::channel();
+            releases.push(release);
+            let started = started_tx.clone();
+            tasks.push(
+                async move {
+                    started.send(index).unwrap();
+                    wait.await.unwrap();
+                    Ok(index)
+                }
+                .boxed(),
+            );
+        }
+        let mut runner = Box::pin(run_write_tasks(tasks, 0));
+        for (index, release) in releases.into_iter().enumerate() {
+            assert!(poll!(runner.as_mut()).is_pending());
+            assert_eq!(started_rx.try_recv().unwrap(), index);
+            assert!(started_rx.try_recv().is_err());
+            release.send(()).unwrap();
+        }
+        assert_eq!(
+            runner
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            vec![0, 1]
+        );
+    }
 
     #[test]
     fn test_user_write_validation_only_rejects_exact_top_level_meta_fields() {
