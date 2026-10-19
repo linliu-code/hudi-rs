@@ -714,7 +714,7 @@ async fn test_partial_preserves_stored_java_null_partition() {
 }
 
 #[tokio::test]
-async fn test_partial_unmatched_prepared_input_routes_by_data() {
+async fn test_partial_reingestion_rejects_metadata_then_routes_user_data() {
     let dir = tempfile::tempdir().unwrap();
     let mut table = create(&dir.path().join("source"), 8, false).await;
     table
@@ -740,8 +740,29 @@ async fn test_partial_unmatched_prepared_input_routes_by_data() {
     let mut columns = old.columns().to_vec();
     columns[old.schema().index_of("city").unwrap()] = Arc::new(StringArray::from(vec!["ny"]));
     let input = RecordBatch::try_new(old.schema(), columns).unwrap();
+    let before = std::fs::read_dir(output.join(".hoodie/timeline"))
+        .unwrap()
+        .count();
+    let error = table
+        .upsert_with([input.clone()], partial(&["city", "value"]))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("remove Hudi metadata columns"));
+    assert_eq!(
+        std::fs::read_dir(output.join(".hoodie/timeline"))
+            .unwrap()
+            .count(),
+        before
+    );
+    let indices = ["id", "city", "ts", "value"]
+        .iter()
+        .map(|name| input.schema().index_of(name).unwrap())
+        .collect::<Vec<_>>();
     table
-        .upsert_with([input], partial(&["city", "value"]))
+        .upsert_with(
+            [input.project(&indices).unwrap()],
+            partial(&["city", "value"]),
+        )
         .await
         .unwrap();
     let reopened = Table::new(output.to_str().unwrap()).await.unwrap();

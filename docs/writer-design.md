@@ -194,6 +194,14 @@ separators remain literal, and explicit record keys must be non-null and non-emp
 
 ### 4.5 Schema handling
 
+Complete-row writes (`append`, `append_only`, `upsert`, `upsert_with`, `overwrite`,
+and `dynamic_partition_overwrite`, including their exported write functions) accept
+user data columns only. They reject the five Hudi metadata columns and
+`_hoodie_operation` before recovery or a new write instant is requested. When
+reingesting read results, project away these metadata columns so the writer can
+assign the new commit lineage and derive identity from the configured data fields.
+Predicate `update` retains its SET semantics: only non-meta columns are applied.
+
 - Commit metadata records the **data schema** (no `_hoodie_*` meta fields).
 - Arrow aliases with one Avro representation are normalized before validation and
   encoding: Int8/Int16 to Int32, large string/binary/list offsets to standard

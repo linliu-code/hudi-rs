@@ -81,6 +81,7 @@ async fn append_batches_inner(
     batches: &[RecordBatch],
     require_append_only: bool,
 ) -> Result<AppendResult> {
+    crate::write::validate_user_write_batches(batches)?;
     let canonical = crate::write::canonicalize_write_batches(batches)?;
     let batches = canonical.as_slice();
     table.reload_timeline_for_write().await?;

@@ -139,6 +139,7 @@ pub async fn upsert_batches(
     batches: &[RecordBatch],
     options: UpsertOptions,
 ) -> Result<WriteResult> {
+    crate::write::validate_user_write_batches(batches)?;
     let canonical = crate::write::canonicalize_write_batches(batches)?;
     let batches = canonical.as_slice();
     table.reload_timeline_for_write().await?;
@@ -828,6 +829,7 @@ where
 }
 
 pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<WriteResult> {
+    crate::write::validate_user_write_batches(batches)?;
     let canonical = crate::write::canonicalize_write_batches(batches)?;
     let batches = canonical.as_slice();
     table.reload_timeline_for_write().await?;
@@ -879,6 +881,7 @@ pub async fn dynamic_partition_overwrite_batches(
     table: &mut Table,
     batches: &[RecordBatch],
 ) -> Result<WriteResult> {
+    crate::write::validate_user_write_batches(batches)?;
     let canonical = crate::write::canonicalize_write_batches(batches)?;
     let batches = canonical.as_slice();
     table.reload_timeline_for_write().await?;

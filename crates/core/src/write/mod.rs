@@ -56,6 +56,25 @@ use crate::storage::Storage;
 use crate::table::partition::PARTITION_METAFIELD_PREFIX;
 use crate::timeline::instant::{Action, Instant};
 
+/// Complete-row public writes accept data columns, never caller-owned lineage.
+pub(crate) fn validate_user_write_batches(batches: &[arrow_array::RecordBatch]) -> Result<()> {
+    let protected = crate::metadata::meta_field::MetaField::field_names_with_operation();
+    for batch in batches {
+        if let Some(field) = batch
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| protected.contains(&field.name().as_str()))
+        {
+            return Err(CoreError::Write(format!(
+                "write input contains protected Hudi metadata field '{}'; remove Hudi metadata columns before reingesting rows",
+                field.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Write `.hoodie_partition_metadata` if missing (required for Spark FS partition listing).
 pub(crate) async fn ensure_partition_metadata(
     storage: &Storage,
@@ -464,6 +483,18 @@ pub(crate) fn build_delete_log_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_user_write_validation_only_rejects_exact_top_level_meta_fields() {
+        use arrow_schema::{DataType, Field, Schema};
+        let nested = Field::new("_hoodie_commit_time", DataType::Utf8, true);
+        let schema = Schema::new(vec![
+            Field::new("_hoodie_custom", DataType::Utf8, true),
+            Field::new("payload", DataType::Struct(vec![nested].into()), true),
+        ]);
+        let batch = arrow_array::RecordBatch::new_empty(std::sync::Arc::new(schema));
+        validate_user_write_batches(&[batch]).unwrap();
+    }
 
     /// Two writers fencing the same instant: the second must get a conflict,
     /// not silently share the instant.
