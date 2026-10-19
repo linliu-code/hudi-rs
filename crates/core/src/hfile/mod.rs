@@ -56,4 +56,8 @@ pub use error::{HFileError, Result};
 pub use key::{Key, KeyValue, Utf8Key};
 pub use reader::{HFileReader, HFileRecordIterator, SeekResult};
 pub use record::HFileRecord;
+pub(crate) use record::HFileRecordBatch;
 pub use writer::HFileWriter;
+
+#[cfg(test)]
+pub(crate) mod schema_context_tests;

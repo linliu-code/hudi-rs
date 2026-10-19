@@ -28,7 +28,8 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use hudi_core::config::HudiConfigs;
 use hudi_core::config::table::HudiTableConfig;
-use hudi_core::file_group::log_file::scanner::{LogFileScanner, ScanResult};
+use hudi_core::file_group::log_file::log_block::{BlockMetadataKey, LogBlockContent};
+use hudi_core::file_group::log_file::reader::LogFileReader;
 use hudi_core::hfile::HFileReader;
 use hudi_core::metadata::table::encode::{
     ColumnStatValue, ColumnStatsMetadata, decode_column_stats_entry,
@@ -110,23 +111,33 @@ async fn read_stats_records(
     let mut merged = HashMap::new();
     for base in bases {
         let mut reader = HFileReader::open(storage.as_ref(), &base).await.unwrap();
+        let schema = reader.get_avro_schema_arc().unwrap();
         for record in reader.collect_records().unwrap() {
             let key = record.key_as_str().unwrap().to_string();
             if let Some(stats) =
-                decode_column_stats_entry(record.value(), record.avro_schema()).unwrap()
+                decode_column_stats_entry(record.value(), schema.as_deref()).unwrap()
             {
                 merged.insert(key, stats);
             }
         }
     }
-    if !logs.is_empty() {
-        let scanner = LogFileScanner::new(table.hudi_configs.clone(), storage);
+    for path in logs {
+        let mut reader = LogFileReader::new(table.hudi_configs.clone(), storage.clone(), &path)
+            .await
+            .unwrap();
         let range = InstantRange::up_to("99991231235959999", "UTC");
-        if let ScanResult::HFileRecords(records) = scanner.scan(logs, &range).await.unwrap() {
-            for record in &records {
+        for block in reader.read_all_blocks(&range).await.unwrap() {
+            let schema = apache_avro::Schema::parse_str(
+                block.header.get(&BlockMetadataKey::Schema).unwrap(),
+            )
+            .unwrap();
+            let LogBlockContent::HFileRecords(records) = block.content else {
+                panic!("stats logs must be HFile blocks");
+            };
+            for record in records {
                 let key = record.key_as_str().unwrap().to_string();
                 if let Some(stats) =
-                    decode_column_stats_entry(record.value(), record.avro_schema()).unwrap()
+                    decode_column_stats_entry(record.value(), Some(&schema)).unwrap()
                 {
                     merged.insert(key, stats);
                 }

@@ -237,6 +237,26 @@ impl Decoder {
         block_type: &BlockType,
         header: &HashMap<BlockMetadataKey, String>,
     ) -> Result<LogBlockContent> {
+        self.decode_content_with_schema(
+            reader,
+            log_format_version,
+            fallback_length,
+            block_type,
+            header,
+            false,
+        )
+        .map(|(content, _)| content)
+    }
+
+    pub(crate) fn decode_content_with_schema(
+        &self,
+        reader: &mut (impl Read + Seek),
+        log_format_version: &LogFormatVersion,
+        fallback_length: u64,
+        block_type: &BlockType,
+        header: &HashMap<BlockMetadataKey, String>,
+        retain_schema: bool,
+    ) -> Result<(LogBlockContent, Option<Arc<apache_avro::Schema>>)> {
         let content_length = if log_format_version.has_content_length() {
             let mut content_length_buf = [0u8; 8];
             reader.read_exact(&mut content_length_buf)?;
@@ -246,7 +266,7 @@ impl Decoder {
         };
 
         let reader = reader.by_ref().take(content_length);
-        match block_type {
+        let content = match block_type {
             BlockType::AvroData => self
                 .decode_avro_record_content(reader, header)
                 .map(LogBlockContent::Records),
@@ -256,12 +276,15 @@ impl Decoder {
             BlockType::Delete => self
                 .decode_delete_record_content(reader, header)
                 .map(LogBlockContent::Records),
-            BlockType::HfileData => self.decode_hfile_content(reader, header),
+            BlockType::HfileData => {
+                return self.decode_hfile_content(reader, header, retain_schema);
+            }
             BlockType::Command => Ok(LogBlockContent::Empty),
             _ => Err(CoreError::LogBlockError(format!(
                 "Unsupported block type: {block_type:?}"
             ))),
-        }
+        }?;
+        Ok((content, None))
     }
 
     /// Validate the log block version (first 4 bytes of block content).
@@ -373,10 +396,13 @@ impl Decoder {
         &self,
         reader: impl Read,
         header: &HashMap<BlockMetadataKey, String>,
-    ) -> Result<LogBlockContent> {
-        let records = self.decode_hfile_record_content(reader)?;
+        retain_schema: bool,
+    ) -> Result<(LogBlockContent, Option<Arc<apache_avro::Schema>>)> {
+        let batch =
+            self.decode_hfile_record_content(reader, retain_schema && !self.hfile_as_records)?;
+        let records = batch.records;
         if !self.hfile_as_records {
-            return Ok(LogBlockContent::HFileRecords(records));
+            return Ok((LogBlockContent::HFileRecords(records), batch.schema));
         }
 
         let writer_schema_json = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
@@ -427,7 +453,7 @@ impl Decoder {
             );
             offset += rows;
         }
-        Ok(LogBlockContent::Records(batches))
+        Ok((LogBlockContent::Records(batches), None))
     }
 
     fn decode_avro_record_content(
@@ -583,25 +609,34 @@ impl Decoder {
         Ok(batches)
     }
 
-    fn decode_hfile_record_content(&self, mut reader: impl Read) -> Result<Vec<HFileRecord>> {
+    fn decode_hfile_record_content(
+        &self,
+        mut reader: impl Read,
+        retain_schema: bool,
+    ) -> Result<crate::hfile::HFileRecordBatch> {
         // Note: HFile blocks do NOT have the 4-byte log block version prefix
         // that Avro blocks have. The content is raw HFile data.
         let mut hfile_bytes = Vec::new();
         reader.read_to_end(&mut hfile_bytes)?;
 
         if hfile_bytes.is_empty() {
-            return Ok(Vec::new());
+            return Ok(crate::hfile::HFileRecordBatch::default());
         }
 
         let mut hfile_reader =
             HFileReader::new(hfile_bytes).map_err(|e| CoreError::HFile(e.to_string()))?;
 
-        // Records must carry the block's own writer schema: log blocks may be
-        // written by a different writer (e.g. Spark) than the base file they
-        // are later merged against.
-        let schema = hfile_reader
-            .get_avro_schema_arc()
-            .map_err(|e| CoreError::HFile(e.to_string()))?;
+        // Keep the embedded writer schema with this container's records, even
+        // after the reader is dropped or another block uses a different schema.
+        // Raw APIs return bytes even if an optional Avro schema is malformed.
+        // Typed consumers must distinguish a missing schema from a corrupt one.
+        let schema = if retain_schema {
+            hfile_reader
+                .get_avro_schema_arc()
+                .map_err(|e| CoreError::HFile(e.to_string()))?
+        } else {
+            None
+        };
 
         let mut records = Vec::new();
 
@@ -622,7 +657,7 @@ impl Decoder {
                     }
                 }
             }
-            return Ok(records);
+            return Ok(crate::hfile::HFileRecordBatch { records, schema });
         }
 
         let iter = hfile_reader
@@ -631,13 +666,13 @@ impl Decoder {
 
         for kv_result in iter {
             let kv = kv_result.map_err(|e| CoreError::HFile(e.to_string()))?;
-            records.push(
-                HFileRecord::new(kv.key().content().to_vec(), kv.value().to_vec())
-                    .with_avro_schema(schema.clone()),
-            );
+            records.push(HFileRecord::new(
+                kv.key().content().to_vec(),
+                kv.value().to_vec(),
+            ));
         }
 
-        Ok(records)
+        Ok(crate::hfile::HFileRecordBatch { records, schema })
     }
 }
 

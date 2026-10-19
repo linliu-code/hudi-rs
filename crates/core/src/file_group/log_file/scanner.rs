@@ -18,10 +18,10 @@
  */
 use crate::Result;
 use crate::config::HudiConfigs;
-use crate::file_group::log_file::log_block::{BlockType, LogBlock, LogBlockContent};
-use crate::file_group::log_file::reader::LogFileReader;
+use crate::file_group::log_file::log_block::{BlockType, LogBlockContent};
+use crate::file_group::log_file::reader::{ContextualLogBlock, LogFileReader};
 use crate::file_group::record_batches::RecordBatches;
-use crate::hfile::HFileRecord;
+use crate::hfile::{HFileRecord, HFileRecordBatch};
 use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
 use arrow_array::Array;
@@ -99,28 +99,32 @@ enum ContentType {
 /// Result of collecting blocks from multiple log files.
 struct CollectedBlocks {
     /// All blocks organized by log file.
-    all_blocks: Vec<Vec<LogBlock>>,
+    all_blocks: Vec<Vec<ContextualLogBlock>>,
     /// Instant times that have been rolled back.
     rollback_targets: HashSet<String>,
 }
 
 impl CollectedBlocks {
     /// Iterate over all blocks, filtering out rollback blocks and rolled-back data.
-    fn iter_valid_blocks(self) -> impl Iterator<Item = LogBlock> {
+    fn iter_valid_blocks(self) -> impl Iterator<Item = ContextualLogBlock> {
         let rollback_targets = self.rollback_targets;
-        self.all_blocks.into_iter().flatten().filter(move |block| {
-            // Skip rollback command blocks (they have no content)
-            if block.is_rollback_block() {
-                return false;
-            }
-            // Skip blocks whose instant time was rolled back
-            match block.instant_time() {
-                Ok(instant) => !rollback_targets.contains(instant),
-                // If we can't get the instant time, include the block
-                // and let downstream handle the error
-                Err(_) => true,
-            }
-        })
+        self.all_blocks
+            .into_iter()
+            .flatten()
+            .filter(move |context| {
+                let block = &context.block;
+                // Skip rollback command blocks (they have no content)
+                if block.is_rollback_block() {
+                    return false;
+                }
+                // Skip blocks whose instant time was rolled back
+                match block.instant_time() {
+                    Ok(instant) => !rollback_targets.contains(instant),
+                    // If we can't get the instant time, include the block
+                    // and let downstream handle the error
+                    Err(_) => true,
+                }
+            })
     }
 }
 
@@ -151,17 +155,28 @@ impl LogFileScanner {
         &self,
         relative_paths: Vec<String>,
         instant_range: &InstantRange,
+        retain_schema: bool,
     ) -> Result<CollectedBlocks> {
-        let mut all_blocks: Vec<Vec<LogBlock>> = Vec::with_capacity(relative_paths.len());
+        let mut all_blocks: Vec<Vec<ContextualLogBlock>> = Vec::with_capacity(relative_paths.len());
         let mut rollback_targets: HashSet<String> = HashSet::new();
 
         for path in relative_paths {
             let mut reader =
                 LogFileReader::new(self.hudi_configs.clone(), self.storage.clone(), &path).await?;
-            let blocks = reader.read_all_blocks(instant_range).await?;
+            let blocks = if retain_schema {
+                reader.read_all_blocks_with_schema(instant_range).await?
+            } else {
+                reader
+                    .read_all_blocks(instant_range)
+                    .await?
+                    .into_iter()
+                    .map(ContextualLogBlock::from)
+                    .collect()
+            };
 
             // Collect rollback targets from command blocks
-            for block in &blocks {
+            for context in &blocks {
+                let block = &context.block;
                 if block.is_rollback_block() {
                     rollback_targets.insert(block.target_instant_time()?.to_string());
                 }
@@ -186,7 +201,8 @@ impl LogFileScanner {
         let mut has_delete_blocks = false;
 
         for blocks in &collected.all_blocks {
-            for block in blocks {
+            for context in blocks {
+                let block = &context.block;
                 match block.block_type {
                     BlockType::AvroData | BlockType::ParquetData | BlockType::CdcData => {
                         has_record_blocks = true;
@@ -232,7 +248,8 @@ impl LogFileScanner {
         let mut num_data_batches = 0;
         let mut num_delete_batches = 0;
         for blocks in &collected.all_blocks {
-            for block in blocks {
+            for context in blocks {
+                let block = &context.block;
                 match block.block_type {
                     BlockType::AvroData | BlockType::ParquetData | BlockType::CdcData => {
                         if let Some(records) = block.content.as_records() {
@@ -251,7 +268,8 @@ impl LogFileScanner {
 
         // Collect valid record batches
         let mut batches = RecordBatches::new_with_capacity(num_data_batches, num_delete_batches);
-        for block in collected.iter_valid_blocks() {
+        for context in collected.iter_valid_blocks() {
+            let block = context.block;
             if let LogBlockContent::Records(records) = block.content {
                 batches.extend(records);
             }
@@ -264,28 +282,20 @@ impl LogFileScanner {
     ///
     /// Delete blocks may appear alongside HFile data (MDT RLI tombstones). Apply them
     /// as empty-value records so callers treat the key as deleted.
-    fn collect_hfile_records(&self, collected: CollectedBlocks) -> Result<ScanResult> {
-        // Pre-count records for capacity
-        let mut total_records = 0;
-        for blocks in &collected.all_blocks {
-            for block in blocks {
-                if block.block_type == BlockType::HfileData
-                    && let Some(records) = block.content.as_hfile_records()
-                {
-                    total_records += records.len();
-                }
-            }
-        }
-
-        // Collect valid HFile records, then apply delete-block keys as tombstones.
-        let mut records = Vec::with_capacity(total_records);
-        for block in collected.iter_valid_blocks() {
+    fn collect_hfile_records(&self, collected: CollectedBlocks) -> Result<Vec<HFileRecordBatch>> {
+        let mut batches = Vec::new();
+        for context in collected.iter_valid_blocks() {
+            let block = context.block;
             match block.content {
                 LogBlockContent::HFileRecords(hfile_records) => {
-                    records.extend(hfile_records);
+                    batches.push(HFileRecordBatch {
+                        records: hfile_records,
+                        schema: context.schema,
+                    });
                 }
-                LogBlockContent::Records(batches) if block.block_type == BlockType::Delete => {
-                    for (batch, _) in &batches.delete_batches {
+                LogBlockContent::Records(deletes) if block.block_type == BlockType::Delete => {
+                    let mut records = Vec::new();
+                    for (batch, _) in &deletes.delete_batches {
                         if let Some(keys) = batch
                             .column_by_name("recordKey")
                             .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
@@ -300,12 +310,33 @@ impl LogFileScanner {
                             }
                         }
                     }
+                    batches.push(HFileRecordBatch {
+                        records,
+                        schema: None,
+                    });
                 }
                 _ => {}
             }
         }
 
-        Ok(ScanResult::HFileRecords(records))
+        Ok(batches)
+    }
+
+    pub(crate) async fn scan_hfile(
+        &self,
+        relative_paths: Vec<String>,
+        instant_range: &InstantRange,
+    ) -> Result<Vec<HFileRecordBatch>> {
+        let collected = self
+            .collect_blocks(relative_paths, instant_range, true)
+            .await?;
+        match self.detect_content_type(&collected)? {
+            ContentType::HFile => self.collect_hfile_records(collected),
+            ContentType::Empty => Ok(Vec::new()),
+            ContentType::Records => Err(crate::error::CoreError::LogBlockError(
+                "Expected HFile log records but found Arrow-based data blocks".into(),
+            )),
+        }
     }
 
     /// Scan log files and return the appropriate content type.
@@ -324,14 +355,21 @@ impl LogFileScanner {
         relative_paths: Vec<String>,
         instant_range: &InstantRange,
     ) -> Result<ScanResult> {
-        let collected = self.collect_blocks(relative_paths, instant_range).await?;
+        let collected = self
+            .collect_blocks(relative_paths, instant_range, false)
+            .await?;
 
         // Detect content type from blocks
         let content_type = self.detect_content_type(&collected)?;
 
         match content_type {
             ContentType::Records => self.collect_record_batches(collected),
-            ContentType::HFile => self.collect_hfile_records(collected),
+            ContentType::HFile => Ok(ScanResult::HFileRecords(
+                self.collect_hfile_records(collected)?
+                    .into_iter()
+                    .flat_map(|batch| batch.records)
+                    .collect(),
+            )),
             ContentType::Empty => Ok(ScanResult::Empty),
         }
     }

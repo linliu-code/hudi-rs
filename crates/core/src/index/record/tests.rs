@@ -91,26 +91,32 @@ async fn compact_record_index_fixture(table: &Table) {
     let mut keys_by_shard = BTreeMap::new();
     for (id, base, logs) in &slices {
         let mut reader = HFileReader::open(storage.as_ref(), base).await.unwrap();
-        let mut records = reader.collect_records().unwrap();
+        let mut batches = vec![crate::hfile::HFileRecordBatch {
+            schema: reader.get_avro_schema_arc().unwrap(),
+            records: reader.collect_records().unwrap(),
+        }];
         if !logs.is_empty() {
             let scanner = LogFileScanner::new(table.hudi_configs.clone(), storage.clone());
-            let ScanResult::HFileRecords(log_records) = scanner
-                .scan(
-                    logs.clone(),
-                    &InstantRange::up_to("99991231235959999", "UTC"),
-                )
-                .await
-                .unwrap()
-            else {
-                panic!("fixture must contain genuine HFile puts")
-            };
-            records.extend(log_records);
+            batches.extend(
+                scanner
+                    .scan_hfile(
+                        logs.clone(),
+                        &InstantRange::up_to("99991231235959999", "UTC"),
+                    )
+                    .await
+                    .unwrap(),
+            );
         }
         let mut entries = BTreeMap::new();
-        for record in records {
+        for (record, schema) in batches.iter().flat_map(|batch| {
+            batch
+                .records
+                .iter()
+                .map(|record| (record, batch.schema.as_deref()))
+        }) {
             let key = record.key_as_str().unwrap().to_string();
             assert!(
-                decode_record_index_entry(&key, record.value(), record.avro_schema())
+                decode_record_index_entry(&key, record.value(), schema)
                     .unwrap()
                     .is_some()
             );
@@ -163,14 +169,11 @@ async fn compact_record_index_fixture(table: &Table) {
             logs.is_empty(),
             "old put logs must not mask the delete-only scan"
         );
-        for record in HFileReader::open(storage.as_ref(), &base)
-            .await
-            .unwrap()
-            .collect_records()
-            .unwrap()
-        {
+        let mut reader = HFileReader::open(storage.as_ref(), &base).await.unwrap();
+        let schema = reader.get_avro_schema_arc().unwrap();
+        for record in reader.collect_records().unwrap() {
             let key = record.key_as_str().unwrap();
-            let entry = decode_record_index_entry(key, record.value(), record.avro_schema())
+            let entry = decode_record_index_entry(key, record.value(), schema.as_deref())
                 .unwrap()
                 .unwrap();
             found.insert(key.to_string(), entry.partition_path);
@@ -290,5 +293,50 @@ async fn test_record_index_delete_only_after_compaction() {
     assert!(
         failures.is_empty(),
         "delete-only latest RLI logs must clear compacted locations: {failures:#?}"
+    );
+}
+
+#[tokio::test]
+async fn test_record_index_context_compacted_base_and_alternate_log_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("rli-schema")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_ordering_fields(["ts"])
+        .create()
+        .await
+        .unwrap();
+    table.append([batch(&[("a", 1), ("b", 2)])]).await.unwrap();
+    compact_record_index_fixture(&table).await;
+    table.append([batch(&[("c", 3)])]).await.unwrap();
+    let keys = [key("a"), key("b"), key("c")];
+    let expected = RecordIndex.tag_location(&table, &keys).await.unwrap();
+    assert!(expected.values().all(|location| {
+        location
+            .as_ref()
+            .is_some_and(|l| l.partition_path == "city=sf")
+    }));
+    let storage = table.file_system_view.storage.clone();
+    let paths = mdt_partition_latest_slices(&storage, "record_index")
+        .await
+        .unwrap()
+        .into_iter()
+        .flat_map(|(_, _, logs)| logs)
+        .collect::<Vec<_>>();
+    assert!(!paths.is_empty());
+    crate::hfile::schema_context_tests::rewrite_logs_with_alternate_schema(
+        storage,
+        table.hudi_configs.clone(),
+        &paths,
+    )
+    .await;
+    assert_eq!(
+        RecordIndex.tag_location(&table, &keys).await.unwrap(),
+        expected
+    );
+    assert_eq!(
+        rows(&table).await,
+        vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)]
     );
 }

@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::error::CoreError;
-use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
+use crate::file_group::log_file::scanner::LogFileScanner;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::index::{HoodieIndex, HoodieKey, RecordLocation};
 use crate::metadata::table::encode::decode_record_index_entry;
@@ -97,10 +97,13 @@ async fn load_record_index_map(
         let mut reader = HFileReader::open(storage.as_ref(), &base)
             .await
             .map_err(|e| CoreError::HFile(format!("failed to open record_index base: {e:?}")))?;
+        let schema = reader.get_avro_schema_arc().map_err(|e| {
+            CoreError::HFile(format!("invalid record_index writer schema in {base}: {e}"))
+        })?;
         let records = reader
             .collect_records()
             .map_err(|e| CoreError::HFile(format!("failed to read record_index base: {e:?}")))?;
-        apply_hfile_records(&mut merged, &records)?;
+        apply_hfile_records(&mut merged, &records, schema.as_deref())?;
     }
     if !log_paths.is_empty() {
         // Only trust log blocks whose instant completed on the data timeline
@@ -108,14 +111,8 @@ async fn load_record_index_map(
         let valid = table.valid_metadata_instants().await?;
         let scanner = LogFileScanner::new(table.hudi_configs.clone(), storage).with_hfile_context();
         let range = InstantRange::exact_match(valid, "UTC");
-        match scanner.scan(log_paths, &range).await? {
-            ScanResult::HFileRecords(records) => apply_hfile_records(&mut merged, &records)?,
-            ScanResult::Empty => {}
-            ScanResult::RecordBatches(_) => {
-                return Err(CoreError::MetadataTable(
-                    "record_index logs must contain HFile data blocks".to_string(),
-                ));
-            }
+        for batch in scanner.scan_hfile(log_paths, &range).await? {
+            apply_hfile_records(&mut merged, &batch.records, batch.schema.as_deref())?;
         }
     }
 
@@ -128,13 +125,14 @@ async fn load_record_index_map(
 fn apply_hfile_records(
     merged: &mut HashMap<String, Option<LoadedLocation>>,
     records: &[HFileRecord],
+    schema: Option<&apache_avro::Schema>,
 ) -> Result<()> {
     for record in records {
         let key = record
             .key_as_str()
             .ok_or_else(|| CoreError::MetadataTable("record_index key must be utf8".to_string()))?
             .to_string();
-        match decode_record_index_entry(&key, record.value(), record.avro_schema())? {
+        match decode_record_index_entry(&key, record.value(), schema)? {
             Some(entry) => {
                 merged.insert(
                     key,

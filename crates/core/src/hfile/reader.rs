@@ -429,15 +429,12 @@ impl HFileReader {
             });
         }
         let data_block = DataBlock::from_block(block);
-        // Records carry the file's own writer schema so a decoder can honor the
-        // shape this file was written with rather than a vendored one.
-        let schema = self.get_avro_schema_arc()?;
         // The shared helper, not a second copy of it: two places building an
         // `HFileRecord` from a `KeyValue` is how the predicate path and the scan path
         // would drift on what a record key is.
         Ok(data_block
             .iter()
-            .map(|kv| Self::key_value_to_record(&kv, schema.clone()))
+            .map(|kv| Self::key_value_to_record(&kv))
             .collect())
     }
 
@@ -595,7 +592,6 @@ impl HFileReader {
             return Ok(Vec::new());
         }
         let blocks = self.fetch_blocks(entries).await?;
-        let schema = self.get_avro_schema_arc()?;
         let mut records = Vec::new();
         for block in blocks {
             if block.block_type() != HFileBlockType::Data {
@@ -606,7 +602,7 @@ impl HFileReader {
             }
             let data_block = DataBlock::from_block(block);
             for kv in data_block.iter() {
-                records.push(Self::key_value_to_record(&kv, schema.clone()));
+                records.push(Self::key_value_to_record(&kv));
             }
         }
         Ok(records)
@@ -1062,7 +1058,7 @@ impl HFileReader {
     }
 
     /// Like [`Self::get_avro_schema`], but returns a shared handle suitable for
-    /// attaching to records read from this file.
+    /// retaining the writer schema after this reader is dropped.
     pub fn get_avro_schema_arc(&self) -> Result<Option<Arc<AvroSchema>>> {
         // Check if schema exists in file info
         let schema_bytes = match self.file_info.get(FILE_INFO_SCHEMA) {
@@ -1431,11 +1427,10 @@ impl HFileReader {
     /// Convert a KeyValue to an owned HFileRecord.
     ///
     /// This extracts the key content (without length prefix) and value bytes
-    /// into an owned struct suitable for metadata table operations. The file's
-    /// embedded Avro schema (when present) is attached so downstream decoding
-    /// uses this file's writer schema rather than an assumed one.
-    fn key_value_to_record(kv: &KeyValue, schema: Option<Arc<AvroSchema>>) -> HFileRecord {
-        HFileRecord::new(kv.key().content().to_vec(), kv.value().to_vec()).with_avro_schema(schema)
+    /// into an owned struct. Raw reads do not parse Avro schemas; typed consumers
+    /// retrieve the container schema explicitly before decoding these bytes.
+    fn key_value_to_record(kv: &KeyValue) -> HFileRecord {
+        HFileRecord::new(kv.key().content().to_vec(), kv.value().to_vec())
     }
 
     /// Collect all records from the HFile as owned HFileRecords.
@@ -1451,11 +1446,10 @@ impl HFileReader {
     /// }
     /// ```
     pub fn collect_records(&mut self) -> Result<Vec<HFileRecord>> {
-        let schema = self.get_avro_schema_arc().ok().flatten();
         let mut records = Vec::with_capacity(self.trailer.entry_count as usize);
         for result in self.iter()? {
             let kv = result?;
-            records.push(Self::key_value_to_record(&kv, schema.clone()));
+            records.push(Self::key_value_to_record(&kv));
         }
         Ok(records)
     }
@@ -1473,9 +1467,8 @@ impl HFileReader {
     ///
     /// Returns None if not seeked or at EOF.
     pub fn get_record(&mut self) -> Result<Option<HFileRecord>> {
-        let schema = self.get_avro_schema_arc().ok().flatten();
         match self.get_key_value()? {
-            Some(kv) => Ok(Some(Self::key_value_to_record(&kv, schema))),
+            Some(kv) => Ok(Some(Self::key_value_to_record(&kv))),
             None => Ok(None),
         }
     }
@@ -1523,7 +1516,6 @@ impl HFileReader {
     ///
     /// Returns all records where the key starts with the given prefix.
     pub fn collect_records_by_prefix(&mut self, prefix: &str) -> Result<Vec<HFileRecord>> {
-        let schema = self.get_avro_schema_arc().ok().flatten();
         let mut records = Vec::new();
         let prefix_bytes = prefix.as_bytes();
 
@@ -1558,7 +1550,7 @@ impl HFileReader {
                 Some(kv) => {
                     let key_content = kv.key().content();
                     if key_content.starts_with(prefix_bytes) {
-                        records.push(Self::key_value_to_record(&kv, schema.clone()));
+                        records.push(Self::key_value_to_record(&kv));
                     } else if key_content > prefix_bytes {
                         // Past the prefix range
                         break;
@@ -1589,10 +1581,9 @@ impl<'a> Iterator for HFileRecordIterator<'a> {
             return None;
         }
 
-        let schema = self.reader.get_avro_schema_arc().ok().flatten();
         match self.reader.get_key_value() {
             Ok(Some(kv)) => {
-                let record = HFileReader::key_value_to_record(&kv, schema);
+                let record = HFileReader::key_value_to_record(&kv);
                 match self.reader.next() {
                     Ok(_) => {}
                     Err(e) => return Some(Err(e)),

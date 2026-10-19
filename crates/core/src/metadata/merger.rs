@@ -23,6 +23,8 @@
 
 use crate::Result;
 use crate::hfile::HFileRecord;
+#[cfg(test)]
+use crate::hfile::HFileRecordBatch;
 use crate::metadata::table_record::{
     FilesPartitionRecord, decode_files_partition_record_with_schema,
 };
@@ -94,28 +96,7 @@ impl FilesPartitionMerger {
         base_records: &[HFileRecord],
         log_records: &[HFileRecord],
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
-        let mut merged: HashMap<String, FilesPartitionRecord> = HashMap::new();
-
-        // First, decode and add all base records
-        for record in base_records {
-            let decoded = self.decode_record(record)?;
-            merged.insert(decoded.key.clone(), decoded);
-        }
-
-        // Then, merge log records in order
-        for record in log_records {
-            let decoded = self.decode_record(record)?;
-            match merged.get_mut(&decoded.key) {
-                Some(existing) => {
-                    self.merge_files_partition_records(existing, &decoded);
-                }
-                None => {
-                    merged.insert(decoded.key.clone(), decoded);
-                }
-            }
-        }
-
-        Ok(merged)
+        self.merge_for_keys(base_records, log_records, &[])
     }
 
     /// Merge records, optionally filtering to specific keys.
@@ -137,47 +118,59 @@ impl FilesPartitionMerger {
         log_records: &[HFileRecord],
         keys: &[&str],
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
-        // When keys is empty, process all records
-        if keys.is_empty() {
-            return self.merge(base_records, log_records);
-        }
+        self.merge_with_schemas(
+            base_records,
+            log_records.iter().map(|record| (record, &self.schema)),
+            keys,
+        )
+    }
 
+    #[cfg(test)]
+    pub(crate) fn merge_contextual_for_keys(
+        &self,
+        base_records: &[HFileRecord],
+        log_batches: &[HFileRecordBatch],
+        keys: &[&str],
+    ) -> Result<HashMap<String, FilesPartitionRecord>> {
+        self.merge_with_schemas(
+            base_records,
+            log_batches.iter().flat_map(|batch| {
+                batch
+                    .records
+                    .iter()
+                    .map(|record| (record, batch.schema.as_deref().unwrap_or(&self.schema)))
+            }),
+            keys,
+        )
+    }
+
+    fn merge_with_schemas<'a>(
+        &'a self,
+        base_records: &[HFileRecord],
+        log_records: impl IntoIterator<Item = (&'a HFileRecord, &'a AvroSchema)>,
+        keys: &[&str],
+    ) -> Result<HashMap<String, FilesPartitionRecord>> {
         let key_set: std::collections::HashSet<&str> = keys.iter().copied().collect();
-        let mut merged: HashMap<String, FilesPartitionRecord> = HashMap::new();
-
-        // Process base records, filtering by key
-        for record in base_records {
-            if let Some(key_str) = record.key_as_str()
-                && key_set.contains(key_str)
-            {
-                let decoded = self.decode_record(record)?;
-                merged.insert(decoded.key.clone(), decoded);
-            }
+        let selected = |record: &HFileRecord| {
+            keys.is_empty() || record.key_as_str().is_some_and(|key| key_set.contains(key))
+        };
+        let mut merged = HashMap::new();
+        for record in base_records.iter().filter(|record| selected(record)) {
+            let decoded = decode_files_partition_record_with_schema(record, &self.schema)?;
+            merged.insert(decoded.key.clone(), decoded);
         }
-
-        // Process log records, filtering by key
-        for record in log_records {
-            if let Some(key_str) = record.key_as_str()
-                && key_set.contains(key_str)
-            {
-                let decoded = self.decode_record(record)?;
+        for (record, schema) in log_records {
+            if selected(record) {
+                let decoded = decode_files_partition_record_with_schema(record, schema)?;
                 match merged.get_mut(&decoded.key) {
-                    Some(existing) => {
-                        self.merge_files_partition_records(existing, &decoded);
-                    }
+                    Some(existing) => self.merge_files_partition_records(existing, &decoded),
                     None => {
                         merged.insert(decoded.key.clone(), decoded);
                     }
                 }
             }
         }
-
         Ok(merged)
-    }
-
-    /// Decode an HFile record using the schema.
-    fn decode_record(&self, record: &HFileRecord) -> Result<FilesPartitionRecord> {
-        decode_files_partition_record_with_schema(record, &self.schema)
     }
 
     /// Merge a newer record into an existing record

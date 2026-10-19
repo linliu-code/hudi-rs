@@ -45,6 +45,20 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+pub(crate) struct ContextualLogBlock {
+    pub block: LogBlock,
+    pub schema: Option<Arc<apache_avro::Schema>>,
+}
+
+impl From<LogBlock> for ContextualLogBlock {
+    fn from(block: LogBlock) -> Self {
+        Self {
+            block,
+            schema: None,
+        }
+    }
+}
+
 pub struct LogFileReader {
     hudi_configs: Arc<HudiConfigs>,
     reader: StorageReader,
@@ -150,6 +164,22 @@ impl LogFileReader {
                 continue;
             }
             blocks.push(block);
+        }
+        Ok(blocks)
+    }
+
+    pub(crate) async fn read_all_blocks_with_schema(
+        &mut self,
+        instant_range: &InstantRange,
+    ) -> Result<Vec<ContextualLogBlock>> {
+        let mut blocks = Vec::new();
+        while let Some(block) = self
+            .read_next_block_with_schema(instant_range, true)
+            .await?
+        {
+            if !block.block.skipped {
+                blocks.push(block);
+            }
         }
         Ok(blocks)
     }
@@ -548,6 +578,17 @@ impl LogFileReader {
     }
 
     async fn read_next_block(&mut self, instant_range: &InstantRange) -> Result<Option<LogBlock>> {
+        Ok(self
+            .read_next_block_with_schema(instant_range, false)
+            .await?
+            .map(|context| context.block))
+    }
+
+    async fn read_next_block_with_schema(
+        &mut self,
+        instant_range: &InstantRange,
+        retain_schema: bool,
+    ) -> Result<Option<ContextualLogBlock>> {
         // The magic's own offset — where a corrupt block's span starts.
         let magic_pos = self.reader.position();
         if !self.read_magic().await? {
@@ -559,7 +600,7 @@ impl LogFileReader {
         // yield a corrupt marker and resume at the next block, rather than
         // failing the whole file on one bad span.
         if self.is_block_corrupted(magic_pos, block_length).await? {
-            return Ok(Some(self.create_corrupted_block(magic_pos).await?));
+            return Ok(Some(self.create_corrupted_block(magic_pos).await?.into()));
         }
         let block_end = Self::block_end(magic_pos, block_length)?;
         let format_version = self.read_log_format_version().await?;
@@ -570,11 +611,9 @@ impl LogFileReader {
         // If block is out of the requested range, fast skip its payload without decoding
         if self.should_skip_block(&header, instant_range)? {
             self.reader.seek_to(block_end);
-            return Ok(Some(LogBlock::new_skipped(
-                format_version,
-                block_type,
-                header,
-            )));
+            return Ok(Some(
+                LogBlock::new_skipped(format_version, block_type, header).into(),
+            ));
         }
 
         let decoder = Decoder::new(self.hudi_configs.clone())
@@ -592,12 +631,13 @@ impl LogFileReader {
             ))
         })?;
         let mut content_bytes = Cursor::new(self.reader.read_bytes(remaining).await?);
-        let content = decoder.decode_content(
+        let (content, schema) = decoder.decode_content_with_schema(
             &mut content_bytes,
             &format_version,
             block_length,
             &block_type,
             &header,
+            retain_schema,
         )?;
         // What follows the content is at whatever offset the decoder stopped at,
         // which is not a function of the block length: a decoder is capped at
@@ -609,13 +649,10 @@ impl LogFileReader {
             .await?;
         let _ = self.read_total_block_length(&format_version).await?;
 
-        Ok(Some(LogBlock::new(
-            format_version,
-            block_type,
-            header,
-            content,
-            footer,
-        )))
+        Ok(Some(ContextualLogBlock {
+            block: LogBlock::new(format_version, block_type, header, content, footer),
+            schema,
+        }))
     }
 }
 

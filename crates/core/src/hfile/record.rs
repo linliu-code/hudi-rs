@@ -44,51 +44,31 @@ use std::sync::Arc;
 /// // Decode value on demand
 /// let payload = decode_avro(&record.value);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HFileRecord {
     /// Record key (UTF-8 string content only, no length prefix)
     pub key: Vec<u8>,
     /// Record value (raw bytes, typically Avro-serialized)
     pub value: Vec<u8>,
-    /// Writer schema of the container this record was read from (the HFile's
-    /// embedded "schema" file-info entry). Decoding must use this schema when
-    /// present: bytes written by another writer (e.g. Spark) may not match the
-    /// schema of the base file they are merged against.
-    schema: Option<Arc<AvroSchema>>,
 }
 
-impl PartialEq for HFileRecord {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.value == other.value
-    }
+/// Records from one container, kept together with that container's writer schema.
+/// Order between batches is significant for deletes and later puts.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HFileRecordBatch {
+    pub records: Vec<HFileRecord>,
+    pub schema: Option<Arc<AvroSchema>>,
 }
-
-impl Eq for HFileRecord {}
 
 impl HFileRecord {
     /// Create a new HFile record.
     pub fn new(key: Vec<u8>, value: Vec<u8>) -> Self {
-        Self {
-            key,
-            value,
-            schema: None,
-        }
+        Self { key, value }
     }
 
     /// Create a record from string key and value bytes.
     pub fn from_str_key(key: &str, value: Vec<u8>) -> Self {
         Self::new(key.as_bytes().to_vec(), value)
-    }
-
-    /// Attach the writer schema of the container this record came from.
-    pub fn with_avro_schema(mut self, schema: Option<Arc<AvroSchema>>) -> Self {
-        self.schema = schema;
-        self
-    }
-
-    /// The writer schema of this record's source container, if known.
-    pub fn avro_schema(&self) -> Option<&AvroSchema> {
-        self.schema.as_deref()
     }
 
     /// Returns the key as a UTF-8 string.

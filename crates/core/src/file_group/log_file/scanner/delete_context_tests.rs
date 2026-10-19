@@ -115,9 +115,8 @@ async fn test_delete_only_context_preserves_regular_data_and_hfile_semantics() {
     assert_eq!(hfile.len(), 1);
     assert_eq!(hfile[0].key_as_str(), Some("a"));
     assert!(hfile[0].value().is_empty());
-    assert!(hfile[0].avro_schema().is_none());
     assert!(
-        decode_record_index_entry("a", hfile[0].value(), hfile[0].avro_schema())
+        decode_record_index_entry("a", hfile[0].value(), None)
             .unwrap()
             .is_none()
     );
@@ -135,26 +134,29 @@ async fn test_hfile_context_keeps_put_delete_reinsert_order_and_schema() {
     let mut tail = delete(DELETE);
     tail.extend(put(LAST, "last-file"));
     scanner.storage.put_file("tail.log", tail).await.unwrap();
-    let records = scanner
-        .scan(vec!["first.log".into(), "tail.log".into()], &range())
+    let batches = scanner
+        .scan_hfile(vec!["first.log".into(), "tail.log".into()], &range())
         .await
-        .unwrap()
-        .unwrap_hfile_records();
-    assert_eq!(records.len(), 3);
-    let decoded = records
+        .unwrap();
+    assert_eq!(batches.len(), 3);
+    let decoded = batches
         .iter()
-        .map(|r| {
-            decode_record_index_entry("a", r.value(), r.avro_schema())
-                .unwrap()
-                .map(|entry| entry.file_id)
+        .flat_map(|batch| {
+            batch.records.iter().map(|record| {
+                decode_record_index_entry("a", record.value(), batch.schema.as_deref())
+                    .unwrap()
+                    .map(|entry| entry.file_id)
+            })
         })
         .collect::<Vec<_>>();
     assert_eq!(
         decoded,
         vec![Some("first-file".into()), None, Some("last-file".into())]
     );
-    assert!(records[0].avro_schema().is_some());
-    assert!(records[2].avro_schema().is_some());
+    assert!(batches[0].schema.is_some());
+    assert!(batches[1].schema.is_none());
+    assert!(batches[1].records[0].is_deleted());
+    assert!(batches[2].schema.is_some());
 }
 
 #[tokio::test]
