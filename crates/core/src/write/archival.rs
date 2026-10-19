@@ -30,7 +30,7 @@
 //! LSM level compaction (merging L0 files into L1+) is not yet implemented —
 //! readers are unaffected since every file stays manifest-listed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BinaryArray, Int32Array, RecordBatch, StringArray};
@@ -54,7 +54,7 @@ struct LsmManifest {
     files: Vec<LsmFileEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LsmFileEntry {
     file_name: String,
@@ -206,11 +206,7 @@ pub(crate) async fn archive_timeline_if_needed(
 
     // Build HoodieLSMTimelineInstant rows: metadata = completed file bytes;
     // plan = inflight (fallback requested) bytes for replacecommits.
-    let mut instant_times = Vec::new();
-    let mut completion_times = Vec::new();
-    let mut actions = Vec::new();
-    let mut metadata_bytes: Vec<Option<Vec<u8>>> = Vec::new();
-    let mut plan_bytes: Vec<Option<Vec<u8>>> = Vec::new();
+    let mut records = Vec::new();
     for instant in &to_archive {
         let metadata = storage
             .get_file_data(&format!("{timeline_dir}/{}", instant.file_name))
@@ -251,56 +247,141 @@ pub(crate) async fn archive_timeline_if_needed(
         } else {
             None
         };
-        instant_times.push(instant.requested.clone());
-        completion_times.push(instant.completion.clone());
-        actions.push(instant.action.clone());
-        metadata_bytes.push(Some(metadata.to_vec()));
-        plan_bytes.push(plan);
+        records.push(LsmRecord {
+            instant: instant.requested.clone(),
+            completion: instant.completion.clone(),
+            action: instant.action.clone(),
+            metadata: Some(metadata.to_vec()),
+            plan,
+        });
     }
 
-    let parquet = write_lsm_parquet(
-        &instant_times,
-        &completion_times,
-        &actions,
-        &metadata_bytes,
-        &plan_bytes,
-    )?;
     let history_dir = format!("{timeline_dir}/history");
+    let (published_version, mut manifest) = read_manifest(storage, &history_dir).await?;
+    validate_manifest(&manifest)?;
+    let mut version = published_version;
+    // A manifest PUT can succeed before its response (or the pointer PUT) fails.
+    // Preserve that immutable successor before planning any additional archive.
+    loop {
+        let next = next_manifest_version(version)?;
+        let path = format!("{history_dir}/manifest_{next}");
+        let bytes = match storage.get_file_data(&path).await {
+            Ok(bytes) => bytes,
+            Err(crate::storage::error::StorageError::ObjectStoreError(
+                object_store::Error::NotFound { .. },
+            )) => break,
+            Err(error) => return Err(error.into()),
+        };
+        let successor: LsmManifest = serde_json::from_slice(&bytes)
+            .map_err(|e| CoreError::Timeline(format!("invalid LSM manifest {path}: {e}")))?;
+        validate_manifest(&successor)?;
+        if !manifest
+            .files
+            .iter()
+            .all(|entry| successor.files.contains(entry))
+        {
+            return Err(CoreError::Timeline(format!(
+                "LSM manifest {path} drops published files"
+            )));
+        }
+        for entry in &successor.files {
+            if !manifest.files.contains(entry) {
+                read_archive_file(storage, &history_dir, entry).await?;
+            }
+        }
+        manifest = successor;
+        version = next;
+    }
+
+    // Range endpoints are only a pruning hint: gaps and distinct actions can
+    // share a range. Only an identical archived record permits active cleanup.
     let min_instant = &to_archive[0].requested;
     let max_instant = &to_archive[to_archive.len() - 1].requested;
-    let parquet_name = format!("{min_instant}_{max_instant}_0.parquet");
-    let parquet_len = parquet.len() as i64;
-    storage
-        .put_file(&format!("{history_dir}/{parquet_name}"), parquet)
-        .await?;
-
-    // Manifest protocol: parquet → manifest_{N+1} → _version_ (Java order).
-    let (current_version, mut manifest) = read_manifest(storage, &history_dir).await?;
-    manifest.files.push(LsmFileEntry {
-        file_name: parquet_name,
-        file_len: parquet_len,
-    });
-    let next_version = current_version + 1;
-    let manifest_json = serde_json::to_vec(&manifest)
-        .map_err(|e| CoreError::Timeline(format!("serialize LSM manifest: {e}")))?;
-    storage
-        .put_file(
-            &format!("{history_dir}/manifest_{next_version}"),
-            manifest_json,
-        )
-        .await?;
-    storage
-        .put_file(
-            &format!("{history_dir}/_version_"),
-            next_version.to_string().into_bytes(),
-        )
-        .await?;
-    // Retain only the last N manifest versions.
-    let stale_floor = next_version - RETAINED_MANIFEST_VERSIONS;
-    let mut stale = stale_floor;
+    let mut covered = HashSet::new();
+    for entry in &manifest.files {
+        let (min, max) = archive_file_range(&entry.file_name)?;
+        if max < min_instant.as_str() || min > max_instant.as_str() {
+            continue;
+        }
+        let archived = read_archive_file(storage, &history_dir, entry).await?;
+        for (i, record) in records.iter().enumerate() {
+            if record_is_covered(record, &archived)? {
+                covered.insert(i);
+            }
+        }
+    }
+    records = records
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, record)| (!covered.contains(&i)).then_some(record))
+        .collect();
+    if !records.is_empty() {
+        let min = &records[0].instant;
+        let max = &records[records.len() - 1].instant;
+        let name = format!("{min}_{max}_0.parquet");
+        let path = format!("{history_dir}/{name}");
+        let parquet = write_lsm_parquet(&records)?;
+        let mut entry = LsmFileEntry {
+            file_name: name,
+            file_len: parquet.len() as i64,
+        };
+        match storage.put_file_if_absent(&path, parquet).await {
+            Ok(()) => {}
+            Err(crate::storage::error::StorageError::AlreadyExists(..)) => {
+                // This may be an unpublished archive from a lost response.
+                // Never replace it, even when it contains extra middle instants.
+                let bytes = storage.get_file_data(&path).await?;
+                entry.file_len = bytes.len() as i64;
+                let archived = read_lsm_parquet(bytes)?;
+                validate_archive_range(&entry.file_name, &archived)?;
+                for record in &records {
+                    if !record_is_covered(record, &archived)? {
+                        return Err(CoreError::Timeline(format!(
+                            "LSM archive collision at {path}: missing {}",
+                            record.instant
+                        )));
+                    }
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(existing) = manifest
+            .files
+            .iter()
+            .find(|e| e.file_name == entry.file_name)
+        {
+            if existing != &entry {
+                return Err(CoreError::Timeline(format!(
+                    "conflicting LSM archive length at {path}"
+                )));
+            }
+        } else {
+            manifest.files.push(entry);
+            version = next_manifest_version(version)?;
+            let json = serde_json::to_vec(&manifest)
+                .map_err(|e| CoreError::Timeline(format!("serialize LSM manifest: {e}")))?;
+            storage
+                .put_file_if_absent(&format!("{history_dir}/manifest_{version}"), json)
+                .await?;
+        }
+    }
+    // Manifest protocol: immutable parquet → immutable manifest → mutable pointer.
+    // A pointer error must leave every active completion intact for the retry.
+    if version != published_version {
+        storage
+            .put_file(
+                &format!("{history_dir}/_version_"),
+                version.to_string().into_bytes(),
+            )
+            .await?;
+    }
+    let mut stale = version - RETAINED_MANIFEST_VERSIONS;
     while stale > 0 {
-        let path = format!("{history_dir}/manifest_{stale}");
-        if storage.delete_file(&path).await.is_err() {
+        if storage
+            .delete_file(&format!("{history_dir}/manifest_{stale}"))
+            .await
+            .is_err()
+        {
             break;
         }
         stale -= 1;
@@ -350,6 +431,147 @@ async fn read_manifest(storage: &Storage, history_dir: &str) -> Result<(i64, Lsm
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LsmRecord {
+    instant: String,
+    completion: String,
+    action: String,
+    metadata: Option<Vec<u8>>,
+    plan: Option<Vec<u8>>,
+}
+
+fn next_manifest_version(version: i64) -> Result<i64> {
+    // Java parses the version as an int.
+    if !(0..i64::from(i32::MAX)).contains(&version) {
+        return Err(CoreError::Timeline(format!(
+            "invalid LSM manifest version {version}"
+        )));
+    }
+    Ok(version + 1)
+}
+
+fn archive_file_range(name: &str) -> Result<(&str, &str)> {
+    if let Some(stem) = name.strip_suffix(".parquet") {
+        let parts: Vec<_> = stem.split('_').collect();
+        if parts.len() == 3
+            && parts[2].len() == 1
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            && parts[0] <= parts[1]
+        {
+            return Ok((parts[0], parts[1]));
+        }
+    }
+    Err(CoreError::Timeline(format!(
+        "invalid LSM archive filename {name}"
+    )))
+}
+
+fn validate_manifest(manifest: &LsmManifest) -> Result<()> {
+    let mut names = HashSet::new();
+    for entry in &manifest.files {
+        archive_file_range(&entry.file_name)?;
+        if entry.file_len <= 0 || !names.insert(&entry.file_name) {
+            return Err(CoreError::Timeline(format!(
+                "invalid or duplicate LSM entry {}",
+                entry.file_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn read_archive_file(
+    storage: &Storage,
+    history_dir: &str,
+    entry: &LsmFileEntry,
+) -> Result<Vec<LsmRecord>> {
+    let path = format!("{history_dir}/{}", entry.file_name);
+    let bytes = storage.get_file_data(&path).await?;
+    if bytes.len() as i64 != entry.file_len {
+        return Err(CoreError::Timeline(format!(
+            "LSM archive length mismatch at {path}"
+        )));
+    }
+    let records = read_lsm_parquet(bytes)?;
+    validate_archive_range(&entry.file_name, &records)?;
+    Ok(records)
+}
+
+fn validate_archive_range(name: &str, records: &[LsmRecord]) -> Result<()> {
+    let (min, max) = archive_file_range(name)?;
+    if records.is_empty()
+        || records
+            .iter()
+            .any(|r| r.instant.as_str() < min || r.instant.as_str() > max)
+    {
+        return Err(CoreError::Timeline(format!(
+            "LSM records outside archive range {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn record_is_covered(record: &LsmRecord, archived: &[LsmRecord]) -> Result<bool> {
+    let mut found = false;
+    for existing in archived {
+        if existing.instant == record.instant && existing.action == record.action {
+            if existing != record {
+                return Err(CoreError::Timeline(format!(
+                    "conflicting LSM record {}.{}",
+                    record.instant, record.action
+                )));
+            }
+            found = true;
+        }
+    }
+    Ok(found)
+}
+
+fn read_lsm_parquet(bytes: bytes::Bytes) -> Result<Vec<LsmRecord>> {
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .map_err(|e| CoreError::Timeline(format!("open LSM parquet: {e}")))?
+        .build()
+        .map_err(|e| CoreError::Timeline(format!("read LSM parquet: {e}")))?;
+    let mut records = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|e| CoreError::Timeline(format!("read LSM batch: {e}")))?;
+        fn column<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T> {
+            batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<T>())
+                .ok_or_else(|| CoreError::Timeline(format!("invalid LSM column {name}")))
+        }
+        let instants = column::<StringArray>(&batch, "instantTime")?;
+        let completions = column::<StringArray>(&batch, "completionTime")?;
+        let actions = column::<StringArray>(&batch, "action")?;
+        let metadata = column::<BinaryArray>(&batch, "metadata")?;
+        let plans = column::<BinaryArray>(&batch, "plan")?;
+        let versions = column::<Int32Array>(&batch, "version")?;
+        for i in 0..batch.num_rows() {
+            if instants.is_null(i)
+                || completions.is_null(i)
+                || actions.is_null(i)
+                || versions.is_null(i)
+                || versions.value(i) != 1
+            {
+                return Err(CoreError::Timeline(
+                    "invalid LSM instant identity or version".into(),
+                ));
+            }
+            records.push(LsmRecord {
+                instant: instants.value(i).to_string(),
+                completion: completions.value(i).to_string(),
+                action: actions.value(i).to_string(),
+                metadata: (!metadata.is_null(i)).then(|| metadata.value(i).to_vec()),
+                plan: (!plans.is_null(i)).then(|| plans.value(i).to_vec()),
+            });
+        }
+    }
+    Ok(records)
+}
+
 /// Arrow shape of Java `HoodieLSMTimelineInstant.avsc`.
 fn lsm_instant_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -362,42 +584,27 @@ fn lsm_instant_schema() -> Arc<Schema> {
     ]))
 }
 
-fn write_lsm_parquet(
-    instant_times: &[String],
-    completion_times: &[String],
-    actions: &[String],
-    metadata: &[Option<Vec<u8>>],
-    plans: &[Option<Vec<u8>>],
-) -> Result<Vec<u8>> {
+fn write_lsm_parquet(records: &[LsmRecord]) -> Result<Vec<u8>> {
     let schema = lsm_instant_schema();
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(StringArray::from(
-                instant_times.iter().map(String::as_str).collect::<Vec<_>>(),
+            Arc::new(StringArray::from_iter_values(
+                records.iter().map(|r| r.instant.as_str()),
             )) as ArrayRef,
-            Arc::new(StringArray::from(
-                completion_times
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>(),
+            Arc::new(StringArray::from_iter_values(
+                records.iter().map(|r| r.completion.as_str()),
             )),
-            Arc::new(StringArray::from(
-                actions.iter().map(String::as_str).collect::<Vec<_>>(),
+            Arc::new(StringArray::from_iter_values(
+                records.iter().map(|r| r.action.as_str()),
             )),
-            Arc::new(BinaryArray::from(
-                metadata
-                    .iter()
-                    .map(|m| m.as_deref())
-                    .collect::<Vec<Option<&[u8]>>>(),
+            Arc::new(BinaryArray::from_iter(
+                records.iter().map(|r| r.metadata.as_deref()),
             )),
-            Arc::new(BinaryArray::from(
-                plans
-                    .iter()
-                    .map(|p| p.as_deref())
-                    .collect::<Vec<Option<&[u8]>>>(),
+            Arc::new(BinaryArray::from_iter(
+                records.iter().map(|r| r.plan.as_deref()),
             )),
-            Arc::new(Int32Array::from(vec![1; instant_times.len()])),
+            Arc::new(Int32Array::from(vec![1; records.len()])),
         ],
     )?;
     let mut out = Vec::new();
@@ -561,3 +768,7 @@ mod lifecycle_tests {
         assert_eq!(rows, 12);
     }
 }
+
+#[cfg(test)]
+#[path = "archival_tests.rs"]
+mod retry_tests;
