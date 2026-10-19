@@ -20,8 +20,8 @@
 //!
 //! At write start, any pending data instant (fenced but never completed) is
 //! rolled back: its marker-listed base/log files are deleted (tv8+ rollback is
-//! deletion-only), its completed-but-orphaned MDT deltacommit and MDT log
-//! files are removed, a `rollback` instant records the operation, and the
+//! deletion-only), its orphan MDT log and timeline files are removed,
+//! a `rollback` instant records the operation, and the
 //! failed instant's fencing files and marker dir are cleaned up.
 
 use std::collections::HashMap;
@@ -37,6 +37,10 @@ use crate::write::append::{generate_instant_time, is_layout_two, timeline_dir};
 use crate::write::markers::{delete_marker_dir, parse_marker_name, read_markers};
 
 const METADATA_BASE: &str = ".hoodie/metadata";
+
+#[cfg(test)]
+#[path = "rollback_tests.rs"]
+mod rollback_tests;
 
 /// A pending (fenced, never completed) instant on the data timeline.
 #[derive(Debug, Clone)]
@@ -180,19 +184,26 @@ async fn rollback_instant(
         } else {
             request.files_to_be_deleted.push(file_path.clone());
         }
-        let deleted = storage.delete_file(&file_path).await.is_ok();
+        storage.delete_file(&file_path).await.map_err(|error| {
+            crate::error::CoreError::Write(format!(
+                "Failed to delete '{file_path}' while rolling back instant '{failed_ts}': {error}"
+            ))
+        })?;
         let meta = partition_meta.entry(partition.clone()).or_insert_with(|| {
             HoodieRollbackPartitionMetadata {
                 partition_path: partition.clone(),
                 ..Default::default()
             }
         });
-        if deleted {
-            total_deleted += 1;
-            meta.success_delete_files.push(file_path);
-        } else {
-            meta.failed_delete_files.push(file_path);
-        }
+        total_deleted += 1;
+        meta.success_delete_files.push(file_path);
+    }
+
+    // A completed rollback admits the failed instant's metadata blocks. Keep
+    // the data fence and markers until all data and MDT cleanup succeeds,
+    // and avoid leaving a pending rollback that would pin future archival.
+    if table.is_metadata_table_enabled() {
+        rollback_orphan_mdt_commit(storage, failed_ts).await?;
     }
 
     // Rollback plan + lifecycle on its own (new) instant.
@@ -217,14 +228,6 @@ async fn rollback_instant(
             Vec::new(),
         )
         .await?;
-
-    // Remove the orphan MDT deltacommit (and its log blocks) if the crashed
-    // write got as far as committing the MDT. Required: once the failed
-    // instant's fencing files are gone, the valid-instants fence would start
-    // trusting the orphan.
-    if table.is_metadata_table_enabled() {
-        rollback_orphan_mdt_commit(storage, failed_ts).await?;
-    }
 
     let metadata = HoodieRollbackMetadata {
         start_rollback_time: rollback_ts.clone(),
@@ -262,16 +265,16 @@ async fn rollback_instant(
                 .filter(|n| n.ends_with(".requested")),
         )
     {
-        let _ = storage
+        storage
             .delete_file(&format!("{timeline_dir}/{fencing}"))
-            .await;
+            .await?;
     }
     delete_marker_dir(storage, failed_ts).await;
     Ok(())
 }
 
-/// Delete a completed-but-orphaned MDT deltacommit for a failed data instant:
-/// its instant-named log files in every MDT partition, then its timeline files.
+/// Delete an orphan MDT write for a failed data instant: its instant-named log
+/// files in every MDT partition, then its timeline files, if any.
 /// (Java rolls the MDT deltacommit back via the MDT write client; deletion is
 /// the single-writer equivalent — the log files are per-instant, never shared.)
 async fn rollback_orphan_mdt_commit(storage: &Storage, failed_ts: &str) -> Result<()> {
@@ -280,46 +283,50 @@ async fn rollback_orphan_mdt_commit(storage: &Storage, failed_ts: &str) -> Resul
         Ok(files) => files,
         Err(crate::storage::error::StorageError::ObjectStoreError(
             object_store::Error::NotFound { .. },
-        )) => return Ok(()),
+        )) => Vec::new(),
         Err(error) => return Err(error.into()),
     };
     let mut mdt_instant_files = Vec::new();
-    let mut has_completed = false;
     for file in timeline_files {
         let name = file.name;
         let matches_instant = name.starts_with(&format!("{failed_ts}_"))
             || name.starts_with(&format!("{failed_ts}."));
         if matches_instant {
-            if name.ends_with(".deltacommit") {
-                has_completed = true;
-            }
             mdt_instant_files.push(name);
         }
     }
-    if mdt_instant_files.is_empty() {
-        return Ok(());
-    }
-    if has_completed {
-        // Delete the failed instant's log blocks from every MDT partition.
-        let partitions = storage.list_dirs(Some(METADATA_BASE)).await?;
-        for partition in partitions {
-            if partition == ".hoodie" {
-                continue;
-            }
-            let dir = format!("{METADATA_BASE}/{partition}");
-            let Ok(files) = storage.list_files(Some(&dir)).await else {
-                continue;
-            };
-            for file in files {
-                // MDT log files embed the data instant: `.{fileId}_{ts}.log.N_...`.
-                if file.name.contains(&format!("_{failed_ts}.log.")) {
-                    let _ = storage.delete_file(&format!("{dir}/{}", file.name)).await;
-                }
+    // MDT log PUTs precede all MDT timeline files; absence of those files
+    // cannot establish that there is no orphan log to delete.
+    let partitions = match storage.list_dirs(Some(METADATA_BASE)).await {
+        Ok(partitions) => partitions,
+        Err(crate::storage::error::StorageError::ObjectStoreError(
+            object_store::Error::NotFound { .. },
+        )) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    for partition in partitions {
+        if partition == ".hoodie" {
+            continue;
+        }
+        let dir = format!("{METADATA_BASE}/{partition}");
+        let files = match storage.list_files(Some(&dir)).await {
+            Ok(files) => files,
+            Err(crate::storage::error::StorageError::ObjectStoreError(
+                object_store::Error::NotFound { .. },
+            )) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        for file in files {
+            // MDT log files embed the data instant: `.{fileId}_{ts}.log.N_...`.
+            if file.name.contains(&format!("_{failed_ts}.log.")) {
+                storage.delete_file(&format!("{dir}/{}", file.name)).await?;
             }
         }
     }
     for name in mdt_instant_files {
-        let _ = storage.delete_file(&format!("{mdt_timeline}/{name}")).await;
+        storage
+            .delete_file(&format!("{mdt_timeline}/{name}"))
+            .await?;
     }
     Ok(())
 }
