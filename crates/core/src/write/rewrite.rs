@@ -1675,14 +1675,7 @@ async fn mor_upsert_batches(
         }
         return Err(error);
     }
-    if let Err(error) =
-        complete_deltacommit(table, &instant, "UPSERT", stats, incoming.schema().as_ref()).await
-    {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error);
-    }
+    complete_deltacommit(table, &instant, "UPSERT", stats, incoming.schema().as_ref()).await?;
     // Durable from here: best-effort maintenance must not fail the write.
     let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await;
     drop(cs2);
@@ -1881,20 +1874,14 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         }
         return Err(error);
     }
-    if let Err(error) = complete_deltacommit(
+    complete_deltacommit(
         table,
         &instant,
         "DELETE",
         stats,
         table.get_schema_with_meta_fields().await?.as_ref(),
     )
-    .await
-    {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error);
-    }
+    .await?;
     // Durable from here: best-effort maintenance must not fail the write.
     let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await;
     drop(cs2);
@@ -1909,6 +1896,8 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
     })
 }
 
+// Callers must retain data and markers on error: the completion may already be
+// durable. Eager rollback resolves pending writes from the stored timeline.
 async fn complete_deltacommit(
     table: &Table,
     instant: &str,
@@ -2927,12 +2916,9 @@ async fn finalize_rewrite_commit(
     };
     let commit = Instant::new_completed(instant.to_string(), action, completed)?;
     let path = commit.relative_path_with_base(&timeline_dir(table))?;
-    if let Err(error) = storage.put_file_if_absent(&path, bytes).await {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error.into());
-    }
+    // A failed response may follow a durable completion. Retain data and the
+    // recovery trail; eager rollback checks the timeline before deleting files.
+    storage.put_file_if_absent(&path, bytes).await?;
     // Durable from here: best-effort maintenance must not fail the write.
     let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), instant).await;
     drop(cs2);

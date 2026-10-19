@@ -549,3 +549,6 @@ mod tests {
         assert!(std::str::from_utf8(&json).unwrap().contains("UPSERT"));
     }
 }
+
+#[cfg(test)]
+mod completion_tests;

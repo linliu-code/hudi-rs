@@ -306,17 +306,18 @@ pub(crate) async fn archive_timeline_if_needed(
         stale -= 1;
     }
 
-    // Remove archived instants from the active timeline: fencing files first
-    // (ascending), completed files after.
+    // Remove all fences before any completed files. A surviving fence without
+    // its completion looks pending to eager rollback, which could delete data
+    // still listed in markers retained after a lost completion response.
     for instant in &to_archive {
         for fencing in fencing_by_instant
             .get(&instant.requested)
             .into_iter()
             .flatten()
         {
-            let _ = storage
+            storage
                 .delete_file(&format!("{timeline_dir}/{fencing}"))
-                .await;
+                .await?;
         }
     }
     for instant in &to_archive {
