@@ -840,10 +840,13 @@ async fn ensure_append_schema_matches_table(
 }
 
 pub(crate) fn strip_meta_fields_from_schema(schema: &arrow_schema::Schema) -> arrow_schema::Schema {
+    // Only writer-owned metadata is removed. Ordinary prefixed columns and
+    // the built-in delete marker must remain in the committed data schema.
+    let meta = crate::metadata::meta_field::MetaField::field_names_with_operation();
     let fields: Vec<_> = schema
         .fields()
         .iter()
-        .filter(|f| !f.name().starts_with("_hoodie_"))
+        .filter(|f| !meta.contains(&f.name().as_str()))
         .cloned()
         .collect();
     arrow_schema::Schema::new(fields)
@@ -1133,11 +1136,16 @@ mod tests {
 
     #[test]
     fn test_strip_meta_fields_from_schema() {
-        let schema = Schema::new(vec![
-            Field::new("_hoodie_commit_time", DataType::Utf8, true),
-            Field::new("_hoodie_record_key", DataType::Utf8, true),
+        let mut fields = crate::metadata::meta_field::MetaField::field_names_with_operation()
+            .into_iter()
+            .map(|name| Field::new(name, DataType::Utf8, true))
+            .collect::<Vec<_>>();
+        fields.extend([
             Field::new("id", DataType::Utf8, false),
+            Field::new("_hoodie_custom", DataType::Utf8, true),
+            Field::new("_hoodie_is_deleted", DataType::Boolean, true),
         ]);
+        let schema = Schema::new(fields);
         let stripped = strip_meta_fields_from_schema(&schema);
         assert_eq!(
             stripped
@@ -1145,8 +1153,9 @@ mod tests {
                 .iter()
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
-            vec!["id"]
+            vec!["id", "_hoodie_custom", "_hoodie_is_deleted"]
         );
+        assert_eq!(&stripped.fields()[..], &schema.fields()[6..]);
     }
 
     fn id_batch(n: usize) -> arrow_array::RecordBatch {

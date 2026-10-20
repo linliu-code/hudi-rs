@@ -1959,8 +1959,8 @@ async fn complete_deltacommit(
         compacted: Some(false),
         extra_metadata: Some(HashMap::from([(
             "schema".to_string(),
-            // Commit metadata carries the data schema (no _hoodie_* meta
-            // fields), matching the Java writer; some callers pass batches
+            // Commit metadata carries the data schema without writer-owned
+            // metadata fields, matching the Java writer; some callers pass batches
             // that were read back with meta fields.
             crate::write::append::arrow_schema_to_avro_json(
                 &crate::write::append::strip_meta_fields_from_schema(schema),
@@ -3024,7 +3024,7 @@ async fn finalize_rewrite_commit(
     deletes: usize,
 ) -> Result<WriteResult> {
     let storage = table.file_system_view.storage.clone();
-    // Data schema only (no _hoodie_* meta fields) in commit metadata, like
+    // Data schema only (without writer-owned metadata) in commit metadata, like
     // the Java writer; delete/update paths pass batches read with meta fields.
     let schema_json = crate::write::append::arrow_schema_to_avro_json(
         &crate::write::append::strip_meta_fields_from_schema(schema.as_ref()),
