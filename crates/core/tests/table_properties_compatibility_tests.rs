@@ -19,7 +19,7 @@
 //! Historical native properties and Java byte-stream compatibility.
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use hudi_core::config::table::HudiTableConfig;
+use hudi_core::config::table::{HudiTableConfig, TableTypeValue};
 use hudi_core::table::{ReadOptions, Table};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -393,4 +393,90 @@ async fn test_native_marker_and_fallback_propagate_per_metadata_file() {
         Some(r"line\nnext")
     );
     assert_eq!(inventory(dir.path()), before);
+}
+
+#[tokio::test]
+async fn test_empty_continuation_comment_preserves_configured_upsert_keys() {
+    let uuids = [
+        "00000000-0000-0000-0000-000000000001",
+        "00000000-0000-0000-0000-000000000002",
+    ];
+    let expected_rows: Vec<_> = uuids
+        .iter()
+        .map(|uuid| ("same".to_string(), uuid.to_string(), uuid.to_string()))
+        .collect();
+    let mut failures = Vec::new();
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        for version in [8, 9] {
+            for newline in ["\n", "\r\n", "\r"] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().to_str().unwrap();
+                Table::create(path)
+                    .with_table_name("continued")
+                    .with_table_type(table_type.clone())
+                    .with_table_version(version)
+                    .with_record_key_fields(["id"])
+                    .with_metadata(false)
+                    .create()
+                    .await
+                    .unwrap();
+                let mut body = std::fs::read_to_string(properties(dir.path())).unwrap();
+                // Java ignores the comment, including its final slash, after an empty
+                // continued line. The following assignment must still override `id`.
+                body.push_str(
+                    "\\\n# comment ends in a slash\\\nhoodie.table.recordkey.fields=uuid\n",
+                );
+                std::fs::write(properties(dir.path()), body.replace('\n', newline)).unwrap();
+                let before = inventory(dir.path());
+                let mut table = Table::new(path).await.unwrap();
+                let selected = table
+                    .hudi_configs
+                    .get_raw(HudiTableConfig::RecordKeyFields)
+                    .unwrap()
+                    .to_string();
+                assert_eq!(inventory(dir.path()), before);
+                let batch = RecordBatch::try_from_iter([
+                    (
+                        "id",
+                        Arc::new(StringArray::from(vec!["same", "same"])) as ArrayRef,
+                    ),
+                    (
+                        "uuid",
+                        Arc::new(StringArray::from(uuids.to_vec())) as ArrayRef,
+                    ),
+                ])
+                .unwrap();
+                table.upsert([batch]).await.unwrap();
+                let reopened = Table::new(path).await.unwrap();
+                let before = inventory(dir.path());
+                let batches = reopened.read(&ReadOptions::new()).await.unwrap();
+                let mut rows = Vec::new();
+                for batch in batches {
+                    let columns = ["id", "uuid", "_hoodie_record_key"].map(|name| {
+                        batch
+                            .column_by_name(name)
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                    });
+                    for row in 0..batch.num_rows() {
+                        rows.push((
+                            columns[0].value(row).to_string(),
+                            columns[1].value(row).to_string(),
+                            columns[2].value(row).to_string(),
+                        ));
+                    }
+                }
+                rows.sort();
+                assert_eq!(inventory(dir.path()), before);
+                if selected != "uuid" || rows != expected_rows {
+                    failures.push(format!(
+                        "{table_type:?} v{version} newline={newline:?}: selected={selected}, rows={rows:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

@@ -43,10 +43,8 @@ pub(crate) fn parse_table_properties(
     validate_native_codec(codec)?;
     let mut marked = false;
     let mut native = false;
-    let mut continued = false;
-    for line in property_text(bytes).split('\n') {
-        let line = line.trim_start_matches([' ', '\t', '\u{c}']);
-        if !continued && line.starts_with(['#', '!']) {
+    for_each_logical_line(bytes, |line| {
+        if let LogicalLine::Comment(line) = line {
             let comment = line.trim_end_matches([' ', '\t', '\u{c}']);
             native |= comment == NATIVE_HEADER;
             if comment.starts_with(MARKER_PREFIX) {
@@ -58,11 +56,9 @@ pub(crate) fn parse_table_properties(
                 }
                 marked = true;
             }
-            continue;
         }
-        // A continued value can begin with '#'; only logical comments carry provenance.
-        continued = has_continuation(line);
-    }
+        Ok(())
+    })?;
     // Markers describe the individual file; a parent's fallback cannot override them.
     if marked || !native || codec == Some("java") {
         return parse_properties(bytes);
@@ -119,32 +115,70 @@ fn is_native_java_serialization(bytes: &[u8]) -> bool {
 
 pub(crate) fn parse_properties(bytes: &[u8]) -> Result<HashMap<String, String>> {
     let mut properties = HashMap::new();
-    let mut logical = String::new();
-    let mut continued = false;
-    for line in property_text(bytes).split('\n') {
-        let line = line.trim_start_matches([' ', '\t', '\u{c}']);
-        if !continued && (line.is_empty() || line.starts_with(['#', '!'])) {
-            continue;
+    for_each_logical_line(bytes, |line| {
+        if let LogicalLine::Property(line) = line {
+            parse_logical_line(line, &mut properties)?;
         }
-        logical.push_str(line);
-        continued = has_continuation(&logical);
-        if continued {
-            logical.pop();
-            continue;
-        }
-        parse_logical_line(&logical, &mut properties)?;
-        logical.clear();
-    }
-    if !logical.is_empty() {
-        parse_logical_line(&logical, &mut properties)?;
-    }
+        Ok(())
+    })?;
     Ok(properties)
 }
 
-fn property_text(bytes: &[u8]) -> String {
-    // Java's byte-stream format is ISO-8859-1; Unicode is represented by UTF-16 escapes.
-    let text: String = bytes.iter().map(|b| char::from(*b)).collect();
-    text.replace("\r\n", "\n").replace('\r', "\n")
+enum LogicalLine<'a> {
+    Comment(&'a str),
+    Property(&'a str),
+}
+
+fn for_each_logical_line(
+    bytes: &[u8],
+    mut consume: impl FnMut(LogicalLine<'_>) -> Result<()>,
+) -> Result<()> {
+    let mut logical = String::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = bytes[offset..]
+            .iter()
+            .position(|byte| matches!(byte, b'\r' | b'\n'))
+            .map_or(bytes.len(), |length| offset + length);
+        // Java's byte-stream format is ISO-8859-1; Unicode uses UTF-16 escapes.
+        let line: String = bytes[offset..end]
+            .iter()
+            .map(|byte| char::from(*byte))
+            .collect();
+        // Java checks EOF after the first terminator, before removing a continuation
+        // slash. Thus a final "\\\n" emits an empty property, but "\\\r\n" does not.
+        let at_eof = end == bytes.len() || end + 1 == bytes.len();
+        offset = if bytes.get(end..end.saturating_add(2)) == Some(b"\r\n") {
+            end + 2
+        } else {
+            (end + 1).min(bytes.len())
+        };
+        let line = line.trim_start_matches([' ', '\t', '\u{c}']);
+        // An empty continuation does not make the next comment into property data.
+        // Once any logical content exists, '#' and '!' are ordinary characters.
+        if logical.is_empty() {
+            if line.starts_with(['#', '!']) {
+                consume(LogicalLine::Comment(line))?;
+                continue;
+            }
+            if line.is_empty() {
+                continue;
+            }
+        }
+        logical.push_str(line);
+        if has_continuation(&logical) {
+            logical.pop();
+            if !at_eof {
+                continue;
+            }
+        }
+        consume(LogicalLine::Property(&logical))?;
+        logical.clear();
+    }
+    if !logical.is_empty() {
+        consume(LogicalLine::Property(&logical))?;
+    }
+    Ok(())
 }
 
 fn has_continuation(line: &str) -> bool {
@@ -232,6 +266,78 @@ pub(crate) fn escape_property(input: &str, key: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_java_empty_continuations_do_not_continue_comments() {
+        for newline in ["\n", "\r\n", "\r"] {
+            for comment in ["# ignored\\", "! ignored\\"] {
+                let input = format!(
+                    "key=old{newline}\\{newline} \t\u{c}{comment}{newline}key=new{newline}"
+                );
+                assert_eq!(
+                    parse_properties(input.as_bytes()).unwrap(),
+                    HashMap::from([("key".to_string(), "new".to_string())])
+                );
+                let input = format!("key=kept\\{newline}{comment}{newline}next=value{newline}");
+                assert_eq!(
+                    parse_properties(input.as_bytes()).unwrap(),
+                    HashMap::from([(
+                        "key".to_string(),
+                        format!("kept{comment}next=value").replace("\\", "")
+                    )])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_java_empty_continuation_eof_matches_input_stream() {
+        // Verified with java.util.Properties.load(InputStream), including its
+        // lookahead before CRLF consumption at EOF.
+        for (input, empty_key) in [
+            (b"\\".as_slice(), true),
+            (b"\\\n", true),
+            (b"\\\r", true),
+            (b"\\\r\n", false),
+            (b"\\\n ", false),
+            (b"\\\n\t", false),
+            (b"\\\n\n", false),
+            (b"\\\n \\", true),
+            (b"\\\n# ignored\\", false),
+            (b"\\\n! ignored\\\n", false),
+        ] {
+            let expected = if empty_key {
+                HashMap::from([(String::new(), String::new())])
+            } else {
+                HashMap::new()
+            };
+            assert_eq!(parse_properties(input).unwrap(), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn test_empty_continuations_preserve_native_marker_authority() {
+        for newline in ["\n", "\r\n", "\r"] {
+            let prefix = format!("\\{newline} \t\u{c}");
+            for marker in [
+                "# hudi-rs.properties.codec=unknown".to_string(),
+                format!("{JAVA_PROPERTIES_MARKER}{newline}{JAVA_PROPERTIES_MARKER}"),
+            ] {
+                let bytes = Bytes::from(format!("{prefix}{marker}{newline}key=value"));
+                assert!(parse_table_properties(&bytes, None).is_err());
+            }
+            let bytes = Bytes::from(format!(
+                "{NATIVE_HEADER}{newline}{prefix}{JAVA_PROPERTIES_MARKER}{newline}key=line\\nnext"
+            ));
+            assert_eq!(
+                parse_table_properties(&bytes, Some("legacy-utf8")).unwrap()["key"],
+                "line\nnext"
+            );
+        }
+        // The historical UTF-8 writer used LF; its separate decoder stays unchanged.
+        let bytes = Bytes::from(format!("\\\n{NATIVE_HEADER}\nkey=café"));
+        assert_eq!(parse_table_properties(&bytes, None).unwrap()["key"], "café");
+    }
 
     #[test]
     fn test_java_continued_values_are_not_native_provenance_comments() {
