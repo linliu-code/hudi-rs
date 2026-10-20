@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::Result;
+use crate::config::properties::NATIVE_PROPERTIES_CODEC;
 use crate::config::read::{HudiReadConfig, ReadConfigScope};
 use crate::config::table::HudiTableConfig;
 use crate::config::util::{parse_data_for_options, split_hudi_options_from_others};
@@ -213,6 +214,11 @@ impl OptionResolver {
     /// [note] Error may occur when 1 and 2 have conflicts.
     pub async fn resolve_options(&mut self) -> Result<()> {
         self.resolve_user_provided_options();
+        crate::config::properties::validate_native_codec(
+            self.hudi_options
+                .get(NATIVE_PROPERTIES_CODEC)
+                .map(String::as_str),
+        )?;
 
         // If any user-provided options are intended for cloud storage and in uppercase,
         // convert them to lowercase. This is to allow `object_store` to pick them up.
@@ -290,13 +296,19 @@ impl OptionResolver {
         storage: Arc<Storage>,
     ) -> Result<()> {
         let bytes = storage.get_file_data(".hoodie/hoodie.properties").await?;
-        let table_properties = crate::config::properties::parse_properties(&bytes)?;
+        let table_properties = crate::config::properties::parse_table_properties(
+            &bytes,
+            options.get(NATIVE_PROPERTIES_CODEC).map(String::as_str),
+        )?;
 
         // Table properties on storage (hoodie.properties) should have the highest precedence,
         // except for writer-changeable properties like enabling metadata table/indexes.
         // TODO: return err when user-provided options conflict with table properties
         for (k, v) in table_properties {
-            options.insert(k.to_string(), v.to_string());
+            // A stored property cannot choose its own decoder or replace caller provenance.
+            if k != NATIVE_PROPERTIES_CODEC {
+                options.insert(k, v);
+            }
         }
 
         Ok(())
@@ -317,7 +329,10 @@ impl OptionResolver {
             && let Ok(global_configs) = parse_data_for_options(&bytes, " \t=")
         {
             for (key, value) in global_configs {
-                if key.starts_with("hoodie.") && !options.contains_key(&key) {
+                if key.starts_with("hoodie.")
+                    && key != NATIVE_PROPERTIES_CODEC
+                    && !options.contains_key(&key)
+                {
                     options.insert(key.to_string(), value.to_string());
                 }
             }

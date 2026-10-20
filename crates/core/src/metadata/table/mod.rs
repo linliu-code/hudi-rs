@@ -158,11 +158,12 @@ impl Table {
         }
 
         let mdt_url = join_url_segments(&self.base_url(), &[".hoodie", "metadata"])?;
-        Table::new_with_options(
-            mdt_url.as_str(),
-            [(PartitionFields.as_ref(), METADATA_TABLE_PARTITION_FIELD)],
-        )
-        .await
+        let mut options = vec![(PartitionFields.as_ref(), METADATA_TABLE_PARTITION_FIELD)];
+        let codec_key = crate::config::properties::NATIVE_PROPERTIES_CODEC;
+        if let Some(codec) = self.hudi_configs.get_raw(codec_key) {
+            options.push((codec_key, codec));
+        }
+        Table::new_with_options(mdt_url.as_str(), options).await
     }
 
     /// Fetch records from the `files` partition of metadata table
